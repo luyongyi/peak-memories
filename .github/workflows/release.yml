@@ -137,9 +137,18 @@ jobs:
           $tag = $env:RELEASE_TAG
           $zipName = "PeakReplayLab-$($tag.Substring(1)).zip"
           $assetNames = @($zipName, 'PeakReplayLab.dll', 'SHA256SUMS.txt', 'build-manifest.json')
-          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          # The by-tag REST endpoint only returns published releases.
+          # Authenticated release listing also returns drafts with push access.
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --paginate --slurp
           if ($LASTEXITCODE -ne 0) { throw 'The local script must first upload the release draft.' }
-          $release = $releaseJson | ConvertFrom-Json
+          $pages = ConvertFrom-Json -InputObject ($releaseJson -join "`n") -NoEnumerate
+          $found = @(foreach ($page in $pages) {
+            foreach ($candidate in $page) {
+              if ($candidate.tag_name -ceq $tag) { $candidate }
+            }
+          })
+          if ($found.Count -ne 1) { throw 'Exactly one matching release draft or published release is required.' }
+          $release = $found[0]
           if ($release.tag_name -cne $tag -or $release.name -cne "PEAK 回忆录 $tag" -or
               $release.target_commitish -cne $env:RELEASE_COMMIT) { throw 'Release title, tag or target commit does not match.' }
           if (@($release.assets).Count -ne $assetNames.Count) { throw 'Release must contain exactly the four approved assets.' }
@@ -214,7 +223,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = $env:RELEASE_TAG
           $commit = $env:RELEASE_COMMIT
-          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID"
           if ($LASTEXITCODE -ne 0) { throw 'Release disappeared after verification.' }
           $release = $releaseJson | ConvertFrom-Json
           if ($release.id.ToString() -cne $env:RELEASE_ID -or $release.tag_name -cne $tag -or
