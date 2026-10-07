@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/ReplayData.cs" Link="ReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentReplayData.cs" Link="EnvironmentReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentStormReplayRules.cs" Link="EnvironmentStormReplayRules.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentCapturePolicy.cs" Link="EnvironmentCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayVisualClock.cs" Link="ReplayVisualClock.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentReplayTimeline.cs" Link="EnvironmentReplayTimeline.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentTimeRebaser.cs" Link="EnvironmentTimeRebaser.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureReplayData.cs" Link="CreatureReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureDirectoryRules.cs" Link="CreatureDirectoryRules.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeCapturePolicy.cs" Link="NativeCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeVisualAppearanceData.cs" Link="NativeVisualAppearanceData.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeLightAppearanceData.cs" Link="NativeLightAppearanceData.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayHudState.cs" Link="ReplayHudState.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayHudLayout.cs" Link="ReplayHudLayout.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayCursorPolicy.cs" Link="ReplayCursorPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayDrawerMotion.cs" Link="ReplayDrawerMotion.cs" />
+    <Compile Include="../../src/PeakReplayLab/RollingBuffer.cs" Link="RollingBuffer.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayArchive.cs" Link="ReplayArchive.cs" />
+    <Compile Include="../../src/PeakReplayLab/ContinuousReplayData.cs" Link="ContinuousReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayQueueBudget.cs" Link="ReplayQueueBudget.cs" />
+    <Compile Include="../../src/PeakReplayLab/ContinuousReplayWriter.cs" Link="ContinuousReplayWriter.cs" />
+    <Compile Include="../../src/PeakReplayLab/DebugRunCatalog.cs" Link="DebugRunCatalog.cs" />
+    <Compile Include="../../src/PeakReplayLab/RecordingModePolicy.cs" Link="RecordingModePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/MemoriesLibraryModel.cs" Link="MemoriesLibraryModel.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayRegionSummary.cs" Link="ReplayRegionSummary.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeMemoriesNoteLayout.cs" Link="NativeMemoriesNoteLayout.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayTrash.cs" Link="ReplayTrash.cs" />
+    <Compile Include="../../src/PeakReplayLab/FullReplayData.cs" Link="FullReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/FullReplayWriter.cs" Link="FullReplayWriter.cs" />
+    <Compile Include="../../src/PeakReplayLab/FullReplayArchive.cs" Link="FullReplayArchive.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayTimeline.cs" Link="ReplayTimeline.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayDeltaCodec.cs" Link="ReplayDeltaCodec.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayTrackStorage.cs" Link="ReplayTrackStorage.cs" />
+    <Compile Include="../../src/PeakReplayLab/RopeReplayData.cs" Link="RopeReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectReplayData.cs" Link="EffectReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/AudioReplayData.cs" Link="AudioReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/SpawnedReplayData.cs" Link="SpawnedReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/BalloonReplayData.cs" Link="BalloonReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/PresentationResourcePolicy.cs" Link="PresentationResourcePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/BackpackAttachmentPolicy.cs" Link="BackpackAttachmentPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/SampleClock.cs" Link="SampleClock.cs" />
+    <Compile Include="../../src/PeakReplayLab/WorldSegmentIndex.cs" Link="WorldSegmentIndex.cs" />
+    <Compile Include="../../src/PeakReplayLab/WorldEnvironmentState.cs" Link="WorldEnvironmentState.cs" />
+    <Compile Include="../../src/PeakReplayLab/ObjectTrackData.cs" Link="ObjectTrackData.cs" />
+    <Compile Include="../../src/PeakReplayLab/CrateAnimationData.cs" Link="CrateAnimationData.cs" />
+    <Compile Include="../../src/PeakReplayLab/ItemSamplingPolicy.cs" Link="ItemSamplingPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayPerformance.cs" Link="ReplayPerformance.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayFrameCadence.cs" Link="ReplayFrameCadence.cs" />
+    <Compile Include="../../src/PeakReplayLab/ActorJointReplayRules.cs" Link="ActorJointReplayRules.cs" />
+    <Compile Include="../../src/PeakReplayLab/ActorJointRebaser.cs" Link="ActorJointRebaser.cs" />
+    <Compile Include="../../src/PeakReplayLab/ActorJointCodec.cs" Link="ActorJointCodec.cs" />
+    <Compile Include="../../src/PeakReplayLab/ActorJointSamplingPolicy.cs" Link="ActorJointSamplingPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ActorJointTimeline.cs" Link="ActorJointTimeline.cs" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>

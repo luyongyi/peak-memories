@@ -1,0 +1,44 @@
+# Build output and machine-local evidence.
+/artifacts/
+**/bin/
+**/obj/
+/local/
+
+# Private recordings and diagnostics.
+*.peakrun
+*.peakrun.partial
+*.peakreplay
+*.ndjson
+*.partial
+*.log
+*.cfg
+
+# Native game assemblies and extracted game resources stay on the user's machine.
+*.dll
+*.pdb
+*.bundle
+*.assets
+*.unity3d
+*.fbx
+*.zip
+*.7z
+
+# Local credentials and editor state.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+Config.Build.user.props
+*.user
+*.suo
+*.lock.tmp
+.vs/
+.idea/
+.vscode/
+**/__pycache__/
+*.pyc
+Thumbs.db
+.DS_Store

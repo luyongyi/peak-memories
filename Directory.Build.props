@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <DebugType>embedded</DebugType>
+    <PEAKGameRootDir Condition="'$(PEAKGameRootDir)' == ''">$(MSBuildProgramFiles32)/Steam/steamapps/common/PEAK/</PEAKGameRootDir>
+    <ManagedDir>$(PEAKGameRootDir)PEAK_Data/Managed/</ManagedDir>
+  </PropertyGroup>
+</Project>

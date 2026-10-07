@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <Version>0.7.4</Version>
+    <AssemblyName>PeakReplayLab</AssemblyName>
+    <Description>Local, sampled-joint PEAK replay prototype. No web dependency.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <GameAssembly Include="$(ManagedDir)*.dll" Exclude="$(ManagedDir)Mono*.dll;$(ManagedDir)netstandard.dll;$(ManagedDir)System*.dll;$(ManagedDir)mscorlib.dll" />
+    <Reference Include="@(GameAssembly)" Private="false" />
+    <Reference Include="$(PEAKGameRootDir)BepInEx/core/BepInEx.dll" Private="false" />
+    <Reference Include="$(PEAKGameRootDir)BepInEx/core/0Harmony.dll" Private="false" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Original generated art is versioned with this standalone project;
+         release DLLs are self-contained. The recorder never loads cover art. -->
+    <EmbeddedResource Include="../../assets/home-art/shore-v3.png" LogicalName="PeakReplayLab.CoverArt.shore.png" />
+    <EmbeddedResource Include="../../assets/home-art/roots-v3.png" LogicalName="PeakReplayLab.CoverArt.roots.png" />
+    <EmbeddedResource Include="../../assets/home-art/tropics-v3.png" LogicalName="PeakReplayLab.CoverArt.tropics.png" />
+    <EmbeddedResource Include="../../assets/home-art/alpine-v3.png" LogicalName="PeakReplayLab.CoverArt.alpine.png" />
+    <EmbeddedResource Include="../../assets/home-art/mesa-v3.png" LogicalName="PeakReplayLab.CoverArt.mesa.png" />
+    <EmbeddedResource Include="../../assets/home-art/volcano-v3.png" LogicalName="PeakReplayLab.CoverArt.volcano.png" />
+    <EmbeddedResource Include="../../assets/home-art/swamp-v3.png" LogicalName="PeakReplayLab.CoverArt.swamp.png" />
+    <EmbeddedResource Include="../../assets/home-art/kiln-v3.png" LogicalName="PeakReplayLab.CoverArt.kiln.png" />
+    <EmbeddedResource Include="../../assets/home-art/temple-v3.png" LogicalName="PeakReplayLab.CoverArt.temple.png" />
+    <EmbeddedResource Include="../../assets/home-art/peak-v1.png" LogicalName="PeakReplayLab.CoverArt.peak.png" />
+    <EmbeddedResource Include="../../assets/home-art/nadir-v1.png" LogicalName="PeakReplayLab.CoverArt.nadir.png" />
+  </ItemGroup>
+  <Target Name="CheckCoverResources" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('%(EmbeddedResource.Identity)')" Text="Missing memoir cover %(EmbeddedResource.Identity). Restore assets/home-art from this repository before building the self-contained replay DLL." />
+  </Target>
+  <Target Name="CheckGameReferences" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(ManagedDir)Assembly-CSharp.dll')" Text="Install PEAK/BepInEx or pass -p:PEAKGameRootDir=... . Game assemblies are never redistributed." />
+  </Target>
+</Project>

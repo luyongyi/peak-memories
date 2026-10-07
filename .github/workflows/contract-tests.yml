@@ -1,0 +1,43 @@
+name: Contract tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: ${{ matrix.os }} / ${{ matrix.project }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        project:
+          - ReplayContract
+          - NativeAppearanceContract
+          - NativeLoadingContract
+          - ReplayViewContract
+          - ReplayNameplateContract
+          - ReplayAudioSpatialContract
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          # global.json selects SDK 10; net8.0 test executables need runtime 8.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Build contract project
+        run: dotnet build "tests/${{ matrix.project }}/${{ matrix.project }}.csproj" -c Release
+      - name: Run contracts
+        run: dotnet run --project "tests/${{ matrix.project }}/${{ matrix.project }}.csproj" -c Release --no-build

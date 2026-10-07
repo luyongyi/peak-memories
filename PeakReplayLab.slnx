@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/tests/">
+    <Project Path="tests/NativeAppearanceContract/NativeAppearanceContract.csproj" />
+  </Folder>
+  <Project Path="src/PeakReplayLab/PeakReplayLab.csproj" />
+  <Project Path="tests/ReplayContract/ReplayContract.csproj" />
+  <Project Path="tests/ReplayViewContract/ReplayViewContract.csproj" />
+  <Project Path="tests/ReplayNameplateContract/ReplayNameplateContract.csproj" />
+  <Project Path="tests/ReplayAudioSpatialContract/ReplayAudioSpatialContract.csproj" />
+  <Project Path="tests/NativeLoadingContract/NativeLoadingContract.csproj" />
+</Solution>
