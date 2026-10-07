@@ -141,7 +141,7 @@ public sealed class ReplayClip
 public static class ReplayRules
 {
     public const int CurrentSchema = 14;
-    public static bool SupportedSchema(int schema) => schema >= 10 && schema <= CurrentSchema;
+    public static bool SupportedSchema(int schema) => schema == 10 || schema == 11 || schema == 12 || schema == 13 || schema == CurrentSchema;
     // Scoped to one immutable save/read operation, never trusts a previous operation.
     internal sealed class ValidationMemo
     {
