@@ -1,0 +1,251 @@
+name: Release verification
+run-name: Release ${{ inputs.tag }} / ${{ inputs.request_id }}
+
+# The local release script builds against legally installed PEAK references.
+# This workflow only verifies uploaded packages on GitHub-hosted machines.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (vX.Y.Z)
+        required: true
+        type: string
+      publish:
+        description: Publish the verified draft as an experimental prerelease
+        required: true
+        default: false
+        type: boolean
+      request_id:
+        description: Unique local release request identifier
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "true"
+
+jobs:
+  verify:
+    name: Verify source, contracts and uploaded package
+    runs-on: windows-latest
+    timeout-minutes: 25
+    # Draft releases are visible only to identities with push access.
+    # This job never creates, uploads, deletes or publishes a release.
+    permissions:
+      contents: write
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      release_id: ${{ steps.package.outputs.release_id }}
+      was_draft: ${{ steps.package.outputs.was_draft }}
+      asset_hashes: ${{ steps.package.outputs.asset_hashes }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate trusted dispatch and inputs
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_REQUEST_ID: ${{ inputs.request_id }}
+          RELEASE_EVENT: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_ACTOR: ${{ github.actor }}
+          RELEASE_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          RELEASE_OWNER: ${{ github.repository_owner }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -cne 'luyongyi/peak-memories' -or
+              $env:RELEASE_EVENT -cne 'workflow_dispatch' -or
+              $env:RELEASE_REF -cne 'refs/heads/main' -or
+              $env:RELEASE_ACTOR -ine $env:RELEASE_OWNER -or
+              $env:RELEASE_TRIGGERING_ACTOR -ine $env:RELEASE_OWNER) {
+            throw 'Release verification requires an owner dispatch from main in the official repository.'
+          }
+          if ($env:RELEASE_TAG -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'Invalid release tag; expected vX.Y.Z.'
+          }
+          if ($env:RELEASE_REQUEST_ID -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+            throw 'Invalid release request identifier.'
+          }
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind checkout to remote tag and main
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = (git rev-parse --verify HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $commit -cnotmatch '^[a-f0-9]{40}$') { throw 'Invalid checkout commit.' }
+          $tagCommit = (git rev-parse --verify "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $commit) { throw 'Checkout does not match the version tag.' }
+          $remoteLines = @(git ls-remote origin "refs/tags/$($env:RELEASE_TAG)" "refs/tags/$($env:RELEASE_TAG)^{}")
+          if ($LASTEXITCODE -ne 0 -or $remoteLines.Count -lt 1 -or $remoteLines.Count -gt 2) { throw 'Cannot resolve the remote tag.' }
+          $peeledLine = @($remoteLines | Where-Object { $_ -match '\^\{\}$' })
+          $remoteCommit = if ($peeledLine.Count -eq 1) { ($peeledLine[0] -split '\s+')[0] } else { ($remoteLines[0] -split '\s+')[0] }
+          if ($remoteCommit -cne $commit) { throw 'The remote tag changed or does not match the checkout.' }
+          git merge-base --is-ancestor $commit refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'The release commit is not reachable from main.' }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "Verified source: $($env:RELEASE_TAG) -> $commit" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Build and run all six contract projects
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $projects = @('ReplayContract', 'NativeAppearanceContract', 'NativeLoadingContract', 'ReplayViewContract', 'ReplayNameplateContract', 'ReplayAudioSpatialContract')
+          foreach ($project in $projects) {
+            $projectPath = "tests/$project/$project.csproj"
+            dotnet build $projectPath -c Release --nologo -warnaserror
+            if ($LASTEXITCODE -ne 0) { throw "Contract build failed: $project" }
+            dotnet run --project $projectPath -c Release --no-build
+            if ($LASTEXITCODE -ne 0) { throw "Contracts failed: $project" }
+          }
+
+      - name: Build verifier and run its self-tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build tools/ReleaseVerifier/ReleaseVerifier.csproj -c Release --nologo -warnaserror
+          if ($LASTEXITCODE -ne 0) { throw 'Release verifier build failed.' }
+          dotnet run --project tools/ReleaseVerifier/ReleaseVerifier.csproj -c Release --no-build -- self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Release verifier self-tests failed.' }
+
+      - name: Download and verify the four exact release assets
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $zipName = "PeakReplayLab-$($tag.Substring(1)).zip"
+          $assetNames = @($zipName, 'PeakReplayLab.dll', 'SHA256SUMS.txt', 'build-manifest.json')
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'The local script must first upload the release draft.' }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.tag_name -cne $tag -or $release.name -cne "PEAK 回忆录 $tag" -or
+              $release.target_commitish -cne $env:RELEASE_COMMIT) { throw 'Release title, tag or target commit does not match.' }
+          if (@($release.assets).Count -ne $assetNames.Count) { throw 'Release must contain exactly the four approved assets.' }
+          foreach ($name in $assetNames) {
+            $matching = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' -and $_.size -gt 0 })
+            if ($matching.Count -ne 1) { throw "Missing, duplicate or incomplete release asset: $name" }
+          }
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE 'local/gh-release-input'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          foreach ($name in $assetNames) {
+            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $name --dir $downloadDir
+            if ($LASTEXITCODE -ne 0) { throw "Failed to download release asset: $name" }
+          }
+          $zipPath = Join-Path $downloadDir $zipName
+          dotnet run --project tools/ReleaseVerifier/ReleaseVerifier.csproj -c Release --no-build -- verify $zipPath $env:GITHUB_WORKSPACE $tag $env:RELEASE_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'Uploaded ZIP failed release verification.' }
+
+          # The separately downloadable DLL and manifest must be the ZIP's bytes.
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            foreach ($name in @('PeakReplayLab.dll', 'build-manifest.json')) {
+              $entry = $zip.GetEntry($name)
+              if ($null -eq $entry) { throw "ZIP entry missing: $name" }
+              $stream = $entry.Open()
+              $hasher = [System.Security.Cryptography.SHA256]::Create()
+              try { $insideHash = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant() }
+              finally { $stream.Dispose(); $hasher.Dispose() }
+              $outsideHash = (Get-FileHash -LiteralPath (Join-Path $downloadDir $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($insideHash -cne $outsideHash) { throw "Standalone asset differs from ZIP: $name" }
+            }
+          } finally { $zip.Dispose() }
+
+          $expectedHashes = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+          foreach ($line in Get-Content -LiteralPath (Join-Path $downloadDir 'SHA256SUMS.txt')) {
+            if ($line -notmatch '^([a-fA-F0-9]{64})[ \t]+\*?([A-Za-z0-9][A-Za-z0-9._-]*)$') { throw 'Malformed release SHA256SUMS.txt.' }
+            $name = $Matches[2]
+            if ($expectedHashes.ContainsKey($name)) { throw 'Duplicate checksum entry.' }
+            $expectedHashes[$name] = $Matches[1].ToLowerInvariant()
+          }
+          $checksumNames = @($zipName, 'PeakReplayLab.dll', 'build-manifest.json')
+          if ($expectedHashes.Count -ne $checksumNames.Count) { throw 'Checksum file must cover exactly ZIP, DLL and manifest.' }
+          $assetHashes = [ordered]@{}
+          foreach ($name in $assetNames) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path $downloadDir $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($name -cne 'SHA256SUMS.txt' -and
+                (-not $expectedHashes.ContainsKey($name) -or $expectedHashes[$name] -cne $hash)) { throw "Release checksum mismatch: $name" }
+            $assetHashes[$name] = $hash
+          }
+          "release_id=$($release.id)" >> $env:GITHUB_OUTPUT
+          "was_draft=$($release.draft.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "asset_hashes=$($assetHashes | ConvertTo-Json -Compress)" >> $env:GITHUB_OUTPUT
+          "Verified four assets, ZIP allowlist, versions, commit and SHA256 checksums." >> $env:GITHUB_STEP_SUMMARY
+
+  publish:
+    name: Publish verified experimental prerelease
+    needs: verify
+    if: ${{ inputs.publish && needs.verify.outputs.was_draft == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Recheck release, remote tag and all asset bytes before publishing
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.verify.outputs.commit }}
+          RELEASE_ID: ${{ needs.verify.outputs.release_id }}
+          RELEASE_ASSET_HASHES: ${{ needs.verify.outputs.asset_hashes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $commit = $env:RELEASE_COMMIT
+          $releaseJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Release disappeared after verification.' }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.id.ToString() -cne $env:RELEASE_ID -or $release.tag_name -cne $tag -or
+              $release.name -cne "PEAK 回忆录 $tag" -or $release.target_commitish -cne $commit) { throw 'Release identity changed after verification.' }
+          $refJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot recheck the remote tag.' }
+          $tagObject = ($refJson | ConvertFrom-Json).object
+          $depth = 0
+          while ($tagObject.type -ceq 'tag' -and $depth -lt 8) {
+            $tagJson = gh api "repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot peel the remote tag.' }
+            $tagObject = ($tagJson | ConvertFrom-Json).object
+            $depth++
+          }
+          if ($tagObject.type -cne 'commit' -or $tagObject.sha -cne $commit) { throw 'The remote tag changed after verification.' }
+          $hashes = $env:RELEASE_ASSET_HASHES | ConvertFrom-Json -AsHashtable
+          if ($hashes.Count -ne 4 -or @($release.assets).Count -ne 4) { throw 'Release asset list changed after verification.' }
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'verified-release-assets'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          foreach ($name in $hashes.Keys) {
+            $matching = @($release.assets | Where-Object { $_.name -ceq $name -and $_.state -ceq 'uploaded' -and $_.size -gt 0 })
+            if ($matching.Count -ne 1) { throw "Release asset changed: $name" }
+            gh release download $tag --repo $env:GITHUB_REPOSITORY --pattern $name --dir $downloadDir
+            if ($LASTEXITCODE -ne 0) { throw "Cannot recheck asset: $name" }
+            $hash = (Get-FileHash -LiteralPath (Join-Path $downloadDir $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -cne $hashes[$name]) { throw "Asset bytes changed after verification: $name" }
+          }
+          if (-not $release.draft) {
+            'Release is already public and its assets still match; no assets or settings were changed.' >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          gh release edit $tag --repo $env:GITHUB_REPOSITORY --draft=false --prerelease --latest=false
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the verified prerelease failed.' }
+          "Published experimental prerelease: $tag ($commit). It is not marked as latest." >> $env:GITHUB_STEP_SUMMARY
