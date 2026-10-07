@@ -11,6 +11,7 @@ internal sealed class ActorJointRebaser
     private readonly ConditionalWeakTable<NodePose, NodePose> nodes = new();
     private readonly ConditionalWeakTable<NodePose[], NodePose[]> poses = new();
     private readonly ConditionalWeakTable<ActorFrame, ActorFrame> actors = new();
+    private readonly ConditionalWeakTable<ActorRouteState, ActorRouteState> routeStates = new();
     private readonly ConditionalWeakTable<ActorFrame[], ActorFrame[]> sets = new();
     public ActorJointRebaser(double origin) => this.origin = origin;
 
@@ -19,16 +20,21 @@ internal sealed class ActorJointRebaser
         ActorFrame[]? result = null;
         for (int i = 0; i < values.Length; i++)
         {
-            if (values[i].JointPose.Length == 0) continue;
+            if (values[i].JointPose.Length == 0 && values[i].RouteState == null) continue;
             result ??= (ActorFrame[])values.Clone();
             result[i] = actors.GetValue(values[i], actor =>
-            actor.JointPose.Length == 0 ? actor : actor.WithJoints(poses.GetValue(actor.JointPose, joints =>
             {
-                var shifted = new NodePose[joints.Length];
-                for (int j = 0; j < shifted.Length; j++) shifted[j] = nodes.GetValue(joints[j], node =>
-                    new NodePose(node.Path, node.Position, node.Rotation, node.Scale, node.Active, node.Visible, node.SampleTime - origin));
-                return shifted;
-            })));
+                var resultActor = actor;
+                if (actor.JointPose.Length != 0) resultActor = actor.WithJoints(poses.GetValue(actor.JointPose, joints =>
+                {
+                    var shifted = new NodePose[joints.Length];
+                    for (int j = 0; j < shifted.Length; j++) shifted[j] = nodes.GetValue(joints[j], node =>
+                        new NodePose(node.Path, node.Position, node.Rotation, node.Scale, node.Active, node.Visible, node.SampleTime - origin));
+                    return shifted;
+                }));
+                if (actor.RouteState != null) resultActor = resultActor.WithRouteState(routeStates.GetValue(actor.RouteState, state => state.Rebase(origin)));
+                return resultActor;
+            });
         }
         return result ?? values;
     });

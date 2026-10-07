@@ -106,10 +106,10 @@ jobs:
             8.0.x
             10.0.x
 
-      - name: Build and run all six contract projects
+      - name: Build and run all eight contract projects
         run: |
           $ErrorActionPreference = 'Stop'
-          $projects = @('ReplayContract', 'NativeAppearanceContract', 'NativeLoadingContract', 'ReplayViewContract', 'ReplayNameplateContract', 'ReplayAudioSpatialContract')
+          $projects = @('ReplayContract', 'NativeAppearanceContract', 'NativeLoadingContract', 'ReplayViewContract', 'ReplayNameplateContract', 'ReplayAudioSpatialContract', 'TrajectoryContract', 'TrajectoryUploadContract')
           foreach ($project in $projects) {
             $projectPath = "tests/$project/$project.csproj"
             dotnet build $projectPath -c Release --nologo -warnaserror

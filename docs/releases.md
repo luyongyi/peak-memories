@@ -38,8 +38,8 @@ pwsh -File scripts/release.ps1 -Resume -Tag v0.7.4 -Publish
 
 ZIP `PeakReplayLab-X.Y.Z.zip` 仅包含 `PeakReplayLab.dll`、安装说明 `README-INSTALL.md`、`build-manifest.json` 与包内 `SHA256SUMS.txt`。Release 仅上传四个附件：该 ZIP、同字节的独立 DLL、同字节的构建清单，以及校验 ZIP／DLL／清单的外部 `SHA256SUMS.txt`。不包含 PEAK／Unity／BepInEx 的原始 DLL、提取资源、日志、配置、私人录像或本机绝对路径。完整产物结构和版本信息由发布验证器检查。
 
-`release.yml` 只接受仓库所有者从 `main` 发起的手动请求，由本机脚本自动提交标签和唯一请求编号。它在 GitHub 托管的 Windows 环境运行六组 contract 测试及发布验证器自检，核对远端标签、提交、ZIP 文件白名单、DLL 元数据、构建清单和 SHA256。工作流的 `contents: write` 用于读取草稿；云端没有发布作业，保留的 `publish` 输入仅兼容原调用，即使传入 `true` 也不会公开发布。直接推送标签不会在云端编译 Mod。
+`release.yml` 只接受仓库所有者从 `main` 发起的手动请求，由本机脚本自动提交标签和唯一请求编号。它在 GitHub 托管的 Windows 环境运行八组 contract 测试及发布验证器自检，核对远端标签、提交、ZIP 文件白名单、DLL 元数据、构建清单和 SHA256。工作流的 `contents: write` 用于读取草稿；云端没有发布作业，保留的 `publish` 输入仅兼容原调用，即使传入 `true` 也不会公开发布。直接推送标签不会在云端编译 Mod。
 
-脚本按唯一请求编号等待对应 Actions run，确认六组测试、验证器自检与上传包检查全部通过。`-Draft` 至此保留草稿；`-Publish` 再由本机核对标签、Release 身份和四个附件的哈希，用已登录的 `gh` 公开为实验性预发布，不设为 latest。这样无需向 Actions 额外配置发布 secret，也能继续发布源码标签与当前 `main` 工作流不同的已验证草稿。已公开的同版本 Release 通过验证后保留现状，不重复发布或替换附件。
+脚本按唯一请求编号等待对应 Actions run，确认八组测试、验证器自检与上传包检查全部通过。`-Draft` 至此保留草稿；`-Publish` 再由本机核对标签、Release 身份和四个附件的哈希，用已登录的 `gh` 公开为实验性预发布，不设为 latest。这样无需向 Actions 额外配置发布 secret，也能继续发布源码标签与当前 `main` 工作流不同的已验证草稿。已公开的同版本 Release 通过验证后保留现状，不重复发布或替换附件。
 
 云端验证通过说明源码绑定、独立测试和产物完整性通过；Unity 中的录制、回放画面、声音与性能仍需按对应版本验收报告实测。验证失败保留草稿供检查，修复后提交新的版本再发布。

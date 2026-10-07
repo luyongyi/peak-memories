@@ -204,7 +204,7 @@ try {
     if ($dirty) { throw 'Commit or stash source changes before building a release. The package must identify an exact clean commit.' }
     $existingTag = & git rev-parse --verify "$Tag^{commit}" 2>$null
     if ($LASTEXITCODE -eq 0 -and ($existingTag -join '').Trim() -cne $commit) { throw "Local tag $Tag already points to a different commit." }
-    $projects = @('ReplayContract', 'NativeAppearanceContract', 'NativeLoadingContract', 'ReplayViewContract', 'ReplayNameplateContract', 'ReplayAudioSpatialContract')
+    $projects = @('ReplayContract', 'NativeAppearanceContract', 'NativeLoadingContract', 'ReplayViewContract', 'ReplayNameplateContract', 'ReplayAudioSpatialContract', 'TrajectoryContract', 'TrajectoryUploadContract')
     Write-Host "Preflight passed: $Tag / $commit"
     if ($PreflightOnly) { return }
 
@@ -265,7 +265,8 @@ try {
 需要 Windows PEAK 和 BepInEx 5。先关闭游戏，把 PeakReplayLab.dll 放入游戏目录的 BepInEx/plugins/，已有同名文件时替换。封面已经嵌入 DLL。
 配置、Memories、Recordings 和其他插件保留。此包不包含 PEAK、BepInEx 或原版游戏素材。
 
-F7 打开/退出回忆录；内存模式 F6 保存；持续录制 F4 停止/重开；H 展开/收起控制台；空格暂停；Tab 切换玩家；F9 诊断。回放前先离开好友房间。
+F7 打开/退出回忆录；F6 随时保存最近最多 120 秒；F4 独立开启/关闭完整录制，关闭时封存并保留片段缓存；H 展开/收起控制台；空格暂停；Tab 切换玩家；F9 诊断。回放前先离开好友房间。
+完整录像详情可手动上传最多 10 Hz 的姓名与坐标轨迹；上传前确认目标站点与压缩大小。网站只公开审核通过、地图版本匹配的完整个人关卡路线。
 当前写入 Schema $currentSchema，读取 Schema $($supportedSchemas -join ' / ')。旧录像仍需匹配原游戏版本、Build ID、程序集和地图分支；游戏更新前后的兼容性请在游戏内确认。
 
 源码：$Repository，$Tag，提交 $commit。
@@ -331,7 +332,9 @@ SHA256SUMS.txt 校验本包 DLL、安装说明和构建清单。build-manifest.j
         if (-not $release.isDraft) { Write-Host "Already published with identical assets: https://github.com/$Repository/releases/tag/$Tag"; return }
     } else {
         $notes = @"
-PEAK 回忆录 $version 实验版。使用本机 PEAK 引用编译，六套合同测试和安装包校验通过后由 GitHub Actions 复核。
+PEAK 回忆录 $version 实验版。F6 随时保存最近最多 120 秒，F4 独立开启/关闭完整录制；完整录像详情支持手动上传轻量轨迹，在地图内查看审核通过的路线与热力。
+
+使用本机 PEAK 引用编译，八套合同测试和安装包校验通过后由 GitHub Actions 复核。采集复用已有数据；缓存受内存预算限制，实机画面、音效与帧率仍需在游戏内验收。
 
 下载 PeakReplayLab-$version.zip，关闭游戏后将其中 PeakReplayLab.dll 放到 BepInEx/plugins/。
 需要已有 PEAK / BepInEx 5。安装包内有安装说明和哈希清单；单独 DLL、SHA256SUMS.txt、build-manifest.json 也可下载。

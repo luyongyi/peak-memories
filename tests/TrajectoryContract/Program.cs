@@ -1,0 +1,316 @@
+using System.IO.Compression;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using PeakReplayLab;
+
+int passed = 0;
+void Test(string name, Action body)
+{
+    try { body(); passed++; Console.WriteLine("PASS " + name); }
+    catch (Exception error) { Console.Error.WriteLine("FAIL " + name + ": " + error); Environment.Exit(1); }
+}
+void Check(bool condition) { if (!condition) throw new Exception("Assertion failed."); }
+void Reject(Action body)
+{
+    try { body(); } catch (Exception error) when (error is InvalidDataException || error is JsonException || error is ArgumentOutOfRangeException) { return; }
+    throw new Exception("Invalid recording was accepted.");
+}
+void InRoot(Action<string> body)
+{
+    string root = Path.Combine(Path.GetTempPath(), "peak-trajectory-contract-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(root);
+    try { body(root); }
+    finally { Directory.Delete(root, true); }
+}
+ReplayHeader Header(bool native = true) => new()
+{
+    Scene = "Level_3", GameVersion = "synthetic-test", GameAssembly = new string('a', 32), BuildId = 25667990,
+    Route = "Shore,Roots,Alpine,Volcano,Volcano", StartedUtc = "2026-10-07T00:00:00Z", SampleHz = 60,
+    RouteContext = native ? new ReplayRouteContext
+    {
+        RecordingId = ReplayRouteRules.Hash("synthetic-recording"), RunKey = ReplayRouteRules.Hash("synthetic-shared-run"),
+        LevelIndex = 123, LayoutKey = ReplayRouteRules.Hash("synthetic-layout"), Ascent = 3, Custom = false, Mini = false,
+        Stages = new[]
+        {
+            new ReplayRouteStage { Index = 0, Name = "Shore", EnterZCm = 0, ExitZCm = 1000 },
+            new ReplayRouteStage { Index = 1, Name = "Roots", EnterZCm = 1000, ExitZCm = 2000 },
+            new ReplayRouteStage { Index = 2, Name = "Alpine", EnterZCm = 2000, ExitZCm = 3000 },
+            new ReplayRouteStage { Index = 3, Name = "Volcano", EnterZCm = 3000, ExitZCm = 4000 },
+            new ReplayRouteStage { Index = 4, Name = "Kiln", EnterZCm = 4000, ExitZCm = 5000 },
+        },
+    } : null,
+};
+ActorFrame Actor(double nativeTime, float z, string id = "private-photon-id-alpha", bool owner = true) => new()
+{
+    Id = id, Name = "Synthetic Scout", Position = new[] { 99f, 98f, z + 97f },
+    RouteState = new ActorRouteState
+    {
+        SampleTime = nativeTime, Center = new[] { 1.25f, 2.5f, z }, Alive = true, LocalOwner = owner,
+        RunTimeMs = (long)Math.Round((nativeTime - 200) * 1000) + 90_000,
+        SharedRunKey = ReplayRouteRules.Hash("synthetic-shared-run"),
+    },
+};
+ReplayFrame Frame(double nativeTime, params ActorFrame[] actors) => new() { T = nativeTime, Actors = actors };
+FullReplayResult Save(string root, ReplayHeader header, IEnumerable<ReplayFrame> frames, bool interrupted = false)
+{
+    var writer = new FullReplayWriter(root, header, new ContinuousReplayOptions { QueueFrameLimit = 7201 });
+    foreach (var frame in frames) Check(writer.TryEnqueue(frame));
+    var task = interrupted ? writer.InterruptAsync("synthetic-stop", new IOException("synthetic interruption")) : writer.CompleteAsync();
+    Check(task.Wait(TimeSpan.FromSeconds(20))); var result = task.GetAwaiter().GetResult();
+    Check(result.Status == (interrupted ? "faulted" : "completed")); return result;
+}
+JObject ReadPackage(string path)
+{
+    using var file = File.OpenRead(path); using var gzip = new GZipStream(file, CompressionMode.Decompress);
+    using var text = new StreamReader(gzip); using var json = new JsonTextReader(text);
+    return JObject.Load(json);
+}
+ReplayFrame[] SyntheticFrames()
+{
+    return Enumerable.Range(0, 721).Select(i =>
+    {
+        double time = 200 + i / 60d;
+        var first = Actor(time, (float)(i / 60d * 2));
+        // Second participant starts in the middle of Roots, with the same
+        // nickname. Their later crossing is not proof of a complete start.
+        var second = Actor(time, (float)(15 + i / 60d), "private-photon-id-beta", false);
+        return Frame(time, first, second);
+    }).ToArray();
+}
+
+Test("schema 14 route snapshot deltas round-trip without mutating earlier states", () =>
+{
+    var writer = new ReplayDeltaCodec.Writer(); var reader = new ReplayDeltaCodec.Reader();
+    var a = Frame(200, Actor(200, 1)); var b = Frame(200.1, Actor(200.1, 2));
+    b.Actors[0].RouteState!.Alive = false; b.Actors[0].RouteState!.WarpSequence = 7;
+    var first = reader.Decode(JObject.FromObject(writer.Encode(a)));
+    var second = reader.Decode(JObject.FromObject(writer.Encode(b)));
+    Check(first.Actors[0].RouteState!.Center[2] == 1 && first.Actors[0].RouteState!.Alive);
+    Check(second.Actors[0].RouteState!.Center[2] == 2 && !second.Actors[0].RouteState!.Alive && second.Actors[0].RouteState!.WarpSequence == 7);
+    var c = Frame(200.2, Actor(200.2, 3)); c.Actors[0].RouteState = null;
+    Check(reader.Decode(JObject.FromObject(writer.Encode(c))).Actors[0].RouteState == null);
+});
+Test("schemas 10 through 13 preserve missing native evidence as unknown", () =>
+{
+    foreach (int schema in new[] { 10, 11, 12, 13 })
+    {
+        var frame = Frame(0, new ActorFrame { Id = "legacy", Name = "Synthetic" });
+        var writer = new ReplayDeltaCodec.Writer(schema); var reader = new ReplayDeltaCodec.Reader(schema);
+        var token = JObject.FromObject(writer.Encode(frame));
+        Check(token["Actors"]![0]!["RouteState"] == null);
+        Check(reader.Decode(token).Actors[0].RouteState == null);
+        token["Actors"]![0]!["RouteState"] = JObject.FromObject(Actor(0, 0).RouteState!);
+        Reject(() => new ReplayDeltaCodec.Reader(schema).Decode(token));
+        Reject(() => new ReplayDeltaCodec.Writer(schema).Encode(Frame(0, Actor(0, 0))));
+    }
+});
+Test("route states rebase even without joint poses and retain their shared center arrays", () =>
+{
+    var frame = Frame(200, Actor(200, 1)); var prior = frame.Actors[0].RouteState!;
+    var rebaser = new ContinuousReplayRebaser(200); var a = rebaser.Apply(frame); var b = rebaser.Apply(Frame(200.1, frame.Actors));
+    Check(a.Actors[0].RouteState!.SampleTime == 0 && prior.SampleTime == 200);
+    Check(ReferenceEquals(a.Actors[0].RouteState!.Center, prior.Center));
+    Check(ReferenceEquals(a.Actors[0].RouteState, b.Actors[0].RouteState));
+});
+Test("metadata validates malformed gates, identities, native timestamps and non-finite centers", () =>
+{
+    var header = Header(); header.RouteContext!.RecordingId = "raw-id"; Reject(() => ReplayRules.Validate(header));
+    header = Header(); header.RouteContext!.Stages[1].ExitZCm = 500; Reject(() => ReplayRules.Validate(header));
+    var frame = Frame(0, Actor(0, 0)); frame.Actors[0].RouteState!.SampleTime = 1; Reject(() => ReplayRules.Validate(frame, -1));
+    frame = Frame(0, Actor(0, 0)); frame.Actors[0].RouteState!.Center[0] = float.NaN; Reject(() => ReplayRules.Validate(frame, -1));
+});
+Test("complete archive exports only whitelist fields, centimeter centers and unique 10 Hz points across pages", () => InRoot(root =>
+{
+    var source = Save(root, Header(), SyntheticFrames());
+    var info = FullReplayArchive.ReadInfo(source.FilePath); Check(info.Pages.Length >= 2 && info.Pages.Skip(1).Any(p => p.Overlap));
+    var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "export"));
+    var package = ReadPackage(result.Path);
+    Check((string?)package["format"] == "trajectory-v1" && (int?)package["sampleHz"] == 10 && (string?)package["coordinateUnit"] == "cm");
+    Check((long?)package["timeOriginMs"] == 90000 && (int?)package["durationMs"] == 12000);
+    Check(result.PlayerCount == 2 && result.PointCount == 242 && result.NativeEvidence && result.StageGatesKnown && result.PlayerNames.Length == 2);
+    Check(package.Properties().Select(p => p.Name).OrderBy(s => s).SequenceEqual(new[]
+    { "format", "recordingId", "runKey", "timeOriginMs", "startedUtc", "durationMs", "sampleHz", "coordinateUnit", "map", "difficulty", "players" }.OrderBy(s => s)));
+    var players = (JArray)package["players"]!;
+    Check(players[0]!["key"]!.Value<string>() != players[1]!["key"]!.Value<string>());
+    foreach (var player in players)
+    {
+        Check(ReplayRouteRules.HashKey((string?)player["key"]));
+        Check((string?)player["evidence"] == "native-state");
+        var points = (JArray)player["points"]!;
+        Check(points[0]![1]!.Value<int>() == 125 && points[0]![2]!.Value<int>() == 250);
+        for (int i = 1; i < points.Count; i++) Check(points[i]![0]!.Value<int>() - points[i - 1]![0]!.Value<int>() >= 100);
+    }
+    string json = package.ToString();
+    foreach (string forbidden in new[] { "private-photon-id", "Inventory", "Stamina", "JointPose", "Audio", "Appearance", "MapObjects", "GameAssembly" }) Check(!json.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
+    Check(result.CompressedBytes == new FileInfo(result.Path).Length && result.DecodedBytes < ReplayTrajectoryExporter.MaximumDecodedBytes);
+    Check(new FileInfo(source.FilePath).Length == new FileInfo(info.Path).Length);
+}));
+Test("legacy complete source uploads with absent optional map keys and unknown difficulty/evidence", () => InRoot(root =>
+{
+    var header = Header(false);
+    var frames = new[] { Frame(200, new ActorFrame { Id = "legacy", Name = "Old", Position = new[] { 0f, 0f, 0f } }),
+        Frame(200.1, new ActorFrame { Id = "legacy", Name = "Old", Position = new[] { 1f, 0f, 0f } }) };
+    var source = Save(root, header, frames); var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"));
+    var package = ReadPackage(result.Path);
+    Check(package["runKey"] == null && package["timeOriginMs"] == null && package["map"]!["layoutKey"] == null && package["map"]!["levelIndex"] == null);
+    Check(package["difficulty"]!["ascent"]!.Type == JTokenType.Null && package["difficulty"]!["custom"]!.Type == JTokenType.Null && package["difficulty"]!["mini"]!.Type == JTokenType.Null);
+    Check((string?)package["players"]![0]!["evidence"] == "legacy-unknown" && !result.NativeEvidence && !result.StageGatesKnown);
+}));
+Test("player-local crossings finish only that player, with no invented teleport or gap bridge", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), 8);
+    builder.Observe(Frame(0, Actor(0, 0), Actor(0, 0, "second", false)));
+    builder.Observe(Frame(.1, Actor(.1, 1), Actor(.1, 0, "second", false)));
+    builder.Observe(Frame(1, Actor(1, 11), Actor(1, 0, "second", false)));
+    var warped = Actor(1.1, 50); warped.RouteState!.WarpSequence = 1;
+    builder.Observe(Frame(1.1, warped, Actor(1.1, 0, "second", false)));
+    builder.Observe(Frame(4, Actor(4, 55), Actor(4, 0, "second", false)));
+    var package = builder.Finish();
+    Check(package.Players[0].Events.Count(e => e.Kind == "finish" && e.StageIndex == 0) == 1);
+    Check(!package.Players[1].Events.Any(e => e.Kind == "finish"));
+    Check(!package.Players[0].Events.Any(e => e.Kind == "finish" && e.StageIndex > 0));
+    Check(package.Players[0].Events.Any(e => e.Kind == "warp") && package.Players[0].Events.Count(e => e.Kind == "break") >= 2);
+});
+Test("death, revive, leave and rejoin break route continuity and never qualify dead crossings", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), 2);
+    builder.Observe(Frame(0, Actor(0, 0)));
+    var dead = Actor(.1, 11); dead.RouteState!.Alive = false; builder.Observe(Frame(.1, dead));
+    builder.Observe(Frame(.2, Actor(.2, 12)));
+    builder.Observe(Frame(.3)); builder.Observe(Frame(.4, Actor(.4, 13)));
+    var package = builder.Finish(); var events = package.Players[0].Events;
+    Check(events.Any(e => e.Kind == "dead") && events.Any(e => e.Kind == "revive") && events.Any(e => e.Kind == "leave"));
+    Check(events.Count(e => e.Kind == "join") == 2 && !events.Any(e => e.Kind == "finish"));
+});
+Test("no resampling creates points across native sample gaps or low source cadence", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), 10);
+    foreach (double t in new[] { 0d, .25, .5, 5, 10 }) builder.Observe(Frame(t, Actor(t, (float)t)));
+    var package = builder.Finish(); Check(package.Players[0].Points.Count == 5);
+    Check(package.Players[0].Points.Select(p => p[0]).SequenceEqual(new[] { 0, 250, 500, 5000, 10000 }));
+    Check(package.Players[0].Events.Count(e => e.Kind == "break") == 2);
+});
+Test("recording-scoped fallback hashes keep equal names separate and repeated exports stable", () =>
+{
+    var h = Header(false);
+    TrajectoryPackage Build()
+    {
+        var b = new ReplayTrajectoryExporter.Builder(h, .1);
+        b.Observe(Frame(0, Actor(0, 0, "one"), Actor(0, 0, "two")));
+        b.Observe(Frame(.1, Actor(.1, 1, "one"), Actor(.1, 1, "two"))); return b.Finish();
+    }
+    var first = Build(); var second = Build();
+    Check(first.RecordingId == second.RecordingId && first.Players[0].Key == second.Players[0].Key && first.Players[0].Key != first.Players[1].Key);
+    h.StartedUtc = "2026-10-07T01:00:00Z"; Check(Build().RecordingId != first.RecordingId);
+});
+Test("unfinished archives and 120-second or partial names reject without writing an upload", () => InRoot(root =>
+{
+    var frames = new[] { Frame(200, Actor(200, 0)), Frame(200.1, Actor(200.1, 1)) };
+    var fault = Save(root, Header(), frames, true);
+    string partial = Directory.GetFiles(root, "*.partial").Single(); string fakeFinal = Path.Combine(root, "fault.peakrun"); File.Copy(partial, fakeFinal);
+    Reject(() => ReplayTrajectoryExporter.Export(partial, Path.Combine(root, "out")));
+    Reject(() => ReplayTrajectoryExporter.Export(fakeFinal, Path.Combine(root, "out")));
+    Reject(() => ReplayTrajectoryExporter.Export(Path.Combine(root, "memory.peakreplay"), Path.Combine(root, "out")));
+    Check(!Directory.Exists(Path.Combine(root, "out")));
+}));
+Test("cancellation during sequential export leaves the source intact and no complete upload", () => InRoot(root =>
+{
+    var source = Save(root, Header(), SyntheticFrames()); long size = new FileInfo(source.FilePath).Length;
+    using var cancellation = new CancellationTokenSource();
+    try
+    {
+        ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"), cancellation.Token,
+            progress => { if (progress > .1) cancellation.Cancel(); });
+        throw new Exception("Cancellation was ignored.");
+    }
+    catch (OperationCanceledException) { }
+    Check(new FileInfo(source.FilePath).Length == size && !Directory.Exists(Path.Combine(root, "out")));
+}));
+Test("compressed and decoded limits abort the real package writer and remove only its temporary output", () => InRoot(root =>
+{
+    var source = Save(root, Header(), SyntheticFrames()); long size = new FileInfo(source.FilePath).Length;
+    foreach (bool compressed in new[] { true, false })
+    {
+        string output = Path.Combine(root, compressed ? "gzip-limit" : "raw-limit"); Directory.CreateDirectory(output);
+        string sentinel = Path.Combine(output, "keep.txt"); File.WriteAllText(sentinel, "keep");
+        Reject(() => ReplayTrajectoryExporter.ExportWithSmallerLimits(source.FilePath, output,
+            compressed ? 30 : ReplayTrajectoryExporter.MaximumCompressedBytes,
+            compressed ? ReplayTrajectoryExporter.MaximumDecodedBytes : 100));
+        Check(Directory.GetFiles(output).SequenceEqual(new[] { sentinel }) && File.ReadAllText(sentinel) == "keep");
+    }
+    Check(new FileInfo(source.FilePath).Length == size);
+}));
+Test("late real RunId after empty or stale startup identity preserves early points and uses reset shared clock", () =>
+{
+    foreach (bool stale in new[] { true, false })
+    {
+        var header = Header(); header.RouteContext!.RunKey = stale ? ReplayRouteRules.Hash("old-run") : null;
+        var builder = new ReplayTrajectoryExporter.Builder(header, 3);
+        foreach (double time in new[] { 0d, .1, 1, 2, 2.1, 3 })
+        {
+            var actor = Actor(time, (float)time);
+            actor.RouteState!.SharedRunKey = time < 2 ? stale ? ReplayRouteRules.Hash("old-run") : "" : ReplayRouteRules.Hash("new-run");
+            actor.RouteState.RunTimeMs = time < 2 ? (long)(time * 1000) : (long)((time - 2) * 1000);
+            builder.Observe(Frame(time, actor));
+        }
+        var package = builder.Finish();
+        Check(package.RunKey == ReplayRouteRules.Hash("new-run") && package.TimeOriginMs == -2000);
+        Check(package.DurationMs == 3000 && package.Players[0].Points[0][0] == 0 && package.Players[0].Points.Count == 6);
+        var later = new ReplayTrajectoryExporter.Builder(Header(), 1);
+        foreach (double time in new[] { 0d, .1, 1 })
+        {
+            var actor = Actor(time, (float)time + 3); actor.RouteState!.SharedRunKey = ReplayRouteRules.Hash("new-run");
+            actor.RouteState.RunTimeMs = 1000 + (long)(time * 1000); later.Observe(Frame(time, actor));
+        }
+        var second = later.Finish();
+        Check(second.TimeOriginMs == 1000 && package.Players[0].Key == second.Players[0].Key);
+    }
+});
+Test("same RunId arriving before timer reset uses the later reset clock without discarding early points", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), 3);
+    foreach (double time in new[] { 0d, .1, 1, 2, 2.1, 3 })
+    {
+        var actor = Actor(time, (float)time);
+        actor.RouteState!.RunTimeMs = time < 2 ? 50_000 + (long)(time * 1000) : (long)((time - 2) * 1000);
+        builder.Observe(Frame(time, actor));
+    }
+    var package = builder.Finish();
+    Check(package.RunKey == ReplayRouteRules.Hash("synthetic-shared-run") && package.TimeOriginMs == -2000);
+    Check(package.Players[0].Points.Count == 6 && package.Players[0].Points[0][0] == 0);
+});
+Test("unknown shared clock keeps identity recording-scoped instead of inventing a time origin", () =>
+{
+    var header = Header(); var builder = new ReplayTrajectoryExporter.Builder(header, .1);
+    foreach (double time in new[] { 0d, .1 })
+    {
+        var actor = Actor(time, (float)time); actor.RouteState!.RunTimeMs = -1; builder.Observe(Frame(time, actor));
+    }
+    var package = builder.Finish(); Check(package.RunKey == null && package.TimeOriginMs == null);
+    Check(package.Players[0].Key == ReplayRouteRules.Hash("peak-memories/player/v1/" + package.RecordingId + "/private-photon-id-alpha"));
+});
+Test("writer snapshots recording context before external mutation", () => InRoot(root =>
+{
+    var header = Header(); header.CoverOutcome = new ReplayRegionOutcome(200, false);
+    var writer = new FullReplayWriter(root, header);
+    header.RouteContext!.Ascent = 8; header.RouteContext.Stages[0].ExitZCm = 99999;
+    Check(writer.TryEnqueue(Frame(200, Actor(200, 0))) && writer.TryEnqueue(Frame(200.1, Actor(200.1, 1))));
+    var task = writer.CompleteAsync(); Check(task.Wait(TimeSpan.FromSeconds(10)));
+    var info = FullReplayArchive.ReadInfo(task.Result.FilePath);
+    Check(info.Header.RouteContext!.Ascent == 3 && info.Header.RouteContext.Stages[0].ExitZCm == 1000);
+}));
+
+int fixtureIndex = Array.IndexOf(args, "--fixture-dir");
+if (fixtureIndex >= 0)
+{
+    if (fixtureIndex + 1 >= args.Length) throw new ArgumentException("--fixture-dir needs a directory.");
+    string root = Path.GetFullPath(args[fixtureIndex + 1]); Directory.CreateDirectory(root);
+    var source = Save(root, Header(), SyntheticFrames()); var result = ReplayTrajectoryExporter.Export(source.FilePath, root);
+    File.WriteAllText(Path.Combine(root, "fixture.json"), JsonConvert.SerializeObject(new
+    {
+        source = source.FilePath, package = result.Path, result.CompressedBytes, result.DecodedBytes,
+        result.PointCount, result.PlayerCount, result.DurationMs, synthetic = true,
+    }, Formatting.Indented));
+    Console.WriteLine("FIXTURE " + result.Path);
+}
+Console.WriteLine($"TOTAL: {passed} trajectory checks passed. No real recording, identity, Unity runtime or HTTP endpoint is used.");

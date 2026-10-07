@@ -33,6 +33,10 @@ internal static class Capture
         public double NextCosmeticRead;
         public readonly ActorJointCapture Joints = new();
         public ReplayHudState? HudState;
+        public ActorRouteState? RouteState;
+        public double NextRouteRead;
+        public int WarpSequence;
+        public bool WatchingWarp;
     }
     private static ConditionalWeakTable<Character, ActorCache> actors = new();
     // This native field is internal. Resolve its access once, so sampling uses
@@ -75,12 +79,14 @@ internal static class Capture
             ? string.Join(",", map.segments.Select(s => s.biome.ToString())) : "no-map-handler";
         int build = 0;
         try { build = Steamworks.SteamApps.GetAppBuildId(); } catch { /* Non-Steam debug environment. */ }
-        return new ReplayHeader
+        var header = new ReplayHeader
         {
             Scene = SceneManager.GetActiveScene().name, GameVersion = Application.version,
             BuildId = build, GameAssembly = typeof(Character).Assembly.ManifestModule.ModuleVersionId.ToString("N"),
             Route = route, SampleHz = hz, StartedUtc = DateTime.UtcNow.ToString("O"),
         };
+        if (map && map.segments != null) header.RouteContext = NativeReplayRouteCapture.Context(map, header);
+        return header;
     }
 
     public static ActorFrame Actor(Character c, double time)
@@ -107,6 +113,7 @@ internal static class Capture
             Look = new[] { d.lookValues.x, d.lookValues.y }, Movement = new[] { c.input.movementInput.x, c.input.movementInput.y },
             Stamina = d.currentStamina, ExtraStamina = d.extraStamina,
             HudState = HudStateOf(c, cache),
+            RouteState = RouteStateOf(c, cache, time),
             WebWrap = WebWrapReplayCapture.Sample(c),
             Appearance = AppearanceOf(c),
             Inventory = inventory, InventoryKnown = inventoryKnown,
@@ -115,6 +122,38 @@ internal static class Capture
             Action = d.dead ? "dead (approx.)" : d.passedOut || d.fullyPassedOut ? "passed out (approx.)" : limp ? "tumbling (approx.)" :
                 d.isClimbingAnything ? "climbing" : !d.isGrounded ? "airborne" : d.isSprinting ? "sprinting" :
                 d.isCrouching ? "crouching" : c.input.movementInput.sqrMagnitude > .01f ? "walking" : "idle",
+        };
+    }
+
+    private static ActorRouteState RouteStateOf(Character character, ActorCache cache, double time)
+    {
+        if (!cache.WatchingWarp)
+        {
+            cache.WatchingWarp = true;
+            // The delegate references only this actor's weak-cache value; no
+            // global character list, Unity search, I/O, or extra Update loop.
+            character.WarpCompleted += _ => { if (cache.WarpSequence < int.MaxValue) cache.WarpSequence++; };
+        }
+        bool alive = !character.data.dead, owner = character.IsLocal, warping = character.warping;
+        var stats = character.refs.stats;
+        bool finished = stats && stats.won, nadir = finished && stats!.wonViaNadir;
+        var old = cache.RouteState;
+        bool statusChanged = old == null || old.Alive != alive || old.LocalOwner != owner || old.Warping != warping ||
+            old.WarpSequence != cache.WarpSequence || old.Finished != finished || old.FinishedNadir != nadir;
+        if (!statusChanged && time < cache.NextRouteRead && time >= cache.NextRouteRead - .2) return old!;
+        var p = character.Center;
+        var center = old != null && old.Center[0] == p.x && old.Center[1] == p.y && old.Center[2] == p.z
+            ? old.Center : new[] { p.x, p.y, p.z };
+        long runTime = -1;
+        var run = RunManager.Instance;
+        if (run && ReplayRules.Finite(run.TimeSinceRunStarted) && run.TimeSinceRunStarted >= 0)
+            runTime = (long)Math.Round(run.TimeSinceRunStarted * 1000d);
+        cache.NextRouteRead = time + .1;
+        return cache.RouteState = new ActorRouteState
+        {
+            SampleTime = time, Center = center, Alive = alive, LocalOwner = owner, Warping = warping,
+            WarpSequence = cache.WarpSequence, Finished = finished, FinishedNadir = nadir, RunTimeMs = runTime,
+            SharedRunKey = NativeReplayRouteCapture.SharedRunKey(run),
         };
     }
 
@@ -216,16 +255,16 @@ internal sealed class RollingCapture : IDisposable
     public int CreatureCount { get; private set; }
     public int JointCount { get; private set; }
 
-    public RollingCapture(int hz, long budget, Action<string>? warning = null, bool keepRollingHistory = true)
+    public RollingCapture(int hz, long budget, Action<string>? warning = null)
     {
         this.warning = warning;
         Header = Capture.Header(hz);
         mapObjects = WorldTrack.MapObjects();
         Header.MapObjects = mapObjects.Select(WorldTrack.Path).ToArray();
         ReplayRules.Validate(Header);
-        // Continuous recording needs only the current/previous immutable samples
-        // for accounting and publication, not a parallel 120-second history.
-        Buffer = new RollingBuffer(budget, frameLimit: keepRollingHistory ? ReplayRules.MaxFrames : 2);
+        // F6 is always available. The optional full-run sink receives these same
+        // immutable snapshots; it does not create a second capture or cache.
+        Buffer = new RollingBuffer(budget, frameLimit: ReplayRules.MaxFrames);
         clock = new SampleClock(hz);
         items = new ItemCapture(warning);
         crates = new LuggageCapture(warning);

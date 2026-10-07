@@ -15,7 +15,7 @@ namespace PeakReplayLab;
 // Only its content is ours. Never clone a menu page (which can start matchmaking).
 internal sealed class NativeMemoriesLibrary : IDisposable
 {
-    private enum Page { Library, Details, Modes, ConfirmMode, ConfirmDelete, Loading }
+    private enum Page { Library, Details, Routes, Modes, ConfirmMode, ConfirmDelete, Loading }
     internal sealed class State
     {
         public MemoriesLibraryItem[] Items = Array.Empty<MemoriesLibraryItem>();
@@ -26,6 +26,9 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         public string DeleteError = "";
         public MemoriesLibraryItem? DeleteItem;
         public long DeleteBytes;
+        public bool CanUpload, RouteExporting, RouteSending, RouteReady, RouteFinished;
+        public string RouteSummary = "", RouteError = "";
+        public float RouteProgress;
     }
     private sealed class Content : ModalContentOption
     {
@@ -56,6 +59,8 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     private readonly Action<ReplayRecordingMode> chooseMode;
     private readonly Func<string, bool> requestDelete;
     private readonly Action confirmDelete, cancelDelete;
+    private readonly Func<string, bool> prepareRoute;
+    private readonly Action uploadRoute, cancelRoute, openRoutes;
     private readonly List<Button[]> navigationRows = new();
     private readonly NativeMemoriesCoverArt covers = new();
     private State state = new();
@@ -69,6 +74,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     private GameObject? buttonPrefab, textPrefab;
     private string loadingLabel = "";
     private TMP_Text? loadingText;
+    private TMP_Text? routeText;
     private Button? firstButton;
     public bool IsVisible => OwnsModal && modal!.Visible;
     private bool OwnsModal => modal && headerRoot && modal!.headerParent.childCount == 1 &&
@@ -76,11 +82,13 @@ internal sealed class NativeMemoriesLibrary : IDisposable
 
     public NativeMemoriesLibrary(Action close, Action refresh, Action openFolder, Action<bool> chooseCollection,
         Action<string> play, Action<ReplayRecordingMode> chooseMode, Action cancelLoading,
-        Func<string, bool> requestDelete, Action confirmDelete, Action cancelDelete)
+        Func<string, bool> requestDelete, Action confirmDelete, Action cancelDelete,
+        Func<string, bool> prepareRoute, Action uploadRoute, Action cancelRoute, Action openRoutes)
     {
         this.close = close; this.refresh = refresh; this.openFolder = openFolder; this.chooseCollection = chooseCollection;
         this.play = play; this.chooseMode = chooseMode; this.cancelLoading = cancelLoading;
         this.requestDelete = requestDelete; this.confirmDelete = confirmDelete; this.cancelDelete = cancelDelete;
+        this.prepareRoute = prepareRoute; this.uploadRoute = uploadRoute; this.cancelRoute = cancelRoute; this.openRoutes = openRoutes;
     }
 
     public bool CanOpen => !Modal.IsOpen || OwnsModal;
@@ -96,6 +104,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     {
         if (!OwnsModal) return;
         if (page == Page.Loading) { cancelLoading(); return; }
+        if (page == Page.Routes) { cancelRoute(); Navigate(Page.Details); return; }
         if (page == Page.ConfirmDelete) { cancelDelete(); Navigate(Page.Details); }
         else if (page == Page.ConfirmMode) Navigate(Page.Modes);
         else if (page != Page.Library) Navigate(Page.Library);
@@ -117,9 +126,12 @@ internal sealed class NativeMemoriesLibrary : IDisposable
             next.Mode != state.Mode || next.CanSwitch != state.CanSwitch || next.ModeHelp != state.ModeHelp || next.Status != state.Status ||
             next.CanManage != state.CanManage || next.Managing != state.Managing || next.DeletePreparing != state.DeletePreparing ||
             next.DeleteMoving != state.DeleteMoving || next.DeleteReady != state.DeleteReady || next.DeleteError != state.DeleteError ||
-            next.DeleteItem != state.DeleteItem || next.DeleteBytes != state.DeleteBytes)
+            next.DeleteItem != state.DeleteItem || next.DeleteBytes != state.DeleteBytes ||
+            next.CanUpload != state.CanUpload || next.RouteExporting != state.RouteExporting || next.RouteSending != state.RouteSending ||
+            next.RouteReady != state.RouteReady || next.RouteFinished != state.RouteFinished || next.RouteError != state.RouteError)
             dirty = true;
         state = next;
+        if (page == Page.Routes && routeText) routeText!.text = RouteDescription();
         if (page == Page.ConfirmDelete && next.DeleteItem != null) selected = next.DeleteItem;
         pageIndex = MemoriesLibraryModel.ClampPage(pageIndex, state.Items.Length);
         if (loading)
@@ -146,14 +158,15 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         switch (page)
         {
             case Page.Details: title = "这一段旅程"; subtitle = selected?.Title ?? "录像详情"; break;
-            case Page.Modes: title = "录制方式"; subtitle = "只影响之后的录制，已保存的回忆不会改变"; break;
-            case Page.ConfirmMode: title = "切换录制方式？"; subtitle = "尚未保存的临时缓存会被清空"; break;
+            case Page.Routes: title = "上传轨迹"; subtitle = "完整录像 · 只上传筛选后的坐标与关键信息"; break;
+            case Page.Modes: title = "录制方式"; subtitle = NativeMemoriesRecordingControls.Subtitle; break;
+            case Page.ConfirmMode: title = NativeMemoriesRecordingControls.ConfirmTitle(pendingMode); subtitle = "片段缓存保留 · 已保存的回忆不会改变"; break;
             case Page.ConfirmDelete: title = "删除这份回忆？"; subtitle = "移入本地回收目录，不会永久删除"; break;
             case Page.Loading: title = "正在打开回忆"; subtitle = "自动还原当时的场景与装扮 · 只读离线重演"; break;
             default:
                 subtitle = state.Reading ? "正在读取本地录像…" :
                     (state.FullRuns ? "完整录像" : "精彩片段") + " · " + state.Items.Length + " 份回忆 · " +
-                    (state.Mode == ReplayRecordingMode.Continuous ? "持续录制" : "120 秒内存缓存");
+                    NativeMemoriesRecordingControls.Status(state.Mode);
                 break;
         }
         if (!buttonPrefab)
@@ -171,7 +184,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
 
     private void Build(Transform parent)
     {
-        navigationRows.Clear(); firstButton = null; loadingText = null;
+        navigationRows.Clear(); firstButton = null; loadingText = null; routeText = null;
         contentRoot = new GameObject("PEAK Memories - native modal content", typeof(RectTransform), typeof(VerticalLayoutGroup), typeof(LayoutElement));
         var rect = contentRoot.GetComponent<RectTransform>();
         Place(contentRoot, parent, new Vector2(0, -120), new Vector2(1050, 600));
@@ -183,6 +196,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         {
             case Page.Library: BuildLibrary(rect); break;
             case Page.Details: BuildDetails(rect); break;
+            case Page.Routes: BuildRoutes(rect); break;
             case Page.Modes: BuildModes(rect); break;
             case Page.ConfirmMode: BuildConfirmation(rect); break;
             case Page.ConfirmDelete: BuildDeleteConfirmation(rect); break;
@@ -203,8 +217,8 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         var list = Column(parent, 352);
         if (state.Items.Length == 0)
             Label(list, state.Reading ? "正在整理你的回忆…" : state.FullRuns ?
-                "这里还没有完整录像\n\n选择「持续录制」，进入关卡后自动记录整局。" :
-                "这里还没有精彩片段\n\n选择「内存 120 秒」，在游戏中按保存键留下精彩瞬间。", 330, 26);
+                "这里还没有完整录像\n\n在录制方式中开启完整录制，或按 F4 开启；F6 仍可保存片段。" :
+                "这里还没有精彩片段\n\n正常游玩时按 F6 保存最近最多 120 秒，完整录制开关不影响片段保存。", 330, 26);
         int start = pageIndex * MemoriesLibraryModel.PageSize;
         for (int i = start; i < Math.Min(state.Items.Length, start + MemoriesLibraryModel.PageSize); i++)
         {
@@ -285,17 +299,40 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         var item = selected;
         ScrollDetails(parent, item?.Details ?? "这份录像已不可用，请刷新列表。");
         Label(parent, state.Status.Length > 150 ? state.Status.Substring(0, 150) + "…" : state.Status, 40, 21);
-        Row(parent, 62, (item?.Playable == true ? "进入回忆" : "这份录像暂不可播放", () =>
+        var playback = (item?.Playable == true ? "进入回忆" : "这份录像暂不可播放", (Action)(() =>
         {
             if (item?.Playable != true) return;
             // Open first. If validation throws, the owned details stay available.
             play(item.Path);
-        }, item?.Playable == true && !state.Managing));
+        }), item?.Playable == true && !state.Managing);
+        if (item?.IsFullRun == true)
+            Row(parent, 62, playback, ("上传轨迹", () =>
+            {
+                if (item.Playable && state.CanUpload && prepareRoute(item.Path)) Navigate(Page.Routes);
+            }, item.Playable && state.CanUpload));
+        else Row(parent, 62, playback);
         Row(parent, 48, ("返回录像列表", () => Navigate(Page.Library), true),
             (state.Managing ? "正在处理文件…" : "删除录像", () =>
             {
                 if (item != null && state.CanManage && requestDelete(item.Path)) Navigate(Page.ConfirmDelete);
             }, item != null && state.CanManage));
+    }
+
+    private string RouteDescription() => state.RouteExporting
+        ? $"{state.RouteSummary}\n\n筛选进度：{Math.Max(0, Math.Min(100, state.RouteProgress * 100)):F0}%"
+        : state.RouteSummary + (state.RouteSending ? "\n\n正在上传…" : "") +
+            (state.RouteError.Length == 0 ? "" : "\n\n" + state.RouteError);
+
+    private void BuildRoutes(Transform parent)
+    {
+        routeText = Label(parent, RouteDescription(), 400, 26);
+        if (state.RouteFinished)
+            Row(parent, 62, ("打开地图网站", openRoutes, true));
+        else
+            Row(parent, 62, (state.RouteExporting ? "正在筛选…" : state.RouteSending ? "正在上传…" :
+                state.RouteError.Length > 0 && state.RouteReady ? "重试上传" : "确认上传到 Web", uploadRoute,
+                state.RouteReady && !state.RouteSending && !state.RouteExporting));
+        Row(parent, 48, (state.RouteExporting || state.RouteSending ? "取消并返回" : "返回录像详情", Back, true));
     }
 
     private void BuildDeleteConfirmation(Transform parent)
@@ -350,28 +387,25 @@ internal sealed class NativeMemoriesLibrary : IDisposable
 
     private void BuildModes(Transform parent)
     {
-        Row(parent, 80, ((state.Mode == ReplayRecordingMode.Rolling120 ? "· 当前 · " : "") +
-            "内存 120 秒\n只在按下保存键时写入精彩片段", () => AskMode(ReplayRecordingMode.Rolling120), state.CanSwitch));
-        Row(parent, 80, ((state.Mode == ReplayRecordingMode.Continuous ? "· 当前 · " : "") +
-            "持续录制\n整局一个完整文件，一条连续时间轴", () => AskMode(ReplayRecordingMode.Continuous), state.CanSwitch));
-        Label(parent, state.ModeHelp + "\n\n" + (state.CanSwitch ? "切换模式会先确认，再清空尚未保存的缓存。" :
-            "正在保存，请等完成后再切换录制方式。"), 130, 24);
+        foreach (var choice in NativeMemoriesRecordingControls.Choices(state.Mode, state.CanSwitch))
+            Row(parent, 80, (choice.Label, () => AskMode(choice.Mode), choice.Enabled));
+        Label(parent, NativeMemoriesRecordingControls.Help + (state.CanSwitch ? "" :
+            "\n正在处理录像，请等完成后再修改完整录制。"), 160, 24);
         Row(parent, 48, ("返回录像列表", () => Navigate(Page.Library), true));
     }
 
     private void AskMode(ReplayRecordingMode mode)
     {
-        if (mode == state.Mode || !state.CanSwitch) return;
+        if (!NativeMemoriesRecordingControls.CanChoose(state.Mode, mode, state.CanSwitch)) return;
         pendingMode = mode; Navigate(Page.ConfirmMode);
     }
 
     private void BuildConfirmation(Transform parent)
     {
-        Label(parent, pendingMode == ReplayRecordingMode.Continuous ?
-            "之后进入关卡，将持续写入一个完整录像文件。\n\n不再同时保留 120 秒内存缓存。\n已保存的录像不受影响。" :
-            "之后只保留最近 120 秒的内存缓存。\n\n按保存键才会写入文件，不自动持续录制。\n已保存的录像不受影响。", 240, 26);
-        Row(parent, 60, ("确认切换", () => { chooseMode(pendingMode); Navigate(Page.Modes); }, state.CanSwitch),
-            ("保留当前模式", () => Navigate(Page.Modes), true));
+        Label(parent, NativeMemoriesRecordingControls.Confirmation(pendingMode), 240, 26);
+        Row(parent, 60, (pendingMode == ReplayRecordingMode.Continuous ? "确认开启" : "确认关闭",
+            () => { chooseMode(pendingMode); Navigate(Page.Modes); }, NativeMemoriesRecordingControls.CanChoose(state.Mode, pendingMode, state.CanSwitch)),
+            ("保持当前设置", () => Navigate(Page.Modes), true));
     }
 
     private static Transform Column(Transform parent, float height)

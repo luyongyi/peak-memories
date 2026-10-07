@@ -32,7 +32,6 @@
     <Compile Include="../../src/PeakReplayLab/MemoriesLibraryModel.cs" Link="MemoriesLibraryModel.cs" />
     <Compile Include="../../src/PeakReplayLab/ReplayRegionSummary.cs" Link="ReplayRegionSummary.cs" />
     <Compile Include="../../src/PeakReplayLab/NativeMemoriesNoteLayout.cs" Link="NativeMemoriesNoteLayout.cs" />
-    <Compile Include="../../src/PeakReplayLab/NativeMemoriesRecordingControls.cs" Link="NativeMemoriesRecordingControls.cs" />
     <Compile Include="../../src/PeakReplayLab/ReplayTrash.cs" Link="ReplayTrash.cs" />
     <Compile Include="../../src/PeakReplayLab/FullReplayData.cs" Link="FullReplayData.cs" />
     <Compile Include="../../src/PeakReplayLab/FullReplayWriter.cs" Link="FullReplayWriter.cs" />
@@ -60,6 +59,7 @@
     <Compile Include="../../src/PeakReplayLab/ActorJointCodec.cs" Link="ActorJointCodec.cs" />
     <Compile Include="../../src/PeakReplayLab/ActorJointSamplingPolicy.cs" Link="ActorJointSamplingPolicy.cs" />
     <Compile Include="../../src/PeakReplayLab/ActorJointTimeline.cs" Link="ActorJointTimeline.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayTrajectoryExporter.cs" Link="ReplayTrajectoryExporter.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>

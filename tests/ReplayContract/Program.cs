@@ -73,6 +73,13 @@ if (args.Contains("--drawer-only"))
     return;
 }
 
+if (args.Contains("--concurrent-only"))
+{
+    ConcurrentRecordingTests.Run(Test);
+    Console.WriteLine($"TOTAL: {passed} concurrent recording checks passed. Files contain synthetic data only; no Unity runtime is simulated.");
+    return;
+}
+
 Test("valid header and actor", () => { ReplayRules.Validate(Header()); ReplayRules.Validate(Frame(0), -1); });
 Test("same map compatibility", () => Check(ReplayRules.Compatible(Header(), Header())));
 Test("formats before schema 10 are incompatible even on the same map", () =>
@@ -204,9 +211,11 @@ RecordingModePolicyTests.Run(Test);
 MemoriesLibraryModelTests.Run(Test);
 ReplayRegionSummaryTests.Run(Test);
 NativeMemoriesNoteLayoutTests.Run(Test);
+NativeMemoriesRecordingControlsTests.Run(Test);
 ReplayTrashTests.Run(Test);
 FullReplayArchiveTests.Run(Test);
 FullReplayTimestampTests.Run(Test);
+ConcurrentRecordingTests.Run(Test);
 ReplayTimelineTests.Run(Test);
 ReplayHudStateTests.Run(Test);
 ReplayHudLayoutTests.Run(Test);

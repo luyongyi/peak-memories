@@ -144,6 +144,7 @@ public static class MemoriesLibraryModel
             ? "兼容旧版录像，已记录体力与状态条；未记录的天气、生物及放置物需新版重新录制。"
             : schema == 10
                 ? "兼容旧版录像；未记录的完整状态条、天气、生物及放置物需新版重新录制。"
+                : ReplayRules.SupportedSchema(schema) ? "兼容旧版录像；未记录的个人过关证据与难度无法补出。"
                 : "格式不受支持：请使用受支持的录像或重新录制。";
     private static string Participants(string[]? values)
     {
@@ -171,7 +172,7 @@ public static class MemoriesLibraryModel
     // TMP tags require literal ASCII angle brackets. Display them as harmless
     // visible characters rather than parsing or trusting user-controlled tags.
     // Remove directional/invisible controls; preserve valid emoji surrogate pairs.
-    private static string Plain(string? value, int maximum)
+    internal static string Plain(string? value, int maximum)
     {
         if (string.IsNullOrEmpty(value)) return "";
         var result = new StringBuilder(Math.Min(maximum + 1, value!.Length));

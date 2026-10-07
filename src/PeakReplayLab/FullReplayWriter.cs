@@ -298,6 +298,7 @@ public sealed class FullReplayWriter
     {
         Type = source.Type, Schema = source.Schema, Recorder = source.Recorder, Scene = source.Scene, GameVersion = source.GameVersion,
         BuildId = source.BuildId, GameAssembly = source.GameAssembly, Route = source.Route, StartedUtc = source.StartedUtc, SavedUtc = source.SavedUtc,
+        RouteContext = source.RouteContext?.Copy(),
         Duration = 0, FrameCount = 0, Participants = (string[])source.Participants.Clone(), MapObjects = (string[])source.MapObjects.Clone(),
         SampleHz = source.SampleHz, Fidelity = source.Fidelity,
     };

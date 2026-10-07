@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.7.4")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.0")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {
@@ -48,7 +48,7 @@ public sealed partial class Plugin : BaseUnityPlugin
     private void Awake()
     {
         notice = new ReplayNotice();
-        sampleHz = Config.Bind("Recording", "SampleHz", 60, new ConfigDescription("Target capture Hz; limited by rendered FPS. Recording.Mode chooses rolling memory OR one continuous file.", new AcceptableValueRange<int>(5, 60)));
+        sampleHz = Config.Bind("Recording", "SampleHz", 60, new ConfigDescription("Target capture Hz; limited by rendered FPS. One capture feeds the rolling highlight window and optional continuous recording.", new AcceptableValueRange<int>(5, 60)));
         budgetMiB = Config.Bind("Recording", "BufferBudgetMiB", 256, new ConfigDescription("Conservative rolling sample budget, not preallocated. Oldest frames are evicted when full; F9 shows actual duration.", new AcceptableValueRange<int>(32, 1024)));
         saveKey = Config.Bind("Controls", "SaveHighlightKey", Key.F6, "Save the previous 120 seconds without stopping capture.");
         performanceMetrics = Config.Bind("Diagnostics", "PerformanceMetrics", true, "Bounded CPU timings and rendered-frame cadence; F9 or recording stop saves a diagnostic JSON under PeakReplayLab/Performance. Frame cadence excludes warmup and sealing; CPU timings include initial capture; no GPU attribution.");
@@ -57,6 +57,7 @@ public sealed partial class Plugin : BaseUnityPlugin
         saveKeyLabel = saveKey.Value.ToString();
         saveKey.SettingChanged += (_, _) => saveKeyLabel = saveKey.Value.ToString();
         InitializeFullRuns();
+        InitializeRouteUploads();
         InitializeAutomation();
         try
         {
@@ -72,20 +73,22 @@ public sealed partial class Plugin : BaseUnityPlugin
                 full => { fullRunLibrary = full; if (full) RefreshFullRuns(); else RefreshLibrary(); },
                 path => Guard(() =>
                 {
-                    if (LibraryManagementBusy) { Note("正在处理录像文件，请稍候再播放。"); return; }
+                    if (LibraryManagementBusy || RouteUploadBusy) { Note("正在处理录像文件，请稍候再播放。"); return; }
                     theatre.Open(path); library = false; nextMenuTick = 0;
                 }),
                 mode => Guard(() => SetRecordingMode(mode)), () => theatre.Close(),
-                RequestReplayDeletion, ConfirmReplayDeletion, CancelReplayDeletion);
+                RequestReplayDeletion, ConfirmReplayDeletion, CancelReplayDeletion,
+                RequestRouteExport, ConfirmRouteUpload, CancelRouteUpload, OpenRouteWebsite);
         }
         catch (Exception e) { disabledByError = true; Logger.LogError(e); Note("回放保护未能安装，已停用新回放功能；原足迹 Mod 不受影响。"); }
         SceneManager.activeSceneChanged += SceneChanged;
-        Logger.LogInfo($"PEAK Memories 0.7.4: native replay HUD / {sampleHz.Value} Hz / mode={activeRecordingMode}. " + DirectoryPath);
+        Logger.LogInfo($"PEAK Memories 0.8.0: native replay HUD / {sampleHz.Value} Hz / mode={activeRecordingMode}. " + DirectoryPath);
     }
 
     private void Update()
     {
         UpdateFullRuns();
+        UpdateRouteUploads();
         UpdateAutomation();
         UpdateLibraryManagement();
         if (disabledByError) { UpdateNotice(); return; }
@@ -140,7 +143,7 @@ public sealed partial class Plugin : BaseUnityPlugin
             try { UpdateNativeLibrary(); }
             catch (Exception e)
             {
-                nativeUiFailed = true; Logger.LogError(e); library = false; nextMenuTick = 0; CancelReplayDeletion();
+                nativeUiFailed = true; Logger.LogError(e); library = false; nextMenuTick = 0; CancelReplayDeletion(); CancelRouteUpload();
                 Guard(() => nativeLibrary?.Hide());
                 if (theatre?.Loading == true) theatre.Close();
                 Note("原生回忆录界面未能打开，已停止界面重试：" + e.Message);
@@ -160,17 +163,21 @@ public sealed partial class Plugin : BaseUnityPlugin
             Items = fullRunLibrary ? fullRunCards : highlightCards,
             FullRuns = fullRunLibrary, Reading = fullRunLibrary ? fullRunListing != null : listing != null,
             Mode = activeRecordingMode, ModeHelp = ModeHelp, Status = status,
-            CanManage = CanManageRecordings, Managing = LibraryManagementBusy,
+            CanManage = CanManageRecordings, Managing = LibraryManagementBusy || RouteUploadBusy,
+            CanUpload = FileManagementAllowed && !LibraryManagementBusy,
+            RouteExporting = routeExport != null, RouteSending = routeSending != null,
+            RouteReady = routePackage != null, RouteFinished = routeFinished,
+            RouteSummary = routeSummary, RouteError = routeError, RouteProgress = VolatileRouteProgress(),
             DeletePreparing = preparingDeletion != null, DeleteMoving = movingDeletion != null,
             DeleteReady = CanConfirmDeletion, DeleteError = deletionError,
             DeleteItem = preparedDeletion?.Item, DeleteBytes = preparedDeletion?.Ticket.Length ?? 0,
-            CanSwitch = !LibraryManagementBusy && !ReplaySafety.Active && theatre?.Busy != true && RecordingModePolicy.CanSwitch(
+            CanSwitch = !LibraryManagementBusy && !RouteUploadBusy && !ReplaySafety.Active && theatre?.Busy != true && RecordingModePolicy.CanSwitch(
                 SceneManager.GetActiveScene().name == "Title", fullRun != null, closingFullRun != null, saving != null),
         }, library, theatre?.Loading == true && !ReplaySafety.Active,
             theatre?.NativeLoadingVisible == true, theatre?.Label ?? "");
     }
 
-    private void CloseLibrary() { CancelReplayDeletion(); library = false; nativeLibrary?.Hide(); nextMenuTick = 0; }
+    private void CloseLibrary() { CancelReplayDeletion(); CancelRouteUpload(); library = false; nativeLibrary?.Hide(); nextMenuTick = 0; }
 
     private void ToggleDiagnostics()
     {
@@ -232,7 +239,7 @@ public sealed partial class Plugin : BaseUnityPlugin
         {
             nextStatsTick = Time.realtimeSinceStartupAsDouble + .5;
             cachedPerformance = ReplayPerformance.Summary(theatre?.Playback != null);
-            cachedStats = capture != null ? (IsContinuous ? $"持续录制采集 · 仅驻留 {capture.Buffer.Count} 帧 · " : $"缓存 {capture.Buffer.Duration:F1} / 120 秒 · {capture.Buffer.Count} 帧 · ") +
+            cachedStats = capture != null ? $"片段缓存 {capture.Buffer.Duration:F1} / 120 秒 · {capture.Buffer.Count} 帧 · " +
             $"保守计量 {capture.Buffer.EstimatedBytes / 1048576d:F1} / {budgetMiB.Value} MiB" +
             $"\n主采样 {capture.ObservedHz:F1} / {sampleHz.Value} Hz · 关节 P0/P1/P2 目标 60/30/10 Hz · 节点 {capture.JointCount} · 物品 {capture.ItemCount} · 箱子 {capture.CrateCount} · 物品事件 {capture.EventCount}" +
             $"\n绳索/钩爪 {capture.RopeCount} · 特效 {capture.EffectCount} · 游戏音效 {capture.AudioCount} · 放置物 {capture.SpawnedCount} · 绑头气球 {capture.BalloonCount}" +
@@ -266,7 +273,7 @@ public sealed partial class Plugin : BaseUnityPlugin
             if (capture == null || captureScene != scene)
             {
                 capture?.Dispose();
-                capture = new RollingCapture(sampleHz.Value, budgetMiB.Value * 1024L * 1024, message => Logger.LogWarning(message), keepRollingHistory: !IsContinuous);
+                capture = new RollingCapture(sampleHz.Value, budgetMiB.Value * 1024L * 1024, message => Logger.LogWarning(message));
                 captureScene = scene;
                 ReplayPerformance.Reset();
                 // The native loading/title hint teaches the shortcut. Do not flash a
@@ -275,7 +282,6 @@ public sealed partial class Plugin : BaseUnityPlugin
                 Logger.LogInfo(status);
             }
             StartAutomaticFullRun();
-            if (IsContinuous && fullRun == null) { ItemEventCapture.Activate(false); return; }
             ItemEventCapture.Activate(true);
             capture.Tick(fullRun != null ? fullRunSink : null);
         }
@@ -291,7 +297,6 @@ public sealed partial class Plugin : BaseUnityPlugin
     private void SaveHighlight()
     {
         if (LibraryManagementBusy) { Note("正在处理录像文件，请稍候再保存。"); return; }
-        if (!RecordingModePolicy.CanSaveHighlight(activeRecordingMode)) { Note("当前为持续录制：整局写入一个完整文件，F4 停止；不是 120 秒内存模式。"); return; }
         if (theatre!.Busy) { Note("观看回忆录时不会再次录制回放。"); return; }
         if (saving != null) { Note("上一段正在保存，请稍等完成提示。"); return; }
         if (capture == null || capture.Buffer.Count < 2) { Note("还没有足够的游戏片段可保存。"); return; }
@@ -313,6 +318,7 @@ public sealed partial class Plugin : BaseUnityPlugin
 
     private void OpenLibrary()
     {
+        if (library && RouteUploadBusy) return;
         if (disabledByError || theatre!.Busy || SceneManager.GetActiveScene().name != "Title") return;
         if (nativeLibrary?.CanOpen != true || !FindFirstObjectByType<MainMenuMainPage>())
         { Note("请先关闭当前游戏弹窗，回到主菜单首页再打开回忆录。"); return; }
@@ -364,13 +370,14 @@ public sealed partial class Plugin : BaseUnityPlugin
     {
         DisposePlaybackUi();
         CancelReplayDeletion();
+        CancelRouteUpload();
         StopFullRun("scene-change:" + before.name + "->" + after.name);
         frameCadence.Reset();
         stoppedFullRunScene = int.MinValue; nextFullRunStatus = 0;
         nativeLibrary?.Hide(); menu?.Dispose(); capture?.Dispose(); captureScene = int.MinValue; ItemEventCapture.Activate(false); Capture.ClearCatalog(); library = false;
         WorldTrack.Reset();
-        // Rolling120 keeps pure data so F6 works after returning to the menu.
-        // Continuous seals the one existing file; it never makes a RAM highlight.
+        // Both full-recording settings retain the pure rolling window so F6
+        // remains available after returning to the menu while the file seals.
     }
     private void Guard(Action action)
     {
@@ -382,10 +389,11 @@ public sealed partial class Plugin : BaseUnityPlugin
         status = message; if (notify) notice?.Show(message); Logger.LogInfo(message);
     }
     private void OnApplicationQuit() { quitting = true; StopFullRun("application-quit"); WaitForFullRunShutdown(); }
-    private void OnDisable() { DisposePlaybackUi(); StopFullRun("plugin-disabled"); RestoreAutomationOverride(); ItemEventCapture.Activate(false); capture?.Dispose(); captureScene = int.MinValue; if (!quitting) theatre?.Dispose(); nativeLibrary?.Dispose(); menu?.Dispose(); notice?.Dispose(); }
+    private void OnDisable() { CancelRouteUpload(); DisposePlaybackUi(); StopFullRun("plugin-disabled"); RestoreAutomationOverride(); ItemEventCapture.Activate(false); capture?.Dispose(); captureScene = int.MinValue; if (!quitting) theatre?.Dispose(); nativeLibrary?.Dispose(); menu?.Dispose(); notice?.Dispose(); }
     private void OnDestroy()
     {
         SceneManager.activeSceneChanged -= SceneChanged;
+        CancelRouteUpload();
         DisposePlaybackUi();
         StopFullRun("plugin-destroyed");
         if (!quitting) theatre?.Dispose();

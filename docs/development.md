@@ -14,7 +14,7 @@ dotnet build PeakReplayLab.slnx -c Release "-p:PEAKGameRootDir=C:/Program Files 
 
 ## 独立测试
 
-以下六个可执行测试项目不需要游戏安装或游戏资产，可以逐个运行：
+以下八个可执行测试项目不需要游戏安装或游戏资产，可以逐个运行：
 
 ```powershell
 dotnet run --project tests/ReplayContract/ReplayContract.csproj -c Release
@@ -23,9 +23,11 @@ dotnet run --project tests/NativeLoadingContract/NativeLoadingContract.csproj -c
 dotnet run --project tests/ReplayViewContract/ReplayViewContract.csproj -c Release
 dotnet run --project tests/ReplayNameplateContract/ReplayNameplateContract.csproj -c Release
 dotnet run --project tests/ReplayAudioSpatialContract/ReplayAudioSpatialContract.csproj -c Release
+dotnet run --project tests/TrajectoryContract/TrajectoryContract.csproj -c Release
+dotnet run --project tests/TrajectoryUploadContract/TrajectoryUploadContract.csproj -c Release
 ```
 
-GitHub Actions 在 Ubuntu 和 Windows 上安装 .NET 10 和 .NET 8，分别构建并运行这六个项目。CI 不构建包含游戏 DLL 引用的生产解决方案。Windows 覆盖 Windows 专用的文件操作检查，Linux 会跳过部分系统相关检查，两平台的通过数量可能不同。
+GitHub Actions 在 Ubuntu 和 Windows 上安装 .NET 10 和 .NET 8，分别构建并运行这八个项目。CI 不构建包含游戏 DLL 引用的生产解决方案。Windows 覆盖 Windows 专用的文件操作检查，Linux 会跳过部分系统相关检查，两平台的通过数量可能不同。
 
 测试验证数据格式、回放时钟、调度和资源配置；涉及 Unity 的项目使用小型替身。实际画面、声音与性能仍需在游戏内录制和回放验收。
 

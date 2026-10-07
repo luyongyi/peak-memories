@@ -6,7 +6,7 @@ Build from the repository root:
 dotnet build tools/ReleaseVerifier/ReleaseVerifier.csproj -c Release --nologo -warnaserror
 dotnet artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll self-test
 dotnet artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll inspect artifacts/bin/PeakReplayLab/release/PeakReplayLab.dll
-dotnet artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll verify package.zip . v0.7.4 <full-40-character-commit>
+dotnet artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll verify package.zip . v0.8.0 <full-40-character-commit>
 ```
 
 `inspect` emits one JSON object. It reads managed PE metadata using

@@ -10,6 +10,8 @@
 *.peakreplay
 *.ndjson
 *.partial
+*.trajectory.json.gz
+*.trajectory.json.gz.receipt.json
 *.log
 *.cfg
 

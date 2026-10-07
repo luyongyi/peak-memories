@@ -8,7 +8,7 @@ using Newtonsoft.Json.Linq;
 
 namespace PeakReplayLab;
 
-// Schemas 10–13 are storage codecs, not simulation. All work
+// Schemas 10–14 are storage codecs, not simulation. All work
 // happens on the save/read worker. Expanded frames remain immutable seek points.
 internal static class ReplayDeltaCodec
 {
@@ -24,6 +24,7 @@ internal static class ReplayDeltaCodec
         [typeof(SpawnedReplayFrame)] = Fields<SpawnedReplayFrame>(),
         [typeof(BalloonReplayFrame)] = Fields<BalloonReplayFrame>(),
         [typeof(ReplayHudState)] = Fields<ReplayHudState>(),
+        [typeof(ActorRouteState)] = Fields<ActorRouteState>(),
         [typeof(EnvironmentReplayFrame)] = Fields<EnvironmentReplayFrame>(),
         [typeof(EnvironmentWindFrame)] = Fields<EnvironmentWindFrame>(),
         [typeof(EnvironmentStormFrame)] = Fields<EnvironmentStormFrame>(),
@@ -41,6 +42,7 @@ internal static class ReplayDeltaCodec
     private static PropertyInfo[] Fields<T>() => typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
         .Where(p => p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0).ToArray();
     private static bool SchemaField(Type type, string field, int schema) =>
+        (schema >= 14 || !(type == typeof(ActorFrame) && field == nameof(ActorFrame.RouteState))) &&
         (schema >= 13 || !(type == typeof(EnvironmentReplayFrame) && (field == nameof(EnvironmentReplayFrame.SampleTimeKnown) || field == nameof(EnvironmentReplayFrame.SampleTime)))) &&
         (schema != 10 || !(type == typeof(ActorFrame) && field == nameof(ActorFrame.HudState) ||
           type == typeof(InventoryFrame) && (field == nameof(InventoryFrame.UiFuel) || field == nameof(InventoryFrame.Cooked)))) &&
@@ -48,6 +50,7 @@ internal static class ReplayDeltaCodec
           type == typeof(ActorFrame) && field == nameof(ActorFrame.WebWrap) || (type == typeof(ItemFrame) || type == typeof(SpawnedReplayFrame)) && (field == "Visuals" || field == "Lights")));
 
     private static bool NullableSnapshot(Type type) => type == typeof(ReplayHudState) ||
+        type == typeof(ActorRouteState) ||
         type == typeof(EnvironmentReplayFrame) || type == typeof(EnvironmentFogFrame) || type == typeof(WebWrapReplayFrame) || type == typeof(CreatureReplayLine);
 
     // Values are compared directly, never by serializing JSON. Shared capture

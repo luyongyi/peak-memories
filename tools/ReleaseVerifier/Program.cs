@@ -52,7 +52,7 @@ internal static class Verifier
     };
     public static readonly string[] Covers = new[] { "shore", "roots", "tropics", "alpine", "mesa", "volcano", "swamp", "kiln", "temple", "peak", "nadir" }
         .Select(value => "PeakReplayLab.CoverArt." + value + ".png").ToArray();
-    public static readonly string[] Projects = { "ReplayContract", "NativeAppearanceContract", "NativeLoadingContract", "ReplayViewContract", "ReplayNameplateContract", "ReplayAudioSpatialContract" };
+    public static readonly string[] Projects = { "ReplayContract", "NativeAppearanceContract", "NativeLoadingContract", "ReplayViewContract", "ReplayNameplateContract", "ReplayAudioSpatialContract", "TrajectoryContract", "TrajectoryUploadContract" };
     private static readonly Dictionary<string, long> Limits = new(StringComparer.Ordinal)
     {
         ["PeakReplayLab.dll"] = 128L * 1024 * 1024,

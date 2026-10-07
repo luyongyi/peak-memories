@@ -228,8 +228,8 @@ public sealed partial class Plugin
             throw new InvalidOperationException("Seal the existing recording and wait for completion before starting another chapter.");
         if (!AutomationCaptureReady)
             throw new InvalidOperationException("The live island and native player must be initialized before starting a chapter.");
-        // The same F4 restart path builds a fresh baseline for objects that changed
-        // while recording was stopped, even when the Unity scene did not change.
+        // The normal F4 path starts from the next complete live sample while
+        // preserving the rolling history captured between full recordings.
         ToggleFullRun();
         if (fullRun == null) throw new InvalidOperationException("The native continuous recording did not start.");
     });

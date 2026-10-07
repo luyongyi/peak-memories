@@ -144,7 +144,7 @@ internal static class EnvironmentIntegrationTests
                 var completion = writer.CompleteAsync(); Check(completion.Wait(TimeSpan.FromSeconds(10)));
                 var result = completion.GetAwaiter().GetResult();
                 Check(result.Status == "completed" && result.WrittenFrames == frames.Length);
-                var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == 13 && info.Pages.Length >= 3);
+                var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == ReplayRules.CurrentSchema && info.Pages.Length >= 3);
                 foreach (int page in Enumerable.Range(0, info.Pages.Length).Reverse())
                     foreach (var decoded in FullReplayArchive.ReadPage(result.FilePath, info, page).Frames)
                     {

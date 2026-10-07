@@ -25,7 +25,7 @@ public sealed partial class Plugin
     private bool LibraryManagementBusy => preparingDeletion != null || movingDeletion != null || preparedDeletion != null;
     private bool FileManagementAllowed => SceneManager.GetActiveScene().name == "Title" &&
         !ReplaySafety.Active && theatre?.Busy != true && saving == null && fullRun == null && closingFullRun == null &&
-        listing == null && fullRunListing == null;
+        listing == null && fullRunListing == null && !RouteUploadBusy;
     private bool CanManageRecordings => FileManagementAllowed && !LibraryManagementBusy;
     private bool CanConfirmDeletion => FileManagementAllowed && preparedDeletion != null &&
         preparingDeletion == null && movingDeletion == null && preparedDeletion.Generation == deletionGeneration;

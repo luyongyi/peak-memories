@@ -1,9 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
-    <Version>0.7.4</Version>
+    <Version>0.8.0</Version>
     <AssemblyName>PeakReplayLab</AssemblyName>
-    <Description>Local, sampled-joint PEAK replay prototype. No web dependency.</Description>
+    <Description>Local PEAK replay with optional manual lightweight trajectory uploads.</Description>
   </PropertyGroup>
   <ItemGroup>
     <GameAssembly Include="$(ManagedDir)*.dll" Exclude="$(ManagedDir)Mono*.dll;$(ManagedDir)netstandard.dll;$(ManagedDir)System*.dll;$(ManagedDir)mscorlib.dll" />

@@ -14,12 +14,14 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.7.4";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.0";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
     public string GameAssembly { get; set; } = "";
     public string Route { get; set; } = "";
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public ReplayRouteContext? RouteContext { get; set; }
     public ReplayRegionSummary? RegionSummary { get; set; }
     public string StartedUtc { get; set; } = "";
     public string SavedUtc { get; set; } = "";
@@ -66,6 +68,7 @@ public sealed class ActorFrame
     public float Stamina { get; set; }
     public float ExtraStamina { get; set; }
     public ReplayHudState? HudState { get; set; }
+    public ActorRouteState? RouteState { get; set; }
     public WebWrapReplayFrame? WebWrap { get; set; }
     public Appearance Appearance { get; set; } = new();
     public InventoryFrame[] Inventory { get; set; } = Array.Empty<InventoryFrame>();
@@ -75,6 +78,8 @@ public sealed class ActorFrame
     public NodePose[] JointPose { get; set; } = Array.Empty<NodePose>();
     internal ActorFrame WithJoints(NodePose[] joints)
     { var copy = (ActorFrame)MemberwiseClone(); copy.JointPose = joints; return copy; }
+    internal ActorFrame WithRouteState(ActorRouteState? state)
+    { var copy = (ActorFrame)MemberwiseClone(); copy.RouteState = state; return copy; }
 }
 
 public sealed class Appearance : IEquatable<Appearance>
@@ -135,8 +140,8 @@ public sealed class ReplayClip
 
 public static class ReplayRules
 {
-    public const int CurrentSchema = 13;
-    public static bool SupportedSchema(int schema) => schema == 10 || schema == 11 || schema == 12 || schema == CurrentSchema;
+    public const int CurrentSchema = 14;
+    public static bool SupportedSchema(int schema) => schema >= 10 && schema <= CurrentSchema;
     // Scoped to one immutable save/read operation, never trusts a previous operation.
     internal sealed class ValidationMemo
     {
@@ -208,7 +213,7 @@ public static class ReplayRules
     public static void Validate(ReplayHeader h)
     {
         if (!SupportedSchema(h.Schema))
-            throw new InvalidDataException("此版本支持格式 10、11 和 12，请使用支持的录像或重新录制。");
+            throw new InvalidDataException("此版本支持格式 10 至 14，请使用支持的录像或重新录制。");
         if (h.Type != "header" || string.IsNullOrWhiteSpace(h.Scene) || h.Scene.Length > 200 ||
             h.Route == null || h.Route.Length > 4096 || h.GameVersion == null || h.GameVersion.Length > 100 ||
             h.GameAssembly == null || h.GameAssembly.Length > 64 || h.SampleHz < 1 || h.SampleHz > 60)
@@ -219,6 +224,7 @@ public static class ReplayRules
             h.FrameCount < 0 || h.FrameCount > MaxFrames || h.StartedUtc == null || h.StartedUtc.Length > 64 || h.SavedUtc == null || h.SavedUtc.Length > 64)
             throw new InvalidDataException("Invalid replay metadata.");
         if (!ReplayRegionCovers.Valid(h.RegionSummary)) throw new InvalidDataException("Invalid replay region summary.");
+        ReplayRouteRules.Validate(h.RouteContext);
     }
 
     public static void Validate(ReplayFrame frame, double previous) => ValidateFrame(frame, previous, false);
@@ -235,6 +241,8 @@ public static class ReplayRules
             throw new InvalidDataException("Environment, creatures and native visual snapshots require schema 12.");
         if (schema < 13 && frame.World.Environment?.SampleTimeKnown == true)
             throw new InvalidDataException("Environment observation clocks require schema 13.");
+        if (schema < 14 && Array.Exists(frame.Actors, a => a.RouteState != null))
+            throw new InvalidDataException("Actor route evidence requires schema 14.");
         if (schema == 10)
             foreach (var actor in frame.Actors)
             {
@@ -267,6 +275,7 @@ public static class ReplayRules
                 !Finite(a.Stamina) || !Finite(a.ExtraStamina))
                 throw new InvalidDataException("Invalid replay actor.");
             ReplayHudState.Validate(a.HudState);
+            ReplayRouteRules.Validate(a.RouteState, frame.T);
             WebWrapReplayRules.Validate(a.WebWrap);
             for (int prior = 0; prior < actorIndex; prior++)
                 if (frame.Actors[prior].Id == a.Id) throw new InvalidDataException("Duplicate replay actor.");
@@ -496,7 +505,7 @@ public static class ReplayFiles
     {
         var token = ParseObject(line);
         if (token["Schema"]?.Type != Newtonsoft.Json.Linq.JTokenType.Integer || !ReplayRules.SupportedSchema((int)token["Schema"]!))
-            throw new InvalidDataException("此版本支持格式 10、11 和 12，请使用支持的录像或重新录制。");
+            throw new InvalidDataException("此版本支持格式 10 至 14，请使用支持的录像或重新录制。");
         var h = JsonConvert.DeserializeObject<ReplayHeader>(line, Json) ?? throw new InvalidDataException("Missing header.");
         return h;
     }

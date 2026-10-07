@@ -165,6 +165,8 @@ public sealed class RollingBuffer
             foreach (var item in a.Inventory) size += 96 + item.Instance.Length * 2L;
             size += ActorJointReplayRules.Estimate(a.JointPose);
             size += ReplayHudState.Estimate(a.HudState);
+            // Shared 10 Hz evidence remains conservatively counted per frame.
+            if (a.RouteState != null) size += 256;
             size += WebWrapReplayRules.Estimate(a.WebWrap);
         }
         foreach (var e in frame.Events) size += 128 + (e.Kind.Length + e.ActorId.Length + e.ItemKey.Length + e.Name.Length) * 2L;
@@ -190,6 +192,7 @@ public sealed class RollingBuffer
         {
             Schema = source.Schema, Recorder = source.Recorder, Fidelity = source.Fidelity,
             Scene = source.Scene, Route = source.Route, GameVersion = source.GameVersion, BuildId = source.BuildId, GameAssembly = source.GameAssembly,
+            RouteContext = source.RouteContext?.Copy(),
             StartedUtc = savedUtc.AddSeconds(-Duration).ToUniversalTime().ToString("O"), SavedUtc = savedUtc.ToUniversalTime().ToString("O"),
             SampleHz = source.SampleHz, Duration = Duration, FrameCount = items.Length, MapObjects = source.MapObjects.ToArray(),
         };

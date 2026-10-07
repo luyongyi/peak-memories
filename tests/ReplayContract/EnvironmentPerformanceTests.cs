@@ -217,7 +217,7 @@ internal static class EnvironmentPerformanceTests
                 foreach (var frame in frames) Check(writer.TryEnqueue(frame));
                 var completion = writer.CompleteAsync(); Check(completion.Wait(TimeSpan.FromSeconds(10)));
                 var result = completion.GetAwaiter().GetResult(); Check(result.Status == "completed" && result.WrittenFrames == frames.Length);
-                var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == 13 && info.Pages.Length > 1);
+                var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == ReplayRules.CurrentSchema && info.Pages.Length > 1);
                 var decoded = new List<ReplayFrame>();
                 for (int page = 0; page < info.Pages.Length; page++) decoded.AddRange(FullReplayArchive.ReadPage(result.FilePath, info, page).Frames);
                 Close(decoded[0].World.Environment!.SampleTime, -.04);
