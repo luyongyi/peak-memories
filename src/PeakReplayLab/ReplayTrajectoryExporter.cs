@@ -23,6 +23,7 @@ public sealed class TrajectoryExportResult
     public string DifficultyLabel { get; internal set; } = "未知难度";
     public bool NativeEvidence { get; internal set; }
     public bool StageGatesKnown { get; internal set; }
+    public int MapLandmarkCount { get; internal set; }
     public string Scene { get; internal set; } = "";
     public string[] Route { get; internal set; } = Array.Empty<string>();
 }
@@ -52,6 +53,27 @@ public sealed class TrajectoryMap
     [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public string? LayoutKey { get; set; }
     public string[] Route { get; set; } = Array.Empty<string>();
     public TrajectoryStage[] Stages { get; set; } = Array.Empty<TrajectoryStage>();
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public TrajectoryMapAlignment? Alignment { get; set; }
+}
+
+// Independent HTTP whitelist; replay metadata types and extension data never
+// become the upload contract. All arrays are copied from recording-start proof.
+public sealed class TrajectoryMapAlignment
+{
+    public int Version { get; set; } = 1;
+    public string CoordinateSpace { get; set; } = "unity-world-cm";
+    public List<TrajectoryMapLandmark> Landmarks { get; set; } = new();
+}
+
+public sealed class TrajectoryMapLandmark
+{
+    public string Key { get; set; } = "";
+    public string Kind { get; set; } = "";
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public int? StageIndex { get; set; }
+    public string Name { get; set; } = "";
+    public int[] PositionCm { get; set; } = new int[3];
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public float[]? Rotation { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public float[]? Scale { get; set; }
 }
 
 public sealed class TrajectoryStage
@@ -182,6 +204,7 @@ public static class ReplayTrajectoryExporter
                 NativeEvidence = package.Players.All(p => p.Evidence == "native-state"),
                 StageGatesKnown = package.Map.Stages.Any(s => s.Name != "Void") &&
                     package.Map.Stages.Where(s => s.Name != "Void").All(s => s.EnterZCm.HasValue && s.ExitZCm.HasValue),
+                MapLandmarkCount = package.Map.Alignment?.Landmarks.Count ?? 0,
                 Scene = package.Map.Scene, Route = (string[])package.Map.Route.Clone(),
             };
         }
@@ -234,7 +257,18 @@ public static class ReplayTrajectoryExporter
                 RecordingId = recordingId, RunKey = context?.RunKey, TimeOriginMs = context?.TimeOriginMs,
                 StartedUtc = header.StartedUtc, DurationMs = Milliseconds(duration),
                 Map = new TrajectoryMap { BuildId = header.BuildId, Scene = header.Scene, LevelIndex = context?.LevelIndex,
-                    LayoutKey = context?.LayoutKey, Route = route, Stages = stages },
+                    LayoutKey = context?.LayoutKey, Route = route, Stages = stages,
+                    Alignment = context?.Alignment == null ? null : new TrajectoryMapAlignment
+                    {
+                        Version = context.Alignment.Version, CoordinateSpace = context.Alignment.CoordinateSpace,
+                        Landmarks = context.Alignment.Landmarks.Select(value => new TrajectoryMapLandmark
+                        {
+                            Key = value.Key, Kind = value.Kind, StageIndex = value.StageIndex, Name = value.Name,
+                            PositionCm = (int[])value.PositionCm.Clone(),
+                            Rotation = value.Rotation == null ? null : (float[])value.Rotation.Clone(),
+                            Scale = value.Scale == null ? null : (float[])value.Scale.Clone(),
+                        }).ToList(),
+                    } },
                 Difficulty = new TrajectoryDifficulty { Ascent = context?.Ascent, Custom = context?.Custom, Mini = context?.Mini },
             };
         }

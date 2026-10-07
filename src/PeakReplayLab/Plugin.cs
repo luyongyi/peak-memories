@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.0")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.1")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {
@@ -82,7 +82,7 @@ public sealed partial class Plugin : BaseUnityPlugin
         }
         catch (Exception e) { disabledByError = true; Logger.LogError(e); Note("回放保护未能安装，已停用新回放功能；原足迹 Mod 不受影响。"); }
         SceneManager.activeSceneChanged += SceneChanged;
-        Logger.LogInfo($"PEAK Memories 0.8.0: native replay HUD / {sampleHz.Value} Hz / mode={activeRecordingMode}. " + DirectoryPath);
+        Logger.LogInfo($"PEAK Memories 0.8.1: native replay HUD / {sampleHz.Value} Hz / mode={activeRecordingMode}. " + DirectoryPath);
     }
 
     private void Update()

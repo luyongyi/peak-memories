@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using Newtonsoft.Json;
 
 namespace PeakReplayLab;
 
@@ -20,6 +21,8 @@ public sealed class ReplayRouteContext
     public bool? Custom { get; set; }
     public bool? Mini { get; set; }
     public ReplayRouteStage[] Stages { get; set; } = Array.Empty<ReplayRouteStage>();
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+    public ReplayMapAlignment? Alignment { get; set; }
 
     public ReplayRouteContext Copy() => new()
     {
@@ -27,6 +30,48 @@ public sealed class ReplayRouteContext
         LevelIndex = LevelIndex, LayoutKey = LayoutKey, Ascent = Ascent, Custom = Custom, Mini = Mini,
         Stages = Stages.Select(s => new ReplayRouteStage
         { Index = s.Index, Name = s.Name, EnterZCm = s.EnterZCm, ExitZCm = s.ExitZCm }).ToArray(),
+        Alignment = Alignment?.Copy(),
+    };
+}
+
+// Recording-start evidence only. These are stable map object names and world
+// transforms, never player positions or runtime instance IDs. Old headers omit
+// this optional field; their missing evidence must not be inferred later.
+public sealed class ReplayMapAlignment
+{
+    [JsonProperty(Required = Required.Always)]
+    public int Version { get; set; } = 1;
+    [JsonProperty(Required = Required.Always)]
+    public string CoordinateSpace { get; set; } = "unity-world-cm";
+    [JsonProperty(Required = Required.Always)]
+    public ReplayMapLandmark[] Landmarks { get; set; } = Array.Empty<ReplayMapLandmark>();
+
+    public ReplayMapAlignment Copy() => new()
+    {
+        Version = Version, CoordinateSpace = CoordinateSpace,
+        Landmarks = Landmarks.Select(value => value.Copy()).ToArray(),
+    };
+}
+
+public sealed class ReplayMapLandmark
+{
+    [JsonProperty(Required = Required.Always)]
+    public string Key { get; set; } = "";
+    [JsonProperty(Required = Required.Always)]
+    public string Kind { get; set; } = "";
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public int? StageIndex { get; set; }
+    [JsonProperty(Required = Required.Always)]
+    public string Name { get; set; } = "";
+    [JsonProperty(Required = Required.Always)]
+    public int[] PositionCm { get; set; } = Array.Empty<int>();
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public float[]? Rotation { get; set; }
+    [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public float[]? Scale { get; set; }
+
+    public ReplayMapLandmark Copy() => new()
+    {
+        Key = Key, Kind = Kind, StageIndex = StageIndex, Name = Name,
+        PositionCm = (int[])PositionCm.Clone(), Rotation = Rotation == null ? null : (float[])Rotation.Clone(),
+        Scale = Scale == null ? null : (float[])Scale.Clone(),
     };
 }
 
@@ -100,6 +145,51 @@ public static class ReplayRouteRules
                 stage.EnterZCm.HasValue != stage.ExitZCm.HasValue ||
                 stage.EnterZCm.HasValue && stage.ExitZCm <= stage.EnterZCm)
                 throw new InvalidDataException("Invalid recorded stage gates.");
+        }
+        Validate(context.Alignment);
+        if (context.Alignment != null)
+        {
+            var landmarks = context.Alignment.Landmarks;
+            if (landmarks.Any(value => value.StageIndex.HasValue && !context.Stages.Any(stage => stage.Index == value.StageIndex)))
+                throw new InvalidDataException("Map landmark references an absent recorded stage.");
+            foreach (var stage in context.Stages.Where(value => value.EnterZCm.HasValue && value.Name != "Void"))
+            {
+                var entry = landmarks.FirstOrDefault(value => value.Key == "progress-point:" + stage.Index.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                var next = context.Stages.FirstOrDefault(value => value.Index > stage.Index && value.Name != "Void");
+                var exit = landmarks.FirstOrDefault(value => value.Key == (next == null ? "progress-point:peak" :
+                    "progress-point:" + next.Index.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                if (entry != null && entry.PositionCm[2] != stage.EnterZCm || exit != null && exit.PositionCm[2] != stage.ExitZCm)
+                    throw new InvalidDataException("Recorded stage gates disagree with their world landmarks.");
+            }
+        }
+    }
+
+    public static void Validate(ReplayMapAlignment? alignment)
+    {
+        if (alignment == null) return;
+        if (alignment.Version != 1 || alignment.CoordinateSpace != "unity-world-cm" ||
+            alignment.Landmarks == null || alignment.Landmarks.Length < 1 || alignment.Landmarks.Length > 16)
+            throw new InvalidDataException("Invalid recorded map alignment.");
+        var keys = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+        foreach (var landmark in alignment.Landmarks)
+        {
+            bool root = landmark?.Kind == "segment-root", gate = landmark?.Kind == "progress-point";
+            bool peak = gate && landmark!.Key == "progress-point:peak";
+            if (landmark == null || !keys.Add(landmark.Key) || (!root && !gate) ||
+                (peak ? landmark.StageIndex.HasValue : !landmark.StageIndex.HasValue || landmark.StageIndex < 0 || landmark.StageIndex > 6) ||
+                (!peak && landmark.Key != landmark.Kind + ":" + landmark.StageIndex!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)) ||
+                string.IsNullOrWhiteSpace(landmark.Name) || landmark.Name.Length > 120 || landmark.Name.Any(char.IsControl) ||
+                landmark.PositionCm == null || landmark.PositionCm.Length != 3 || landmark.PositionCm.Any(value => Math.Abs((long)value) > 100_000_000))
+                throw new InvalidDataException("Invalid recorded map landmark.");
+            if (root)
+            {
+                if (landmark.Rotation == null || landmark.Rotation.Length != 4 || landmark.Rotation.Any(value => !ReplayRules.Finite(value)) ||
+                    Math.Abs(landmark.Rotation.Sum(value => (double)value * value) - 1) > .002 ||
+                    landmark.Scale == null || landmark.Scale.Length != 3 || landmark.Scale.Any(value => !ReplayRules.Finite(value) || Math.Abs(value) < .000001 || Math.Abs(value) > 10_000))
+                    throw new InvalidDataException("Invalid recorded map root transform.");
+            }
+            else if (landmark.Rotation != null || landmark.Scale != null)
+                throw new InvalidDataException("Progress-point landmarks only contain world positions.");
         }
     }
 

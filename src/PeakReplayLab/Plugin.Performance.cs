@@ -29,7 +29,7 @@ public sealed partial class Plugin
         if (performanceSaving != null && !performanceSaving.IsCompleted) return;
         var report = new
         {
-            Schema = 1, Recorder = "PeakReplayLab/0.8.0", CreatedUtc = DateTime.UtcNow.ToString("O"),
+            Schema = 1, Recorder = "PeakReplayLab/0.8.1", CreatedUtc = DateTime.UtcNow.ToString("O"),
             Scene = capture?.Header.Scene ?? SceneManager.GetActiveScene().name,
             CurrentScene = SceneManager.GetActiveScene().name, Reason = reason, Recording = recordingFile,
             TargetSampleHz = sampleHz.Value,

@@ -105,6 +105,8 @@ public sealed partial class Plugin
                     routeSummary += "\n旧录像缺少个人过关证据，保留为未知，不计入默认热力。";
                 else if (!routePackage.StageGatesKnown)
                     routeSummary += "\n部分关卡缺少原生边界，仅有完整证据的关卡参与路线统计。";
+                if (routePackage.MapLandmarkCount < 3)
+                    routeSummary += "\n这份录像未记录足够的地图地标；投稿会保留，地标核验完成前不会叠到地图。";
             }
             catch (OperationCanceledException) { routeError = "已取消轨迹筛选。"; }
             catch (Exception e) { Logger.LogWarning("Trajectory export failed: " + e); routeError = "轨迹筛选失败：" + MemoriesLibraryModel.Plain(e.Message, 180); }

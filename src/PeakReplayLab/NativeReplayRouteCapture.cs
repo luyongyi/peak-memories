@@ -84,6 +84,22 @@ internal static class NativeReplayRouteCapture
         if (map.segments != null && map.segments.Skip(normalCount).Any(s => s.biome == Biome.BiomeType.Void))
             stages.Add(new ReplayRouteStage { Index = stages.Count, Name = "Void" });
         result.Stages = stages.ToArray();
+        // Capture the actual island-ready world frame once. The recording and
+        // upload keep these coordinates unchanged; the website may only align
+        // them against matching source landmarks, never a player's first point.
+        var landmarks = new List<ReplayMapLandmark>();
+        for (int i = 0; i < result.Stages.Length && i < (map.segments?.Length ?? 0); i++)
+        {
+            var parent = map.segments![i].segmentParent;
+            if (parent) landmarks.Add(Landmark(parent.transform, "segment-root", i));
+        }
+        for (int i = 0; i < entries.Count; i++)
+        {
+            var point = entries[i];
+            if (point?.transform) landmarks.Add(Landmark(point.transform, "progress-point", i));
+        }
+        if (peak?.transform) landmarks.Add(Landmark(peak.transform, "progress-point", null));
+        if (landmarks.Count != 0) result.Alignment = new ReplayMapAlignment { Landmarks = landmarks.ToArray() };
         if (result.Stages.Length > 0)
         {
             var roots = map.segments!.Select((s, i) => s.segmentParent
@@ -97,5 +113,24 @@ internal static class NativeReplayRouteCapture
         }
         ReplayRouteRules.Validate(result);
         return result;
+    }
+
+    private static ReplayMapLandmark Landmark(Transform transform, string kind, int? stage)
+    {
+        var p = transform.position;
+        var value = new ReplayMapLandmark
+        {
+            Key = kind + ":" + (stage.HasValue ? stage.Value.ToString(CultureInfo.InvariantCulture) : "peak"),
+            Kind = kind, StageIndex = stage, Name = transform.name,
+            PositionCm = new[] { ReplayRouteRules.Centimeters(p.x), ReplayRouteRules.Centimeters(p.y), ReplayRouteRules.Centimeters(p.z) },
+        };
+        if (kind == "segment-root")
+        {
+            var rotation = transform.rotation;
+            var scale = transform.lossyScale;
+            value.Rotation = new[] { rotation.x, rotation.y, rotation.z, rotation.w };
+            value.Scale = new[] { scale.x, scale.y, scale.z };
+        }
+        return value;
     }
 }

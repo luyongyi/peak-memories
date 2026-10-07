@@ -38,7 +38,26 @@ ReplayHeader Header(bool native = true) => new()
             new ReplayRouteStage { Index = 3, Name = "Volcano", EnterZCm = 3000, ExitZCm = 4000 },
             new ReplayRouteStage { Index = 4, Name = "Kiln", EnterZCm = 4000, ExitZCm = 5000 },
         },
+        Alignment = Alignment(),
     } : null,
+};
+ReplayMapAlignment Alignment() => new()
+{
+    Landmarks = new[]
+    {
+        new ReplayMapLandmark { Key = "segment-root:0", Kind = "segment-root", StageIndex = 0, Name = "Beach_Segment",
+            PositionCm = new[] { -200, 0, 0 }, Rotation = new[] { 0f, 0f, 0f, 1f }, Scale = new[] { 1f, 1f, 1f } },
+        new ReplayMapLandmark { Key = "segment-root:1", Kind = "segment-root", StageIndex = 1, Name = "Roots Segment",
+            PositionCm = new[] { 1000, 300, 1000 }, Rotation = new[] { 0f, 0f, 0f, 1f }, Scale = new[] { 1f, 1f, 1f } },
+        new ReplayMapLandmark { Key = "segment-root:2", Kind = "segment-root", StageIndex = 2, Name = "Alpine_Segment",
+            PositionCm = new[] { -1000, 2000, 2000 }, Rotation = new[] { 0f, 0f, 0f, 1f }, Scale = new[] { 1f, 1f, 1f } },
+        new ReplayMapLandmark { Key = "progress-point:0", Kind = "progress-point", StageIndex = 0, Name = "Beach_Campfire", PositionCm = new[] { 0, 100, 0 } },
+        new ReplayMapLandmark { Key = "progress-point:1", Kind = "progress-point", StageIndex = 1, Name = "Roots_Campfire", PositionCm = new[] { 200, 1000, 1000 } },
+        new ReplayMapLandmark { Key = "progress-point:2", Kind = "progress-point", StageIndex = 2, Name = "Alpine_Campfire", PositionCm = new[] { -300, 2000, 2000 } },
+        new ReplayMapLandmark { Key = "progress-point:3", Kind = "progress-point", StageIndex = 3, Name = "Volcano_Campfire", PositionCm = new[] { 500, 3000, 3000 } },
+        new ReplayMapLandmark { Key = "progress-point:4", Kind = "progress-point", StageIndex = 4, Name = "Kiln_Campfire", PositionCm = new[] { -500, 4000, 4000 } },
+        new ReplayMapLandmark { Key = "progress-point:peak", Kind = "progress-point", Name = "Peak_Campfire", PositionCm = new[] { 0, 5000, 5000 } },
+    },
 };
 ActorFrame Actor(double nativeTime, float z, string id = "private-photon-id-alpha", bool owner = true) => new()
 {
@@ -119,6 +138,89 @@ Test("metadata validates malformed gates, identities, native timestamps and non-
     var frame = Frame(0, Actor(0, 0)); frame.Actors[0].RouteState!.SampleTime = 1; Reject(() => ReplayRules.Validate(frame, -1));
     frame = Frame(0, Actor(0, 0)); frame.Actors[0].RouteState!.Center[0] = float.NaN; Reject(() => ReplayRules.Validate(frame, -1));
 });
+Test("recording-start landmarks reject malformed identities, coordinates, transforms and oversized metadata", () =>
+{
+    var malformed = new Action<ReplayMapAlignment>[]
+    {
+        value => value.Version = 2,
+        value => value.CoordinateSpace = "unity-world-meters",
+        value => value.Landmarks = Array.Empty<ReplayMapLandmark>(),
+        value => value.Landmarks = Enumerable.Repeat(value.Landmarks[0], 17).ToArray(),
+        value => value.Landmarks[1].Key = value.Landmarks[0].Key,
+        value => value.Landmarks[0].Key = "player:0",
+        value => value.Landmarks[0].StageIndex = 7,
+        value => { value.Landmarks[0].Key = "segment-root:6"; value.Landmarks[0].StageIndex = 6; },
+        value => value.Landmarks[0].PositionCm = new[] { 1, 2 },
+        value => value.Landmarks[0].PositionCm[0] = 100_000_001,
+        value => value.Landmarks[0].Name = "map\nsecret",
+        value => value.Landmarks[0].Rotation = new[] { 0f, 0f, 0f, 0f },
+        value => value.Landmarks[0].Rotation![0] = float.NaN,
+        value => value.Landmarks[0].Scale = null,
+        value => value.Landmarks[0].Scale![0] = 0,
+        value => value.Landmarks[3].Rotation = new[] { 0f, 0f, 0f, 1f },
+        value => value.Landmarks[^1].StageIndex = 5,
+        value => value.Landmarks[3].PositionCm[2] = 42,
+    };
+    foreach (var mutate in malformed)
+    {
+        var header = Header(); mutate(header.RouteContext!.Alignment!);
+        Reject(() => ReplayRules.Validate(header));
+    }
+    // Root reflection is valid source evidence; source matching decides whether
+    // the same signed scale is present, rather than inventing a positive scale.
+    var reflected = Header(); reflected.RouteContext!.Alignment!.Landmarks[0].Scale![0] = -1;
+    ReplayRules.Validate(reflected);
+});
+Test("present landmark metadata cannot invent missing fields from serializer defaults", () =>
+{
+    foreach (string property in new[] { "Version", "CoordinateSpace", "Landmarks" })
+    {
+        var json = JObject.FromObject(Header());
+        ((JObject)json["RouteContext"]!["Alignment"]!).Remove(property);
+        Reject(() => json.ToObject<ReplayHeader>());
+    }
+    foreach (string property in new[] { "Key", "Kind", "Name", "PositionCm" })
+    {
+        var json = JObject.FromObject(Header());
+        ((JObject)json["RouteContext"]!["Alignment"]!["Landmarks"]![0]!).Remove(property);
+        Reject(() => json.ToObject<ReplayHeader>());
+    }
+    var legacy = JObject.FromObject(Header()); ((JObject)legacy["RouteContext"]!).Remove("Alignment");
+    Check(legacy.ToObject<ReplayHeader>()!.RouteContext!.Alignment == null);
+});
+Test("complete archives export an independent map-landmark whitelist without moving player points", () => InRoot(root =>
+{
+    var header = Header(); var source = Save(root, header, SyntheticFrames());
+    var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"));
+    Check(result.MapLandmarkCount == 9);
+    var package = ReadPackage(result.Path);
+    var alignment = (JObject)package["map"]!["alignment"]!;
+    Check((int?)alignment["version"] == 1 && (string?)alignment["coordinateSpace"] == "unity-world-cm");
+    var landmarks = (JArray)alignment["landmarks"]!;
+    Check(landmarks.Count == 9 && landmarks.Select(value => (string?)value["key"]).Distinct().Count() == 9);
+    Check(landmarks[0]!.Children<JProperty>().Select(value => value.Name).OrderBy(value => value).SequenceEqual(new[]
+    { "key", "kind", "stageIndex", "name", "positionCm", "rotation", "scale" }.OrderBy(value => value)));
+    Check(landmarks[3]!["rotation"] == null && landmarks[3]!["scale"] == null && landmarks[landmarks.Count - 1]!["stageIndex"] == null);
+    Check(landmarks[0]!["positionCm"]![0]!.Value<int>() == -200);
+    Check(package["players"]![0]!["points"]![0]![1]!.Value<int>() == 125 && package["players"]![0]!["points"]![0]![2]!.Value<int>() == 250);
+    var builder = new ReplayTrajectoryExporter.Builder(header, .1);
+    header.RouteContext!.Alignment!.Landmarks[0].PositionCm[0] = 999;
+    header.RouteContext.Alignment.Landmarks[0].Rotation![3] = 0;
+    header.RouteContext.Alignment.Landmarks[0].Scale![0] = 2;
+    builder.Observe(Frame(0, Actor(0, 0))); builder.Observe(Frame(.1, Actor(.1, 1))); var built = builder.Finish();
+    Check(built.Map.Alignment!.Landmarks[0].PositionCm[0] == -200 && built.Map.Alignment.Landmarks[0].Rotation![3] == 1 && built.Map.Alignment.Landmarks[0].Scale![0] == 1);
+}));
+Test("existing schema 14 complete recordings without landmarks retain absent alignment", () => InRoot(root =>
+{
+    var header = Header(); header.RouteContext!.Alignment = null;
+    var source = Save(root, header, SyntheticFrames());
+    var info = FullReplayArchive.ReadInfo(source.FilePath); Check(info.Header.Schema == 14 && info.Header.RouteContext!.Alignment == null);
+    var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"));
+    Check(result.MapLandmarkCount == 0);
+    var package = ReadPackage(result.Path);
+    Check(package["map"]!["alignment"] == null && (int?)package["map"]!["stages"]![1]!["enterZCm"] == 1000);
+    Check(package["players"]![0]!["points"]![0]![1]!.Value<int>() == 125);
+}));
 Test("complete archive exports only whitelist fields, centimeter centers and unique 10 Hz points across pages", () => InRoot(root =>
 {
     var source = Save(root, Header(), SyntheticFrames());
@@ -153,6 +255,7 @@ Test("legacy complete source uploads with absent optional map keys and unknown d
     var source = Save(root, header, frames); var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"));
     var package = ReadPackage(result.Path);
     Check(package["runKey"] == null && package["timeOriginMs"] == null && package["map"]!["layoutKey"] == null && package["map"]!["levelIndex"] == null);
+    Check(package["map"]!["alignment"] == null);
     Check(package["difficulty"]!["ascent"]!.Type == JTokenType.Null && package["difficulty"]!["custom"]!.Type == JTokenType.Null && package["difficulty"]!["mini"]!.Type == JTokenType.Null);
     Check((string?)package["players"]![0]!["evidence"] == "legacy-unknown" && !result.NativeEvidence && !result.StageGatesKnown);
 }));
@@ -294,10 +397,14 @@ Test("writer snapshots recording context before external mutation", () => InRoot
     var header = Header(); header.CoverOutcome = new ReplayRegionOutcome(200, false);
     var writer = new FullReplayWriter(root, header);
     header.RouteContext!.Ascent = 8; header.RouteContext.Stages[0].ExitZCm = 99999;
+    header.RouteContext.Alignment!.Landmarks[0].PositionCm[0] = 999;
+    header.RouteContext.Alignment.Landmarks[0].Rotation![3] = 0;
+    header.RouteContext.Alignment.Landmarks[0].Scale![0] = 2;
     Check(writer.TryEnqueue(Frame(200, Actor(200, 0))) && writer.TryEnqueue(Frame(200.1, Actor(200.1, 1))));
     var task = writer.CompleteAsync(); Check(task.Wait(TimeSpan.FromSeconds(10)));
     var info = FullReplayArchive.ReadInfo(task.Result.FilePath);
     Check(info.Header.RouteContext!.Ascent == 3 && info.Header.RouteContext.Stages[0].ExitZCm == 1000);
+    Check(info.Header.RouteContext.Alignment!.Landmarks[0].PositionCm[0] == -200 && info.Header.RouteContext.Alignment.Landmarks[0].Rotation![3] == 1 && info.Header.RouteContext.Alignment.Landmarks[0].Scale![0] == 1);
 }));
 
 int fixtureIndex = Array.IndexOf(args, "--fixture-dir");
