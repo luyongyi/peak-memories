@@ -361,7 +361,7 @@ dotnet run --project tests/ReplayViewContract/ReplayViewContract.csproj -c Relea
 需要 .NET 10 SDK（构建 `.slnx`）和 .NET 8 runtime（运行测试），以及本机已安装 PEAK/BepInEx。
 非默认游戏位置加 `-p:PEAKGameRootDir="D:/SteamLibrary/steamapps/common/PEAK/"`，保留尾部斜杠。
 输出：`artifacts/bin/PeakReplayLab/release/PeakReplayLab.dll`，netstandard2.1。
-构建不自动安装，不分发原游戏程序集或提取素材。维护者可运行 `pwsh -File scripts/release.ps1 -Draft` 一键编译、测试、打包、上传草稿并等待 GitHub 复核；改用 `-Publish` 在复核通过后公开实验性预发布。详见 [发布说明](docs/releases.md)。
+构建不自动安装，不分发原游戏程序集或提取素材。维护者为新版本运行 `pwsh -File scripts/release.ps1 -Draft` 一键编译、测试、打包、上传草稿并等待 GitHub 复核；改用 `-Publish` 在复核通过后公开实验性预发布。继续验证现有 0.7.4 草稿用 `pwsh -File scripts/release.ps1 -Resume -Tag v0.7.4 -Draft`。详见 [发布说明](docs/releases.md)。
 
 协议测试可独立运行，不依赖游戏资源；覆盖 60 Hz 时钟、缓存淘汰、对象增量/删除/反向查找、片段起点快照、事件时间重定位、库存/箱子数据、压缩读写、取消、版本匹配及损坏输入。**不能替代 Unity 内验收**。
 

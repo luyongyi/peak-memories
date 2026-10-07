@@ -6,6 +6,8 @@ Build, test, package and optionally publish a PEAK memoir prerelease.
 pwsh -File scripts/release.ps1 -Draft
 .EXAMPLE
 pwsh -File scripts/release.ps1 -Publish -GameRoot 'D:/SteamLibrary/steamapps/common/PEAK'
+.EXAMPLE
+pwsh -File scripts/release.ps1 -Resume -Tag v0.7.4 -Publish
 #>
 [CmdletBinding()]
 param(
@@ -14,6 +16,7 @@ param(
     [string] $Repository = 'luyongyi/peak-memories',
     [switch] $Draft,
     [switch] $Publish,
+    [switch] $Resume,
     [switch] $PreflightOnly
 )
 
@@ -59,13 +62,116 @@ function Write-Checksums {
     Write-Utf8 (Join-Path $Directory 'SHA256SUMS.txt') (($lines -join "`n") + "`n")
 }
 
+function Confirm-Origin {
+    $origin = Invoke-Checked git @('remote', 'get-url', 'origin') -Capture
+    if ($origin -notin @("https://github.com/$Repository.git", "https://github.com/$Repository", "git@github.com:$Repository.git")) {
+        throw 'Origin does not match the requested publication repository.'
+    }
+}
+
+function Read-RemoteRelease {
+    param([string] $ReleaseTag)
+    # The REST by-tag endpoint cannot retrieve unpublished drafts.
+    $json = Invoke-Checked gh @('api', "repos/$Repository/releases?per_page=100", '--paginate', '--slurp') -Capture
+    $pages = ConvertFrom-Json -InputObject $json -NoEnumerate
+    $found = @(foreach ($page in $pages) {
+        foreach ($candidate in $page) { if ($candidate.tag_name -ceq $ReleaseTag) { $candidate } }
+    })
+    if ($found.Count -ne 1) { throw 'Exactly one matching remote release is required.' }
+    return $found[0]
+}
+
+function Confirm-ReleaseIdentity {
+    param($Release, [string] $ReleaseTag, [string] $ReleaseCommit, [string[]] $AssetNames)
+    if ($Release.tag_name -cne $ReleaseTag -or $Release.name -cne "PEAK 回忆录 $ReleaseTag" -or $Release.target_commitish -cne $ReleaseCommit) {
+        throw 'Release title, tag or target commit does not match.'
+    }
+    $actualNames = @($Release.assets | ForEach-Object { $_.name } | Sort-Object)
+    if ($actualNames.Count -ne $AssetNames.Count -or (Compare-Object -CaseSensitive ($AssetNames | Sort-Object) $actualNames)) {
+        throw 'Release must contain exactly the four approved assets.'
+    }
+    foreach ($asset in $Release.assets) {
+        if ($asset.state -cne 'uploaded' -or $asset.size -le 0) { throw 'A release asset is incomplete.' }
+    }
+}
+
+function Compare-AssetBytes {
+    param([string] $Expected, [string] $Actual, [string[]] $AssetNames)
+    foreach ($name in $AssetNames) {
+        if ((Get-FileHash -LiteralPath (Join-Path $Expected $name) -Algorithm SHA256).Hash -cne
+            (Get-FileHash -LiteralPath (Join-Path $Actual $name) -Algorithm SHA256).Hash) {
+            throw "Release asset bytes changed: $name. This command did not publish or overwrite assets."
+        }
+    }
+}
+
+function Verify-And-FinishRelease {
+    param([string] $ReleaseTag, [string] $ReleaseCommit, [string] $Staging, [string[]] $AssetNames, [string] $ExpectedDirectory = '')
+    $null = Invoke-Checked gh @('workflow', 'view', 'release.yml', '--repo', $Repository) -Capture
+    $before = Read-RemoteRelease $ReleaseTag
+    Confirm-ReleaseIdentity $before $ReleaseTag $ReleaseCommit $AssetNames
+    $beforeDir = Join-Path $Staging 'verification-before'
+    $null = New-Item -ItemType Directory -Path $beforeDir -Force
+    Invoke-Checked gh @('release', 'download', $ReleaseTag, '--repo', $Repository, '--dir', $beforeDir)
+    if ($ExpectedDirectory) { Compare-AssetBytes $ExpectedDirectory $beforeDir $AssetNames }
+
+    $requestId = [guid]::NewGuid().ToString('N')
+    # GitHub verifies the tagged source and package; the local credential publishes.
+    Invoke-Checked gh @('workflow', 'run', 'release.yml', '--repo', $Repository, '--ref', 'main', '-f', "tag=$ReleaseTag", '-f', 'publish=false', '-f', "request_id=$requestId")
+    $deadline = [DateTime]::UtcNow.AddMinutes(3)
+    $run = $null
+    while (-not $run -and [DateTime]::UtcNow -lt $deadline) {
+        $runs = (Invoke-Checked gh @('run', 'list', '--repo', $Repository, '--workflow', 'release.yml', '--event', 'workflow_dispatch', '--limit', '30', '--json', 'databaseId,displayTitle,url') -Capture) | ConvertFrom-Json
+        $run = @($runs | Where-Object { $_.displayTitle -ceq "Release $ReleaseTag / $requestId" }) | Select-Object -First 1
+        if (-not $run) { Start-Sleep -Seconds 3 }
+    }
+    if (-not $run) { throw 'The verification run was not located. Check GitHub Actions before retrying.' }
+    Write-Host "GitHub verification: $($run.url)"
+    Invoke-Checked gh @('run', 'watch', [string] $run.databaseId, '--repo', $Repository, '--exit-status', '--interval', '10', '--compact')
+
+    $tagCommit = Invoke-Checked gh @('api', "repos/$Repository/commits/$ReleaseTag", '--jq', '.sha') -Capture
+    $after = Read-RemoteRelease $ReleaseTag
+    if ($tagCommit -cne $ReleaseCommit -or $after.id -ne $before.id) { throw 'Release or tag identity changed during verification.' }
+    Confirm-ReleaseIdentity $after $ReleaseTag $ReleaseCommit $AssetNames
+    $afterDir = Join-Path $Staging 'verification-after'
+    $null = New-Item -ItemType Directory -Path $afterDir
+    Invoke-Checked gh @('release', 'download', $ReleaseTag, '--repo', $Repository, '--dir', $afterDir)
+    Compare-AssetBytes $beforeDir $afterDir $AssetNames
+    if ($Publish -and $after.draft) {
+        Invoke-Checked gh @('release', 'edit', $ReleaseTag, '--repo', $Repository, '--draft=false', '--prerelease', '--latest=false')
+    }
+    $finalRelease = Read-RemoteRelease $ReleaseTag
+    Confirm-ReleaseIdentity $finalRelease $ReleaseTag $ReleaseCommit $AssetNames
+    if ($finalRelease.id -ne $before.id) { throw 'Release identity changed while finishing.' }
+    if ($Publish -and $finalRelease.draft) { throw 'Verified release remains a draft; publishing did not finish.' }
+    Write-Host "$(if ($finalRelease.draft) { 'Verified draft' } else { 'Published prerelease' }): $($finalRelease.html_url)"
+}
+
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $originalLocation = Get-Location
 try {
     Set-Location -LiteralPath $repoRoot
     if ($Draft -and $Publish) { throw 'Choose -Draft or -Publish, not both.' }
     if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid GitHub repository name.' }
-    foreach ($command in @('git', 'dotnet')) { $null = Get-Command $command -ErrorAction Stop }
+    $null = Get-Command git -ErrorAction Stop
+    if ($Resume) {
+        if (-not ($Draft -or $Publish) -or $PreflightOnly) { throw '-Resume requires -Draft or -Publish, without -PreflightOnly.' }
+        if (-not $Tag -or $Tag -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw '-Resume requires an explicit -Tag vX.Y.Z.' }
+        $null = Get-Command gh -ErrorAction Stop
+        Invoke-Checked gh @('auth', 'status')
+        Confirm-Origin
+        $dirty = Invoke-Checked git @('status', '--porcelain', '--untracked-files=normal') -Capture
+        if ($dirty) { throw 'Commit or stash local changes before resuming release verification.' }
+        $commit = Invoke-Checked gh @('api', "repos/$Repository/commits/$Tag", '--jq', '.sha') -Capture
+        if ($commit -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid remote version tag commit.' }
+        $relation = Invoke-Checked gh @('api', "repos/$Repository/compare/$commit...main", '--jq', '.status') -Capture
+        if ($relation -notin @('identical', 'ahead')) { throw 'The release commit must be reachable from main.' }
+        $staging = Join-Path $repoRoot "artifacts/releases/$Tag/resume-$([guid]::NewGuid().ToString('N'))"
+        $assetNames = @("PeakReplayLab-$($Tag.Substring(1)).zip", 'PeakReplayLab.dll', 'SHA256SUMS.txt', 'build-manifest.json')
+        Verify-And-FinishRelease $Tag $commit $staging $assetNames
+        return
+    }
+    $null = Get-Command dotnet -ErrorAction Stop
     [xml] $project = Get-Content -LiteralPath 'src/PeakReplayLab/PeakReplayLab.csproj' -Raw
     $version = [string] $project.Project.PropertyGroup.Version
     if ($version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'The project must use a three-part release version.' }
@@ -193,10 +299,7 @@ SHA256SUMS.txt 校验本包 DLL、安装说明和构建清单。build-manifest.j
 
     $null = Get-Command gh -ErrorAction Stop
     Invoke-Checked gh @('auth', 'status')
-    $origin = Invoke-Checked git @('remote', 'get-url', 'origin') -Capture
-    if ($origin -notin @("https://github.com/$Repository.git", "https://github.com/$Repository", "git@github.com:$Repository.git")) {
-        throw 'Origin does not match the requested publication repository.'
-    }
+    Confirm-Origin
     $remoteCommit = Invoke-Checked gh @('api', "repos/$Repository/commits/$commit", '--jq', '.sha') -Capture
     if ($remoteCommit -cne $commit) { throw 'Push the source commit to GitHub before publishing.' }
     $mainRelation = Invoke-Checked gh @('api', "repos/$Repository/compare/$commit...main", '--jq', '.status') -Capture
@@ -240,22 +343,8 @@ PEAK 回忆录 $version 实验版。使用本机 PEAK 引用编译，六套合�
         $assets = @(@($zipName, 'PeakReplayLab.dll', 'SHA256SUMS.txt', 'build-manifest.json') | ForEach-Object { Join-Path $upload $_ })
         Invoke-Checked gh (@('release', 'create', $Tag, '--repo', $Repository, '--target', $commit, '--verify-tag', '--draft', '--prerelease', '--title', "PEAK 回忆录 $Tag", '--notes-file', $notesFile) + $assets)
     }
-    $requestId = [guid]::NewGuid().ToString('N')
-    $publishInput = if ($Publish) { 'true' } else { 'false' }
-    Invoke-Checked gh @('workflow', 'run', 'release.yml', '--repo', $Repository, '--ref', 'main', '-f', "tag=$Tag", '-f', "publish=$publishInput", '-f', "request_id=$requestId")
-    $deadline = [DateTime]::UtcNow.AddMinutes(3)
-    $run = $null
-    while (-not $run -and [DateTime]::UtcNow -lt $deadline) {
-        $runs = (Invoke-Checked gh @('run', 'list', '--repo', $Repository, '--workflow', 'release.yml', '--event', 'workflow_dispatch', '--limit', '30', '--json', 'databaseId,displayTitle,url') -Capture) | ConvertFrom-Json
-        $run = @($runs | Where-Object { $_.displayTitle -ceq "Release $Tag / $requestId" }) | Select-Object -First 1
-        if (-not $run) { Start-Sleep -Seconds 3 }
-    }
-    if (-not $run) { throw 'Draft assets uploaded, but the dispatched workflow was not located. Check GitHub Actions before retrying.' }
-    Write-Host "GitHub verification: $($run.url)"
-    Invoke-Checked gh @('run', 'watch', [string] $run.databaseId, '--repo', $Repository, '--exit-status', '--interval', '10', '--compact')
-    $finalRelease = (Invoke-Checked gh @('release', 'view', $Tag, '--repo', $Repository, '--json', 'isDraft,url') -Capture) | ConvertFrom-Json
-    if ($Publish -and $finalRelease.isDraft) { throw 'Verification completed but the release is still a draft; check the publishing job.' }
-    Write-Host "$(if ($finalRelease.isDraft) { 'Verified draft' } else { 'Published prerelease' }): $($finalRelease.url)"
+    $assetNames = @($zipName, 'PeakReplayLab.dll', 'SHA256SUMS.txt', 'build-manifest.json')
+    Verify-And-FinishRelease $Tag $commit $staging $assetNames $upload
 } finally {
     Set-Location -LiteralPath $originalLocation
 }
