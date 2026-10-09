@@ -218,7 +218,7 @@ public sealed class FullReplayWriter
             eventSequence = e.Sequence; eventTime = e.T;
         }
         foreach (var actor in frame.Actors)
-            if (actors.Add(actor.Id) && actors.Count > ReplayRules.MaxActors) throw new StopException("actor-limit", "Full recording exceeds its supported participant-template limit.");
+            actors.Add(actor.Id);
         double gap = previous == null ? 0 : frame.T - previous.T;
         if (gap > largestGap) Volatile.Write(ref largestGap, gap);
         if (gap > .100001) Interlocked.Increment(ref gap100);

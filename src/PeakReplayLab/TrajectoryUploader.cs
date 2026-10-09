@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -16,6 +18,7 @@ public sealed class TrajectoryUploadReceipt
     public string ModerationStatus { get; set; } = "";
     public string MapCompatibility { get; set; } = "";
     public bool Duplicate { get; set; }
+    public string[] UploadIds { get; set; } = Array.Empty<string>();
 }
 
 // Only the separately exported, bounded trajectory package reaches HTTP. No
@@ -36,17 +39,79 @@ public static class TrajectoryUploader
     }
 
     public static async Task<TrajectoryUploadReceipt> UploadAsync(string packagePath, Uri endpoint,
-        CancellationToken cancellation = default, HttpMessageHandler? testHandler = null)
+        CancellationToken cancellation = default, HttpMessageHandler? testHandler = null,
+        Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
     {
         Endpoint(endpoint.AbsoluteUri);
+        using var client = Client(testHandler);
+        return await UploadFileAsync(packagePath, endpoint, client, cancellation, retryDelay ?? Task.Delay).ConfigureAwait(false);
+    }
+
+    // Packet limits protect each request, not the number of teammates. A batch
+    // succeeds only after every immutable export has a valid acknowledgement.
+    public static async Task<TrajectoryUploadReceipt> UploadManyAsync(IReadOnlyList<string> packagePaths, Uri endpoint,
+        CancellationToken cancellation = default, Action<int, int>? progress = null,
+        HttpMessageHandler? testHandler = null, Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
+    {
+        Endpoint(endpoint.AbsoluteUri);
+        if (packagePaths == null || packagePaths.Count == 0) throw new InvalidDataException("没有可上传的轨迹包。");
+        string[] paths = packagePaths.ToArray();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string path in paths)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            if (string.IsNullOrEmpty(path) || !seen.Add(System.IO.Path.GetFullPath(path)))
+                throw new InvalidDataException("轨迹分包路径重复或无效。");
+            if (!path.EndsWith(".trajectory.json.gz", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("只允许上传独立轨迹包。");
+            ValidatePackage(path, new FileInfo(path).Length);
+        }
+        using var client = Client(testHandler);
+        var receipts = new List<TrajectoryUploadReceipt>();
+        progress?.Invoke(0, paths.Length);
+        foreach (string path in paths)
+        {
+            try
+            {
+                receipts.Add(await UploadFileAsync(path, endpoint, client, cancellation, retryDelay ?? Task.Delay).ConfigureAwait(false));
+                progress?.Invoke(receipts.Count, paths.Length);
+            }
+            catch (Exception error) when (error is InvalidDataException || error is IOException || error is HttpRequestException)
+            {
+                throw new InvalidDataException($"已确认 {receipts.Count}/{paths.Length} 个轨迹分包。全部分包已保留，重试会自动核对已收录部分。{error.Message}", error);
+            }
+        }
+        string status = receipts.Any(value => value.ModerationStatus == "rejected") ? "rejected"
+            : receipts.Any(value => value.ModerationStatus == "hidden") ? "hidden"
+            : receipts.Any(value => value.ModerationStatus == "pending") ? "pending" : "approved";
+        return new TrajectoryUploadReceipt
+        {
+            UploadId = receipts[0].UploadId, UploadIds = receipts.Select(value => value.UploadId).ToArray(),
+            ModerationStatus = status, MapCompatibility = receipts.All(value => value.MapCompatibility == "matched") ? "matched" : "waiting-map",
+            Duplicate = receipts.All(value => value.Duplicate)
+        };
+    }
+
+    private static HttpClient Client(HttpMessageHandler? handler) => new(handler ?? new HttpClientHandler { AllowAutoRedirect = false })
+        { Timeout = TimeSpan.FromSeconds(60) };
+
+    private static void ValidatePackage(string packagePath, long length)
+    {
+        if (!packagePath.EndsWith(".trajectory.json.gz", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("只允许上传独立轨迹包。");
+        if (length <= 0 || length > MaximumPackageBytes)
+            throw new InvalidDataException("轨迹分包为空或超过 12 MiB，请重新导出。");
+    }
+
+    private static async Task<TrajectoryUploadReceipt> UploadFileAsync(string packagePath, Uri endpoint, HttpClient client,
+        CancellationToken cancellation, Func<TimeSpan, CancellationToken, Task> delay)
+    {
         if (!packagePath.EndsWith(".trajectory.json.gz", StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("只允许上传独立轨迹包。");
         using var file = new FileStream(packagePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        if (file.Length <= 0 || file.Length > MaximumPackageBytes)
-            throw new InvalidDataException("轨迹包为空或超过 12 MiB，请重新导出。");
-        using var client = new HttpClient(testHandler ?? new HttpClientHandler { AllowAutoRedirect = false });
-        client.Timeout = TimeSpan.FromSeconds(60);
+        ValidatePackage(packagePath, file.Length);
+        int rateRetries = 0;
         for (int attempt = 0; ; attempt++)
         {
             cancellation.ThrowIfCancellationRequested();
@@ -57,6 +122,7 @@ public static class TrajectoryUploader
             // read-only file handle alive so a changed path cannot swap payloads.
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
             request.Headers.TryAddWithoutValidation("X-Trajectory-Format", "trajectory-v1");
+            request.Headers.TryAddWithoutValidation("Prefer", "return=minimal");
             request.Content = new StreamContent(new BorrowedStream(file));
             request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             request.Content.Headers.ContentEncoding.Add("gzip");
@@ -64,9 +130,19 @@ public static class TrajectoryUploader
             try
             {
                 using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptTimeout.Token).ConfigureAwait(false);
+                if ((int)response.StatusCode == 429 && rateRetries++ < 8)
+                {
+                    var wait = response.Headers.RetryAfter?.Delta
+                        ?? (response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow) ?? TimeSpan.FromSeconds(60);
+                    // Large batches can span several rate windows. Waiting is
+                    // cancellable and happens on the upload worker, not Unity.
+                    await delay(TimeSpan.FromSeconds(Math.Clamp(wait.TotalSeconds, 1, 300)), cancellation).ConfigureAwait(false);
+                    attempt--;
+                    continue;
+                }
                 if (Retryable(response.StatusCode) && attempt < 2)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false);
+                    await delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false);
                     continue;
                 }
                 string body = await ReadBounded(response.Content, attemptTimeout.Token).ConfigureAwait(false);
@@ -89,13 +165,13 @@ public static class TrajectoryUploader
                 return new TrajectoryUploadReceipt
                 {
                     UploadId = id, ModerationStatus = moderation, MapCompatibility = compatibility,
-                    Duplicate = json.Value<bool?>("duplicate") ?? false
+                    Duplicate = json.Value<bool?>("duplicate") ?? false, UploadIds = new[] { id }
                 };
             }
             catch (HttpRequestException) when (attempt < 2)
-            { await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false); }
+            { await delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false); }
             catch (OperationCanceledException) when (!cancellation.IsCancellationRequested && attempt < 2)
-            { await Task.Delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false); }
+            { await delay(TimeSpan.FromSeconds(2 * (attempt + 1)), cancellation).ConfigureAwait(false); }
         }
     }
 

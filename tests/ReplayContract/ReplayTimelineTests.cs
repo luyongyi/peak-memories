@@ -248,14 +248,15 @@ internal static class ReplayTimelineTests
             }
             finally { Directory.Delete(root, true); }
         });
-        test("invalid global ranges and excessive actors cannot enter a timeline", () =>
+        test("invalid global ranges are rejected while large teams keep every actor", () =>
         {
             Reject(() => new PagedReplayTimeline(new ReplayHeader(), double.NaN, 2, Array.Empty<string>(),
                 new[] { new ReplayPageRange(0, 1) }, (i, c) => Page(i)));
             Reject(() => new PagedReplayTimeline(new ReplayHeader(), 10, 2, Array.Empty<string>(),
                 new[] { new ReplayPageRange(0, 8), new ReplayPageRange(7, 10) }, (i, c) => Page(i)));
-            Reject(() => new PagedReplayTimeline(new ReplayHeader(), 10, 2, Enumerable.Range(0, 17).Select(i => i.ToString()).ToArray(),
-                new[] { new ReplayPageRange(0, 10) }, (i, c) => Page(i)));
+            using var large = new PagedReplayTimeline(new ReplayHeader(), 10, 2, Enumerable.Range(0, 80).Select(i => i.ToString()).ToArray(),
+                new[] { new ReplayPageRange(0, 10) }, (i, c) => Page(i));
+            Check(large.ActorIds.Length == 80);
         });
     }
 

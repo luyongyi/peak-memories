@@ -121,7 +121,7 @@ public static class FullReplayArchive
         if (!ReplayRegionCovers.Valid(info.RegionSummary)) throw Invalid("Invalid full replay region summary.");
         if (info.Version != 1 || info.Header == null || info.Pages == null || info.Pages.Length < 1 || info.Pages.Length > MaximumPages ||
             !ReplayRules.Finite(info.Duration) || info.Duration <= 0 || info.Duration > MaximumDuration ||
-            info.FrameCount < 2 || info.FrameCount > MaximumFrames || info.ActorIds == null || info.ActorIds.Length > ReplayRules.MaxActors ||
+            info.FrameCount < 2 || info.FrameCount > MaximumFrames || info.ActorIds == null ||
             info.ActorIds.Any(x => string.IsNullOrWhiteSpace(x) || x.Length > 256) ||
             info.ActorIds.Distinct(StringComparer.Ordinal).Count() != info.ActorIds.Length ||
             info.Reason == null || info.Reason.Length > 256 || info.Fault?.Length > 4096 || info.FaultCode?.Length > 128 ||

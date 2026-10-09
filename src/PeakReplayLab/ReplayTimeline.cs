@@ -125,7 +125,7 @@ internal sealed class PagedReplayTimeline : IReplayTimeline
                 pages[i].End < pages[i].Start || pages[i].End > duration ||
                 (i > 0 && (pages[i].Start < pages[i - 1].Start || pages[i].Start < pages[i - 1].End)))
                 throw new InvalidDataException("Invalid continuous replay page ranges.");
-        if (pages[0].Start != 0 || pages[pages.Length - 1].End != duration || actorIds.Length > ReplayRules.MaxActors ||
+        if (pages[0].Start != 0 || pages[pages.Length - 1].End != duration ||
             actorIds.Any(string.IsNullOrEmpty) || actorIds.Distinct(StringComparer.Ordinal).Count() != actorIds.Length)
             throw new InvalidDataException("Invalid continuous replay participants or endpoints.");
         Header = header; Duration = duration; FrameCount = frameCount; ActorIds = (string[])actorIds.Clone(); Complete = complete;

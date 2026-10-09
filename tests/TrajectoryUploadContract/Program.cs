@@ -41,6 +41,7 @@ try
         {
             Check(request.Method == HttpMethod.Post && request.RequestUri == endpoint, "correct request target");
             Check(request.Content!.Headers.ContentEncoding.Single() == "gzip" && request.Content.Headers.ContentType!.MediaType == "application/json", "wire headers");
+            Check(request.Headers.GetValues("Prefer").Single() == "return=minimal", "receipt must not grow with lobby size");
             byte[] actual = await request.Content.ReadAsByteArrayAsync(cancellation);
             Check(expected.SequenceEqual(actual), "only export bytes sent");
             return Response(HttpStatusCode.Created, reply);
@@ -107,6 +108,74 @@ try
         var handler = new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, reply)));
         await Reject<OperationCanceledException>(() => TrajectoryUploader.UploadAsync(path, endpoint, cancellation.Token, handler));
         Check(handler.Calls == 0, "request sent after cancellation");
+    });
+    await Test("all 70 parts are acknowledged with no fixed teammate or part ceiling", async () =>
+    {
+        var paths = new List<string>();
+        for (int i = 0; i < 70; i++)
+        {
+            string part = Path.Combine(directory, $"part-{i}.trajectory.json.gz");
+            using (var file = File.Create(part))
+            using (var gzip = new GZipStream(file, CompressionLevel.Optimal))
+                gzip.Write(Encoding.UTF8.GetBytes($"{{\"part\":{i}}}"));
+            paths.Add(part);
+        }
+        int received = 0;
+        var handler = new Handler(async (request, cancellation) =>
+        {
+            Check((await request.Content!.ReadAsByteArrayAsync(cancellation)).SequenceEqual(File.ReadAllBytes(paths[received])), "a teammate's packet was skipped or reordered");
+            string id = (++received).ToString("x64");
+            return Response(HttpStatusCode.Created, reply.Replace(new string('a', 64), id).Replace("pending", "approved").Replace("waiting-map", "matched"));
+        });
+        var progress = new List<(int, int)>();
+        var receipt = await TrajectoryUploader.UploadManyAsync(paths, endpoint, progress: (done, total) => progress.Add((done, total)), testHandler: handler);
+        Check(received == 70 && receipt.UploadIds.Length == 70 && receipt.UploadIds[^1] == 70.ToString("x64"), "last teammate never reached server");
+        Check(progress[0] == (0, 70) && progress[^1] == (70, 70), "batch reported success early");
+        Check(receipt.ModerationStatus == "approved" && receipt.MapCompatibility == "matched", "aggregate receipt");
+    });
+    await Test("partial batch failure never reports all teammates uploaded and files remain retryable", async () =>
+    {
+        string second = Path.Combine(directory, "second.trajectory.json.gz"); File.Copy(path, second, true);
+        int received = 0;
+        var handler = new Handler((_, _) => Task.FromResult(Response(++received == 1 ? HttpStatusCode.Created : HttpStatusCode.UnprocessableEntity, reply)));
+        int confirmed = 0;
+        try
+        {
+            await TrajectoryUploader.UploadManyAsync(new[] { path, second }, endpoint, progress: (done, _) => confirmed = done, testHandler: handler);
+            throw new Exception("incomplete batch accepted");
+        }
+        catch (InvalidDataException error) { Check(error.Message.Contains("1/2"), "missing acknowledged part count"); }
+        Check(confirmed == 1 && received == 2 && File.Exists(path) && File.Exists(second), "batch failure lost source exports");
+    });
+    await Test("batch preflight rejects bad or duplicate paths before sending any part", async () =>
+    {
+        var handler = new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, reply)));
+        await Reject<InvalidDataException>(() => TrajectoryUploader.UploadManyAsync(new[] { path, path }, endpoint, testHandler: handler));
+        await Reject<InvalidDataException>(() => TrajectoryUploader.UploadManyAsync(new[] { path, path + ".peakrun" }, endpoint, testHandler: handler));
+        await Reject<InvalidDataException>(() => TrajectoryUploader.UploadManyAsync(Array.Empty<string>(), endpoint, testHandler: handler));
+        Check(handler.Calls == 0, "invalid batch partially transmitted");
+    });
+    await Test("large batches respect a server rate window without consuming transient-failure retries", async () =>
+    {
+        int calls = 0; var waits = new List<TimeSpan>();
+        var handler = new Handler((_, _) =>
+        {
+            var response = Response(++calls <= 4 ? HttpStatusCode.TooManyRequests : HttpStatusCode.OK, reply);
+            if (calls <= 4) response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromSeconds(60));
+            return Task.FromResult(response);
+        });
+        await TrajectoryUploader.UploadManyAsync(new[] { path }, endpoint, testHandler: handler,
+            retryDelay: (wait, _) => { waits.Add(wait); return Task.CompletedTask; });
+        Check(calls == 5 && waits.Count == 4 && waits.All(wait => wait == TimeSpan.FromSeconds(60)), "rate window treated as teammate/attempt ceiling");
+    });
+    await Test("cancel between parts prevents subsequent teammate requests", async () =>
+    {
+        string second = Path.Combine(directory, "cancel-second.trajectory.json.gz"); File.Copy(path, second, true);
+        using var cancellation = new CancellationTokenSource();
+        var handler = new Handler((_, _) => Task.FromResult(Response(HttpStatusCode.OK, reply)));
+        await Reject<OperationCanceledException>(() => TrajectoryUploader.UploadManyAsync(new[] { path, second }, endpoint,
+            cancellation.Token, (done, _) => { if (done == 1) cancellation.Cancel(); }, handler));
+        Check(handler.Calls == 1 && File.Exists(second), "cancelled batch sent later members");
     });
 }
 finally { Directory.Delete(directory, recursive: true); }

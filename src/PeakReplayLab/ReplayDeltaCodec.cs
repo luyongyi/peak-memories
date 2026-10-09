@@ -250,8 +250,9 @@ internal static class ReplayDeltaCodec
         private T[] previous = Array.Empty<T>();
         private readonly Func<T, string> key;
         private readonly string keyField;
-        private readonly int maximum, keyLength;
-        public ReadSet(Func<T, string> key, string keyField, int maximum, int keyLength)
+        private readonly int? maximum;
+        private readonly int keyLength;
+        public ReadSet(Func<T, string> key, string keyField, int? maximum, int keyLength)
         { this.key = key; this.keyField = keyField; this.maximum = maximum; this.keyLength = keyLength; }
         public T[] Decode(JToken? updatesToken, JToken? removedToken, JToken? orderToken, bool full, int schema)
         {
@@ -279,7 +280,7 @@ internal static class ReplayDeltaCodec
                 if (!removedKeys.Add(id) || touched.Contains(id) || !values.Remove(id))
                     throw Error("Unknown, duplicate or conflicting entity removal.");
             }
-            if (values.Count > maximum) throw Error("Expanded entity count exceeds limit.");
+            if (maximum.HasValue && values.Count > maximum.Value) throw Error("Expanded entity count exceeds limit.");
             if (orderToken != null)
             {
                 JArray order = ArrayToken(orderToken, maximum);
@@ -306,7 +307,7 @@ internal static class ReplayDeltaCodec
         private readonly int schema;
         public Reader(int schema = ReplayRules.CurrentSchema)
         { if (!ReplayRules.SupportedSchema(schema)) throw new ArgumentOutOfRangeException(nameof(schema)); this.schema = schema; }
-        private readonly ReadSet<ActorFrame> actors = new(a => a.Id, nameof(ActorFrame.Id), ReplayRules.MaxActors, 256);
+        private readonly ReadSet<ActorFrame> actors = new(a => a.Id, nameof(ActorFrame.Id), null, 256);
         private readonly ReadSet<ItemFrame> items = new(a => a.Key, nameof(ItemFrame.Key), ReplayRules.MaxItems, 256);
         private readonly ReadSet<CrateFrame> crates = new(a => a.Key, nameof(CrateFrame.Key), ReplayRules.MaxCrates, 2048);
         private readonly ReadSet<RopeReplayFrame> ropes = new(a => a.Key, nameof(RopeReplayFrame.Key), ReplayRules.MaxRopes, 256);
@@ -460,8 +461,8 @@ internal static class ReplayDeltaCodec
         return Apply(token as JObject ?? throw Error("Expected complete nested object."), null, type, schema: schema);
     }
     private static bool Bool(JToken? token) => token?.Type == JTokenType.Boolean ? token.Value<bool>() : throw Error("Expected boolean.");
-    private static JArray ArrayToken(JToken? token, int maximum)
-    { if (token is not JArray array || array.Count > maximum) throw Error("Missing, invalid or oversized array."); return array; }
+    private static JArray ArrayToken(JToken? token, int? maximum)
+    { if (token is not JArray array || maximum.HasValue && array.Count > maximum.Value) throw Error("Missing, invalid or oversized array."); return array; }
     private static string Key(JToken? token, int length)
     {
         if (token?.Type != JTokenType.String) throw Error("Missing entity identity.");

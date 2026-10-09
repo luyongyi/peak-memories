@@ -21,8 +21,9 @@ public sealed partial class Plugin
     private Uri? routeDestination;
     private string routeSummary = "", routeError = "";
     private bool routeFinished;
-    private sealed class RouteProgress { public float Value; }
+    private sealed class RouteProgress { public float Value; public int UploadedParts; public int TotalParts; }
     private RouteProgress routeProgress = new();
+    private int routeDisplayedParts = -1;
     private bool RouteUploadBusy => routeExport != null || routeSending != null || routePackage != null;
     private float VolatileRouteProgress() => Volatile.Read(ref routeProgress.Value);
     private string RouteExportDirectory => Path.Combine(Paths.BepInExRootPath, "PeakReplayLab", "TrajectoryExports");
@@ -66,16 +67,25 @@ public sealed partial class Plugin
         var package = routePackage;
         var destination = routeDestination;
         var cancellation = routeCancellation!.Token;
+        var progressState = routeProgress;
+        Volatile.Write(ref progressState.TotalParts, package.Paths.Length);
+        Volatile.Write(ref progressState.UploadedParts, 0);
+        routeDisplayedParts = -1;
         routeSending = Task.Run(async () =>
         {
-            var receipt = await TrajectoryUploader.UploadAsync(package.Path, destination, cancellation).ConfigureAwait(false);
+            var receipt = await TrajectoryUploader.UploadManyAsync(package.Paths, destination, cancellation,
+                (done, total) =>
+                {
+                    Volatile.Write(ref progressState.UploadedParts, done);
+                    Volatile.Write(ref progressState.Value, (float)done / total);
+                }).ConfigureAwait(false);
             // A small local acknowledgement is separate from the immutable package.
             // Server success must remain success even if writing the local note fails.
             try
             {
                 string json = JsonConvert.SerializeObject(new
                 {
-                    receipt.UploadId, receipt.ModerationStatus, receipt.MapCompatibility, receipt.Duplicate,
+                    receipt.UploadId, receipt.UploadIds, receipt.ModerationStatus, receipt.MapCompatibility, receipt.Duplicate,
                     Destination = destination.GetLeftPart(UriPartial.Authority), ReceivedUtc = DateTime.UtcNow.ToString("O")
                 }, Formatting.Indented);
                 File.WriteAllText(package.Path + ".receipt.json", json);
@@ -98,9 +108,10 @@ public sealed partial class Plugin
                 routeSummary = $"将上传到：{routeDestination!.Host}\n" +
                     $"{routePackage.PlayerCount} 位玩家 · {routePackage.PointCount:N0} 个坐标 · 最多 10 Hz\n" +
                     $"压缩后 {routePackage.CompressedBytes / 1048576d:F2} MiB · {ClockLabel(routePackage.DurationMs / 1000d)}\n" +
+                    $"全部成员 · {routePackage.Paths.Length} 个轨迹分包（自动全部上传）\n" +
                     $"地图：{routePackage.Scene} · {routePackage.DifficultyLabel}\n" +
                     "姓名：" + MemoriesLibraryModel.Plain(names, 240) +
-                    "\n只含轨迹、姓名、地图与难度及少量过关事件。\n有效投稿自动审核；只将个人完整线路用于路线与热力统计。";
+                    "\n只含存活轨迹、姓名、地图与难度及少量过关事件。\n幽灵移动不上传，复活后另起一段。\n有效投稿自动审核；个人完整线路才计入公开热力。";
                 if (!routePackage.NativeEvidence)
                     routeSummary += "\n旧录像缺少个人过关证据，保留为未知，不计入默认热力。";
                 else if (!routePackage.StageGatesKnown)
@@ -111,6 +122,15 @@ public sealed partial class Plugin
             catch (OperationCanceledException) { routeError = "已取消轨迹筛选。"; }
             catch (Exception e) { Logger.LogWarning("Trajectory export failed: " + e); routeError = "轨迹筛选失败：" + MemoriesLibraryModel.Plain(e.Message, 180); }
             finally { routeExport = null; }
+        }
+        if (routeSending != null && !routeSending.IsCompleted)
+        {
+            int completed = Volatile.Read(ref routeProgress.UploadedParts);
+            if (completed != routeDisplayedParts)
+            {
+                routeDisplayedParts = completed;
+                routeSummary = $"正在上传全队轨迹…\n已确认 {completed}/{Volatile.Read(ref routeProgress.TotalParts)} 个分包。\n全部分包确认后才显示上传完成。";
+            }
         }
         if (routeSending?.IsCompleted == true)
         {
@@ -127,6 +147,7 @@ public sealed partial class Plugin
                     _ => "轨迹已上传，等待审核。"
                 };
                 routeSummary = (receipt.Duplicate ? "这份轨迹已经提交。\n" : "") + moderation + "\n" + map +
+                    $"\n全队 {receipt.UploadIds.Length} 个轨迹分包均已确认。" +
                     "\n投稿编号：" + receipt.UploadId.Substring(0, 16) +
                     "\n查看路线：首页 → 进入地图 → 对应关卡 → 线路图层。" +
                     "\n选择「大家的路线」或「热力图」（须审核通过且地图匹配）。";

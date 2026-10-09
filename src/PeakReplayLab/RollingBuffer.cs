@@ -202,7 +202,7 @@ public sealed class RollingBuffer
 
     private static ReplayClip BuildSnapshot(ReplayHeader h, ReplayFrame[] items, double start, ReplayRegionOutcome? outcome)
     {
-        h.Participants = items.SelectMany(f => f.Actors).GroupBy(a => a.Id).Select(g => g.Last().Name).Take(ReplayRules.MaxActors).ToArray();
+        h.Participants = items.SelectMany(f => f.Actors).GroupBy(a => a.Id).Select(g => g.Last().Name).ToArray();
         var regions = new ReplayRegionAccumulator(h);
         foreach (var frame in items) regions.Observe(frame);
         regions.ObserveOutcome(outcome, start, items[items.Length - 1].T);

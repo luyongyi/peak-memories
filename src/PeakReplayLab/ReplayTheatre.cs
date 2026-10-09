@@ -108,7 +108,6 @@ internal sealed class ReplayTheatre : IDisposable
                         !Application.CanStreamedLevelBeLoaded(timeline.Header.Scene))
                         throw new InvalidOperationException("本机游戏没有录像对应的关卡场景。");
                     ids = timeline.ActorIds;
-                    if (ids.Length > ReplayRules.MaxActors) throw new InvalidOperationException("片段参与者过多。");
                     EnterScope();
                     nativeLoading = new NativeReplayLoading(LoadingScreen.LoadingScreenType.Plane);
                     disconnect = MainMenu.DisconnectForOfflineMode();

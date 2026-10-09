@@ -110,7 +110,7 @@ Test("duplicate timestamps rejected", () => Reject(() => ReplayRules.Validate(Fr
 Test("decreasing time rejected", () => Reject(() => ReplayRules.Validate(Frame(1), 2)));
 Test("too long clip rejected", () => Reject(() => ReplayRules.Validate(Frame(901), 1)));
 Test("duplicate participant IDs rejected", () => { var f = Frame(0); f.Actors = new[] { Actor(), Actor() }; Reject(() => ReplayRules.Validate(f, -1)); });
-Test("too many actors rejected", () => { var f = Frame(0); f.Actors = Enumerable.Range(0, 17).Select(i => new ActorFrame { Id = i.ToString() }).ToArray(); Reject(() => ReplayRules.Validate(f, -1)); });
+Test("large modded teams are validated without a member-count cap", () => { var f = Frame(0); f.Actors = Enumerable.Range(0, 80).Select(i => new ActorFrame { Id = i.ToString() }).ToArray(); ReplayRules.Validate(f, -1); Check(f.Actors.Length == 80); });
 Test("empty frame allowed for despawn", () => ReplayRules.Validate(new ReplayFrame { T = 0 }, -1));
 Test("invalid position shape rejected", () => { var f = Frame(0); f.Actors[0].Position = new float[4]; Reject(() => ReplayRules.Validate(f, -1)); });
 Test("non-finite position rejected", () => { var f = Frame(0); f.Actors[0].Position[0] = float.NaN; Reject(() => ReplayRules.Validate(f, -1)); });

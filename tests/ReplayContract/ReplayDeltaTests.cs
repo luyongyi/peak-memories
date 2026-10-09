@@ -127,12 +127,14 @@ internal static class ReplayDeltaTests
             var clip = Sample(); string file = Path.Combine(dir, "legacy.ndjson");
             WriteFixture(file, clip.Header, clip.Frames.Select(Token).ToArray()); Bad(() => ReplayFiles.Read(file));
         }));
-        test("current codec still enforces expanded entity limits", () =>
+        test("current codec keeps all expanded players beyond four, sixteen and sixty-four", () =>
         {
             var tokens = Records(); var reader = new ReplayDeltaCodec.Reader(); reader.Decode(tokens[0]);
             var updates = new JArray(); var template = (JObject)tokens[0]["Actors"]![0]!;
-            for (int i = 0; i < ReplayRules.MaxActors; i++) { var value = (JObject)template.DeepClone(); value["Id"] = "added-" + i; updates.Add(value); }
-            tokens[1]["Actors"] = updates; tokens[1].Remove("ActorOrder"); Bad(() => reader.Decode(tokens[1]));
+            for (int i = 0; i < 80; i++) { var value = (JObject)template.DeepClone(); value["Id"] = "added-" + i; updates.Add(value); }
+            tokens[1]["Actors"] = updates; tokens[1].Remove("ActorOrder");
+            var expanded = reader.Decode(tokens[1]);
+            Check(expanded.Actors.Length == 81 && expanded.Actors.Last().Id == "added-79");
         });
     }
 

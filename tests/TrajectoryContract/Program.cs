@@ -287,6 +287,142 @@ Test("death, revive, leave and rejoin break route continuity and never qualify d
     Check(events.Any(e => e.Kind == "dead") && events.Any(e => e.Kind == "revive") && events.Any(e => e.Kind == "leave"));
     Check(events.Count(e => e.Kind == "join") == 2 && !events.Any(e => e.Kind == "finish"));
 });
+Test("route upload ends at exact death, omits ghosts, restarts at revive and keeps dead rejoin closed", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .6);
+    builder.Observe(Frame(0, Actor(0, 0)));
+    var death = Actor(.05, 1); death.RouteState!.Alive = false; builder.Observe(Frame(.05, death));
+    foreach (double time in new[] { .1, .2 })
+    { var ghost = Actor(time, 999); ghost.RouteState!.Alive = false; builder.Observe(Frame(time, ghost)); }
+    builder.Observe(Frame(.25, Actor(.25, 2)));
+    builder.Observe(Frame(.35, Actor(.35, 3)));
+    death = Actor(.4, 4); death.RouteState!.Alive = false; builder.Observe(Frame(.4, death));
+    builder.Observe(Frame(.45));
+    var returningGhost = Actor(.5, 777); returningGhost.RouteState!.Alive = false; builder.Observe(Frame(.5, returningGhost));
+    var player = builder.Finish().Players.Single();
+    Check(player.Points.Select(point => point[0]).SequenceEqual(new[] { 50, 250, 350, 400 }));
+    Check(player.Points.Select(point => point[3]).SequenceEqual(new[] { 100, 200, 300, 400 }));
+    Check(!player.Events.Any(value => value.Kind == "break" && value.TMs == 50));
+    Check(player.Events.Where(value => value.TMs == 500).Select(value => value.Kind).SequenceEqual(new[] { "join", "dead", "break" }));
+    Check(player.Events.Any(value => value.Kind == "revive" && value.TMs == 250));
+});
+Test("initial ghosts retain member metadata with no coordinates and legacy dead eyes also stop ghost points", () =>
+{
+    foreach (bool legacy in new[] { false, true })
+    {
+        var builder = new ReplayTrajectoryExporter.Builder(Header(!legacy), .3);
+        foreach (double time in new[] { 0d, .1, .2, .3 })
+        {
+            var living = Actor(time, (float)time, "living");
+            var ghost = Actor(time, 999, "initial-ghost");
+            ghost.RouteState!.Alive = false; ghost.Appearance.EyeState = 2;
+            if (legacy) { living.RouteState = ghost.RouteState = null; living.Position = new[] { 0f, 0f, (float)time }; }
+            builder.Observe(Frame(time, living, ghost));
+        }
+        var package = builder.Finish();
+        Check(package.Players.Count == 2 && package.Players[0].Points.Count == 4 && package.Players[1].Points.Count == 0);
+        Check(package.Players[1].Events.Any(value => value.Kind == "dead"));
+    }
+});
+Test("same-bucket deaths replace a living point, early revivals wait and unobserved deaths never add ghost positions", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .6);
+    builder.Observe(Frame(0, Actor(0, 0)));
+    builder.Observe(Frame(.1, Actor(.1, 1)));
+    var death = Actor(.15, 2); death.RouteState!.Alive = false; builder.Observe(Frame(.15, death));
+    builder.Observe(Frame(.16, Actor(.16, 3)));
+    builder.Observe(Frame(.25, Actor(.25, 4)));
+    builder.Observe(Frame(.3));
+    var ghost = Actor(.4, 999); ghost.RouteState!.Alive = false; builder.Observe(Frame(.4, ghost));
+    builder.Observe(Frame(.5, ghost));
+    var player = builder.Finish().Players.Single();
+    Check(player.Points.Select(value => value[0]).SequenceEqual(new[] { 0, 150, 250 }));
+    Check(player.Points.All(value => value[3] != 99900));
+    Check(player.Points.Select(value => value[0] / 100).Distinct().Count() == player.Points.Count);
+});
+Test("missing native evidence and dead sticky wins cannot create an authoritative summit", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .2);
+    var unknown = Actor(0, 0, "mixed"); unknown.RouteState = null;
+    var deadWin = Actor(0, 0, "sticky"); deadWin.RouteState!.Alive = false; deadWin.RouteState.Finished = true;
+    builder.Observe(Frame(0, unknown, deadWin));
+    foreach (double time in new[] { .1, .2 })
+    {
+        var mixed = Actor(time, 1, "mixed"); mixed.RouteState!.Finished = true;
+        var sticky = Actor(time, 1, "sticky"); sticky.RouteState!.Finished = true;
+        builder.Observe(Frame(time, mixed, sticky));
+    }
+    var players = builder.Finish().Players;
+    Check(players[0].Evidence == "legacy-unknown");
+    Check(players.All(value => !value.Events.Any(item => item.Kind == "summit")));
+});
+Test("only individual alive native summit wins emit summit, including first observed winners and excluding Nadir", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .2);
+    foreach (double time in new[] { 0d, .1, .2 })
+    {
+        var initial = Actor(time, 1, "initial-winner"); initial.RouteState!.Finished = true;
+        var later = Actor(time, 1, "later-winner"); later.RouteState!.Finished = time > 0;
+        var ghost = Actor(time, 1, "dead-winner"); ghost.RouteState!.Alive = false; ghost.RouteState.Finished = true;
+        var nadir = Actor(time, 1, "nadir-winner"); nadir.RouteState!.Finished = nadir.RouteState.FinishedNadir = true;
+        var crossing = Actor(time, time == 0 ? 49 : 51, "gate-only");
+        builder.Observe(Frame(time, initial, later, ghost, nadir, crossing));
+    }
+    var players = builder.Finish().Players;
+    Check(players.Take(2).All(value => value.Events.Count(item => item.Kind == "summit" && item.StageIndex == 4) == 1));
+    Check(players.Skip(2).All(value => !value.Events.Any(item => item.Kind == "summit")));
+    Check(players.Last().Events.Any(value => value.Kind == "finish" && value.StageIndex == 4));
+});
+Test("eighty members round-trip full and rolling recordings and all export with whole-member adaptive packets", () => InRoot(root =>
+{
+    var frames = Enumerable.Range(0, 3).Select(sample => Frame(sample / 10d,
+        Enumerable.Range(0, 80).Select(index =>
+        {
+            var actor = Actor(sample / 10d, sample, "private-player-" + index, index == 0);
+            actor.Name = "Synthetic member " + index;
+            // Per-member clocks deliberately disagree. The all-member metadata
+            // pass must supply the exact same final clock to every packet.
+            actor.RouteState!.RunTimeMs = 1000 + index + sample * 100;
+            return actor;
+        }).ToArray())).ToArray();
+    var header = Header(); header.Participants = frames[0].Actors.Select(value => value.Name).ToArray();
+    var source = Save(root, header, frames);
+    var info = FullReplayArchive.ReadInfo(source.FilePath);
+    Check(info.ActorIds.Length == 80 && info.Header.Participants.Length == 80);
+    Check(FullReplayArchive.ReadPage(source.FilePath, info, 0).Frames.All(value => value.Actors.Length == 80));
+    using (var timeline = new PagedReplayTimeline(info.Header, info.Duration, info.FrameCount, info.ActorIds,
+        info.Pages.Select(page => new ReplayPageRange(page.Start, page.End)).ToArray(),
+        (index, cancellation) => FullReplayArchive.ReadPage(source.FilePath, info, index, cancellation)))
+        Check(timeline.ActorIds.Length == 80);
+    var rolling = new RollingBuffer();
+    foreach (var frame in frames) rolling.Add(frame);
+    var clip = rolling.Snapshot(Header(), DateTime.UtcNow);
+    Check(clip.Header.Participants.Length == 80 && clip.Frames.All(value => value.Actors.Length == 80));
+    var result = ReplayTrajectoryExporter.ExportWithSmallerLimits(source.FilePath, Path.Combine(root, "parts"),
+        ReplayTrajectoryExporter.MaximumCompressedBytes, 6500);
+    Check(result.Paths.Length > 1 && result.Path == result.Paths[0] && result.PlayerCount == 80 && result.PointCount == 240);
+    var packages = result.Paths.Select(ReadPackage).ToArray();
+    var players = packages.SelectMany(value => (JArray)value["players"]!).ToArray();
+    Check(players.Length == 80 && players.Select(value => (string)value["key"]!).Distinct().Count() == 80);
+    Check(players.All(value => ((JArray)value["points"]!).Count == 3));
+    Check(packages.All(value => (string)value["recordingId"]! == result.RecordingId
+        && (long)value["timeOriginMs"]! == 1079 && (int)value["durationMs"]! == 200));
+    Check(packages.Select(value => value["runKey"]!.ToString()).Distinct().Count() == 1);
+    Check(result.CompressedBytes == result.Paths.Sum(value => new FileInfo(value).Length));
+    Check(result.DecodedBytes == packages.Sum(value => (long)System.Text.Encoding.UTF8.GetByteCount(value.ToString(Formatting.None))));
+    Check(result.PlayerNames.Last() == "Synthetic member 79");
+    string canceledOutput = Path.Combine(root, "canceled-parts");
+    using var cancellation = new CancellationTokenSource();
+    try
+    {
+        ReplayTrajectoryExporter.ExportWithSmallerLimits(source.FilePath, canceledOutput,
+            ReplayTrajectoryExporter.MaximumCompressedBytes, 6500, cancellation.Token,
+            progress => { if (progress > .45 && progress < 1) cancellation.Cancel(); });
+        throw new Exception("Cancellation between successful member packets was ignored.");
+    }
+    catch (OperationCanceledException) { }
+    Check(!Directory.EnumerateFiles(canceledOutput).Any());
+}));
 Test("no resampling creates points across native sample gaps or low source cadence", () =>
 {
     var builder = new ReplayTrajectoryExporter.Builder(Header(), 10);
@@ -553,5 +689,30 @@ if (fixtureIndex >= 0)
         result.PointCount, result.PlayerCount, result.DurationMs, synthetic = true,
     }, Formatting.Indented));
     Console.WriteLine("FIXTURE " + result.Path);
+}
+int teamFixtureIndex = Array.IndexOf(args, "--team-fixture-dir");
+if (teamFixtureIndex >= 0)
+{
+    if (teamFixtureIndex + 1 >= args.Length) throw new ArgumentException("--team-fixture-dir needs a directory.");
+    string root = Path.GetFullPath(args[teamFixtureIndex + 1]); Directory.CreateDirectory(root);
+    var frames = new[] { 0d, .1, .15, .16, .25, .3 }.Select(time => Frame(time,
+        Enumerable.Range(0, 80).Where(index => index != 4 || time != .1).Select(index =>
+        {
+            var actor = Actor(time, (float)time, "synthetic-private-member-" + index, index == 0);
+            actor.Name = "Synthetic member " + index;
+            actor.RouteState!.RunTimeMs = 1000 + (long)Math.Round(time * 1000);
+            actor.RouteState.Alive = index switch { 1 or 4 => time < .15, 2 => false, 3 => time != .15, 5 => time != .15, _ => true };
+            actor.RouteState.Finished = index == 0 && time >= .25 || index == 5 && time >= .15 || index == 6 && time >= .25;
+            if (index == 6 && time == 0) actor.RouteState = null;
+            if (actor.RouteState?.Alive == false) actor.RouteState.Center[2] = time == .15 ? .15f : 999;
+            return actor;
+        }).ToArray())).ToArray();
+    var header = Header(); header.Participants = frames[0].Actors.Select(value => value.Name).ToArray();
+    var source = Save(root, header, frames);
+    var result = ReplayTrajectoryExporter.ExportWithSmallerLimits(source.FilePath, root,
+        ReplayTrajectoryExporter.MaximumCompressedBytes, 6500);
+    File.WriteAllText(Path.Combine(root, "team-fixture.json"), JsonConvert.SerializeObject(new
+    { source = source.FilePath, packages = result.Paths, result.PointCount, result.PlayerCount, synthetic = true }, Formatting.Indented));
+    Console.WriteLine("TEAM FIXTURE " + Path.Combine(root, "team-fixture.json"));
 }
 Console.WriteLine($"TOTAL: {passed} trajectory checks passed. No real recording, identity, Unity runtime or HTTP endpoint is used.");

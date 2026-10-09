@@ -75,7 +75,7 @@ public static class MemoriesLibraryModel
             !ReplayRules.Finite(info.Duration) || info.Duration <= 0 || info.Duration > FullReplayArchive.MaximumDuration ||
             info.FrameCount < 2 || info.FrameCount > 4L * 60 * 60 * 60 + 1 ||
             info.Pages == null || info.Pages.Length == 0 || info.Pages.Length > FullReplayArchive.MaximumPages ||
-            info.ActorIds == null || info.ActorIds.Length > ReplayRules.MaxActors ||
+            info.ActorIds == null ||
             info.ActorIds.Any(id => string.IsNullOrWhiteSpace(id) || id.Length > 256) ||
             info.ActorIds.Distinct(StringComparer.Ordinal).Count() != info.ActorIds.Length ||
             bytes <= 0 || bytes > FullReplayArchive.MaximumFileBytes))
@@ -149,7 +149,7 @@ public static class MemoriesLibraryModel
     private static string Participants(string[]? values)
     {
         if (values == null || values.Length == 0) return "未标注姓名";
-        return Fallback(Plain(string.Join(" · ", values.Take(ReplayRules.MaxActors).Select(value => Plain(value, 36))), 620), "未标注姓名");
+        return Fallback(Plain(string.Join(" · ", values.Select(value => Plain(value, 36))), 620), "未标注姓名");
     }
     private static string LocalDate(string? preferred, string? fallback)
     {

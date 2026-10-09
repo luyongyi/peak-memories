@@ -14,7 +14,7 @@ internal static class Capture
 {
     public static Character[] Players() => Character.AllCharacters
         .Where(c => c && c.IsPlayerControlled && c.gameObject.activeInHierarchy && c.refs?.hip && c.refs.animator)
-        .Take(ReplayRules.MaxActors).ToArray();
+        .ToArray();
 
     public static void Players(List<Character> destination)
     {
@@ -23,7 +23,6 @@ internal static class Capture
         {
             if (!c || !c.IsPlayerControlled || !c.gameObject.activeInHierarchy || !c.refs?.hip || !c.refs.animator) continue;
             destination.Add(c);
-            if (destination.Count == ReplayRules.MaxActors) break;
         }
     }
 
@@ -225,7 +224,7 @@ internal static class Capture
 
 internal sealed class RollingCapture : IDisposable
 {
-    private readonly List<Character> players = new(ReplayRules.MaxActors);
+    private readonly List<Character> players = new();
     private readonly Transform[] mapObjects;
     private readonly ItemCapture items;
     private readonly LuggageCapture crates;

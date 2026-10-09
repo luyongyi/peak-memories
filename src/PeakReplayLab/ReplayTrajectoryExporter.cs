@@ -13,6 +13,7 @@ namespace PeakReplayLab;
 public sealed class TrajectoryExportResult
 {
     public string Path { get; internal set; } = "";
+    public string[] Paths { get; internal set; } = Array.Empty<string>();
     public string RecordingId { get; internal set; } = "";
     public long CompressedBytes { get; internal set; }
     public long DecodedBytes { get; internal set; }
@@ -115,7 +116,8 @@ public static class ReplayTrajectoryExporter
     public const long MaximumCompressedBytes = 12L * 1024 * 1024;
     public const long MaximumDecodedBytes = 64L * 1024 * 1024;
     private const long MaximumRetainedPoints = MaximumDecodedBytes / 72;
-    private const int MaximumEvents = 50_000;
+    private const int MaximumEvents = 100_000;
+    private const int MaximumRetainedEvents = 200_000;
     private static readonly JsonSerializerSettings UploadJson = new()
     {
         TypeNameHandling = TypeNameHandling.None, MaxDepth = 12,
@@ -124,18 +126,19 @@ public static class ReplayTrajectoryExporter
     };
 
     // Invoke on a disk worker (Task.Run), never in the live capture loop.
-    // Each source page is decoded once and released; replay UI/joint indexes are
-    // not opened, and the original recording is never rewritten.
+    // Pages are released after each read. A metadata pass establishes one shared
+    // clock; bounded whole-member batches are reread as needed. No member is
+    // removed to satisfy a package size or an arbitrary team-size limit.
     public static TrajectoryExportResult Export(string recordingPath, string outputDirectory,
         CancellationToken cancellation = default, Action<double>? progress = null)
         => ExportCore(recordingPath, outputDirectory, MaximumCompressedBytes, MaximumDecodedBytes, cancellation, progress);
 
     internal static TrajectoryExportResult ExportWithSmallerLimits(string recordingPath, string outputDirectory,
-        long compressedLimit, long decodedLimit, CancellationToken cancellation = default)
+        long compressedLimit, long decodedLimit, CancellationToken cancellation = default, Action<double>? progress = null)
     {
         if (compressedLimit < 1 || compressedLimit > MaximumCompressedBytes || decodedLimit < 1 || decodedLimit > MaximumDecodedBytes)
             throw new ArgumentOutOfRangeException(nameof(compressedLimit));
-        return ExportCore(recordingPath, outputDirectory, compressedLimit, decodedLimit, cancellation, null);
+        return ExportCore(recordingPath, outputDirectory, compressedLimit, decodedLimit, cancellation, progress);
     }
 
     private static TrajectoryExportResult ExportCore(string recordingPath, string outputDirectory,
@@ -148,56 +151,60 @@ public static class ReplayTrajectoryExporter
         var info = FullReplayArchive.ReadInfo(recordingPath, cancellation);
         if (!info.Complete || !string.IsNullOrEmpty(info.FaultCode) || !string.IsNullOrEmpty(info.Fault))
             throw new InvalidDataException("这份录像未正常封存，暂时不能上传轨迹。是否通关不影响正常封存录像上传。");
-        var builder = new Builder(info.Header, info.Duration);
-        double previous = -1;
-        for (int i = 0; i < info.Pages.Length; i++)
+        void Read(Builder builder, bool metadata)
         {
-            cancellation.ThrowIfCancellationRequested();
-            var page = FullReplayArchive.ReadPage(recordingPath, info, i, cancellation);
-            foreach (var frame in page.Frames)
+            double previous = -1;
+            for (int i = 0; i < info.Pages.Length; i++)
             {
                 cancellation.ThrowIfCancellationRequested();
-                // Archive validation already checks overlap flags and page
-                // counts. Do not duplicate the boundary actor sample/events.
-                if (frame.T <= previous) continue;
-                builder.Observe(frame);
-                previous = frame.T;
+                var page = FullReplayArchive.ReadPage(recordingPath, info, i, cancellation);
+                foreach (var frame in page.Frames)
+                {
+                    cancellation.ThrowIfCancellationRequested();
+                    if (frame.T <= previous) continue;
+                    builder.Observe(frame); previous = frame.T;
+                }
+                if (metadata) progress?.Invoke((i + 1d) / info.Pages.Length * .45);
             }
-            progress?.Invoke((i + 1d) / info.Pages.Length * .9);
         }
-        var package = builder.Finish();
-        cancellation.ThrowIfCancellationRequested();
+        var overview = new Builder(info.Header, info.Duration, retainData: false);
+        Read(overview, true);
+        var package = overview.Finish();
         string directory = System.IO.Path.GetFullPath(outputDirectory);
         Directory.CreateDirectory(directory);
-        string target = System.IO.Path.Combine(directory, package.RecordingId + "-" + Guid.NewGuid().ToString("N") + ".trajectory.json.gz");
-        string temporary = target + ".partial";
-        bool created = false;
+        var paths = new List<string>();
         long rawBytes = 0, compressedBytes = 0;
+        int exportedMembers = 0;
+        void Batch(string[] ids)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            try
+            {
+                var builder = new Builder(info.Header, info.Duration, selectedIds: new HashSet<string>(ids, StringComparer.Ordinal));
+                Read(builder, false);
+                var batch = builder.Finish(package);
+                var written = WritePackage(batch, directory, compressedLimit, decodedLimit, cancellation);
+                paths.Add(written.Path); rawBytes += written.Decoded; compressedBytes += written.Compressed;
+                exportedMembers += ids.Length;
+                progress?.Invoke(.45 + .55 * exportedMembers / overview.ActorIds.Length);
+            }
+            catch (PackageBudgetException) when (ids.Length > 1)
+            {
+                // Whole-member subdivision preserves every individual's actual
+                // route; time slicing would require inventing cross-upload joins.
+                int middle = ids.Length / 2;
+                Batch(ids.Take(middle).ToArray()); Batch(ids.Skip(middle).ToArray());
+            }
+        }
         try
         {
-            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan))
-            {
-                created = true;
-                using var compressed = new LimitedWriteStream(file, compressedLimit, cancellation);
-                using (var gzip = new GZipStream(compressed, CompressionLevel.Optimal, true))
-                using (var decoded = new LimitedWriteStream(gzip, decodedLimit, cancellation))
-                using (var text = new StreamWriter(decoded, new UTF8Encoding(false), 8192, true))
-                using (var json = new JsonTextWriter(text) { CloseOutput = false })
-                {
-                    JsonSerializer.Create(UploadJson).Serialize(json, package);
-                    json.Flush(); text.Flush();
-                    rawBytes = decoded.BytesWritten;
-                }
-                compressed.Flush(); compressedBytes = compressed.BytesWritten;
-                file.Flush();
-            }
-            cancellation.ThrowIfCancellationRequested();
-            File.Move(temporary, target);
+            Batch(overview.ActorIds);
             progress?.Invoke(1);
             return new TrajectoryExportResult
             {
-                Path = target, RecordingId = package.RecordingId, CompressedBytes = compressedBytes, DecodedBytes = rawBytes,
-                PointCount = package.Players.Sum(p => (long)p.Points.Count), PlayerCount = package.Players.Count,
+                Path = paths[0], Paths = paths.ToArray(), RecordingId = package.RecordingId,
+                CompressedBytes = compressedBytes, DecodedBytes = rawBytes,
+                PointCount = overview.PointCount, PlayerCount = package.Players.Count,
                 PlayerNames = package.Players.Select(p => p.Name).ToArray(), DurationMs = package.DurationMs,
                 DifficultyLabel = package.Difficulty.Custom == true ? "自定义难度" : package.Difficulty.Ascent.HasValue
                     ? "Ascent " + package.Difficulty.Ascent.Value : "未知难度",
@@ -208,14 +215,51 @@ public static class ReplayTrajectoryExporter
                 Scene = package.Map.Scene, Route = (string[])package.Map.Route.Clone(),
             };
         }
+        catch (PackageBudgetException error)
+        {
+            foreach (string path in paths) if (File.Exists(path)) File.Delete(path);
+            throw new InvalidDataException("单名队员的轨迹超过每包处理预算，未丢弃任何队员；请保留录像和导出记录供排查。", error);
+        }
         catch
         {
-            // This invocation's exact temporary file only. Cancellation never
-            // leaves an apparently complete package or alters the source.
-            if (created && File.Exists(temporary)) File.Delete(temporary);
+            // Remove only files made by this invocation. An incomplete batch is
+            // never offered as though every team member was exported.
+            foreach (string path in paths) if (File.Exists(path)) File.Delete(path);
             throw;
         }
     }
+
+    private static (string Path, long Decoded, long Compressed) WritePackage(TrajectoryPackage package,
+        string directory, long compressedLimit, long decodedLimit, CancellationToken cancellation)
+    {
+        string target = System.IO.Path.Combine(directory, package.RecordingId + "-" + Guid.NewGuid().ToString("N") + ".trajectory.json.gz");
+        string temporary = target + ".partial";
+        bool created = false;
+        try
+        {
+            long rawBytes, compressedBytes;
+            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan))
+            {
+                created = true;
+                using var compressed = new LimitedWriteStream(file, compressedLimit, cancellation);
+                using (var gzip = new GZipStream(compressed, CompressionLevel.Optimal, true))
+                using (var decoded = new LimitedWriteStream(gzip, decodedLimit, cancellation))
+                using (var text = new StreamWriter(decoded, new UTF8Encoding(false), 8192, true))
+                using (var json = new JsonTextWriter(text) { CloseOutput = false })
+                {
+                    JsonSerializer.Create(UploadJson).Serialize(json, package);
+                    json.Flush(); text.Flush(); rawBytes = decoded.BytesWritten;
+                }
+                compressed.Flush(); compressedBytes = compressed.BytesWritten; file.Flush();
+            }
+            cancellation.ThrowIfCancellationRequested(); File.Move(temporary, target);
+            return (target, rawBytes, compressedBytes);
+        }
+        catch { if (created && File.Exists(temporary)) File.Delete(temporary); throw; }
+    }
+
+    private sealed class PackageBudgetException : IOException
+    { public PackageBudgetException(string message) : base(message) { } }
 
     internal sealed class Builder
     {
@@ -224,6 +268,7 @@ public static class ReplayTrajectoryExporter
             public readonly TrajectoryPlayer Value;
             public ActorRouteState? Native;
             public bool Present, EverMissingEvidence;
+            public bool SummitRecorded;
             public bool? Dead;
             public double LastFrameTime = -1;
             public int LastPointMs = -100;
@@ -236,14 +281,19 @@ public static class ReplayTrajectoryExporter
         }
         private readonly Dictionary<string, Track> tracks = new(StringComparer.Ordinal);
         private readonly TrajectoryPackage package;
+        private readonly bool retainData;
+        private readonly HashSet<string>? selectedIds;
         private readonly string? headerRunKey;
         private string? lastRunKey;
         private long? runTimeOrigin;
         private long? headerTimeOrigin;
         private long points, events;
+        public long PointCount => points;
+        public string[] ActorIds => tracks.Keys.ToArray();
 
-        public Builder(ReplayHeader header, double duration)
+        public Builder(ReplayHeader header, double duration, bool retainData = true, HashSet<string>? selectedIds = null)
         {
+            this.retainData = retainData; this.selectedIds = selectedIds;
             ReplayRouteRules.Validate(header.RouteContext);
             var context = header.RouteContext;
             string recordingId = context?.RecordingId ?? ReplayRouteRules.Hash("peak-memories/legacy/v1/" +
@@ -283,10 +333,10 @@ public static class ReplayTrajectoryExporter
             var present = new HashSet<string>(StringComparer.Ordinal);
             foreach (var actor in frame.Actors)
             {
+                if (selectedIds != null && !selectedIds.Contains(actor.Id)) continue;
                 present.Add(actor.Id);
                 if (!tracks.TryGetValue(actor.Id, out var track))
                 {
-                    if (tracks.Count >= ReplayRules.MaxActors) throw new InvalidDataException("Trajectory participant limit exceeded.");
                     var player = new TrajectoryPlayer { Name = actor.Name };
                     tracks.Add(actor.Id, track = new Track(player)); package.Players.Add(player);
                 }
@@ -298,14 +348,16 @@ public static class ReplayTrajectoryExporter
                 if (native == null) track.EverMissingEvidence = true;
                 track.Value.Owner |= native?.LocalOwner == true;
                 bool dead = native != null ? !native.Alive : actor.Appearance.EyeState == 2;
+                bool terminalDeath = dead && track.Dead == false && !rejoining;
                 bool lifeChanged = track.Dead.HasValue && track.Dead != dead;
                 if (track.Dead != dead)
                 {
                     if (dead) Event(track, frameMs, "dead");
                     else if (track.Dead == true) Event(track, frameMs, "revive");
-                    if (track.Dead.HasValue) Event(track, frameMs, "break");
+                    if (track.Dead == true) Event(track, frameMs, "break");
                     track.Dead = dead;
                 }
+                else if (dead && rejoining) Event(track, frameMs, "dead");
                 var position = native?.Center ?? actor.Position;
                 int observedMs = native == null ? frameMs : Math.Max(0, Milliseconds(native.SampleTime));
                 // Negative prior baseline at a restarted recording is bounded
@@ -367,11 +419,20 @@ public static class ReplayTrajectoryExporter
                         track.GameStage = gameStage;
                     }
                 }
-                bool sampled = observedMs >= track.LastPointMs + 100;
+                // Full memoir replay still retains ghost animation. The upload
+                // whitelist ends each living segment at the actual death sample
+                // and resumes only after an observed revival, never ghost motion.
+                int pointMs = terminalDeath ? frameMs : observedMs;
+                bool sameBucket = pointMs / 100 == track.LastPointMs / 100 && track.LastPointMs >= 0;
+                bool sampled = terminalDeath || !dead && !sameBucket && (lifeChanged || observedMs >= track.LastPointMs + 100);
                 if (sampled)
                 {
-                    if (++points > MaximumRetainedPoints) throw new InvalidDataException("轨迹点超过 64 MiB 的处理预算，请缩短录像后重试。");
-                    int[] point = { observedMs, ReplayRouteRules.Centimeters(position[0]), ReplayRouteRules.Centimeters(position[1]), ReplayRouteRules.Centimeters(position[2]) };
+                    // Preserve the exact terminal position without increasing
+                    // the wire sampling rate: it replaces this bucket's prior
+                    // living point. A same-bucket revival waits for a later one.
+                    if (!sameBucket && ++points > MaximumRetainedPoints && retainData)
+                        throw new PackageBudgetException("Trajectory point batch budget exceeded.");
+                    int[] point = { pointMs, ReplayRouteRules.Centimeters(position[0]), ReplayRouteRules.Centimeters(position[1]), ReplayRouteRules.Centimeters(position[2]) };
                     // Emit finish evidence only for an alive, unbroken native
                     // crossing. The server still checks the stage's start and
                     // every required interval; finish alone never qualifies it.
@@ -379,13 +440,25 @@ public static class ReplayTrajectoryExporter
                         foreach (var stage in package.Map.Stages)
                             if (stage.ExitZCm.HasValue && ReplayRouteRules.Centimeters(track.LastPosition[2]) <= stage.ExitZCm && point[3] > stage.ExitZCm && track.FinishedStages.Add(stage.Index))
                                 Event(track, observedMs, "finish", stage.Index);
-                    track.Value.Points.Add(point); track.LastPointMs = observedMs; track.LastPosition = (float[])position.Clone();
+                    if (retainData)
+                    {
+                        if (sameBucket && track.Value.Points.Count != 0)
+                            track.Value.Points[track.Value.Points.Count - 1] = point;
+                        else track.Value.Points.Add(point);
+                    }
+                    track.LastPointMs = pointMs; track.LastPosition = (float[])position.Clone();
                 }
                 if (native?.Finished == true && track.Native?.Finished == false)
                 {
                     int last = native.FinishedNadir ? Array.FindIndex(package.Map.Stages, s => s.Name == "Void") :
                         Array.FindLastIndex(package.Map.Stages, s => s.Name != "Void");
                     if (last >= 0 && track.FinishedStages.Add(last)) Event(track, frameMs, "finish", last);
+                }
+                if (native?.Alive == true && native.Finished && !native.FinishedNadir && !track.SummitRecorded
+                    && (track.Native == null || !track.Native.Finished))
+                {
+                    int last = Array.FindLastIndex(package.Map.Stages, s => s.Name != "Void");
+                    if (last >= 0) { Event(track, frameMs, "summit", last); track.SummitRecorded = true; }
                 }
                 track.Native = native; track.LastFrameTime = frame.T; track.LastFrameGameStage = gameStage;
             }
@@ -408,29 +481,35 @@ public static class ReplayTrajectoryExporter
             return index >= 0 && index <= 4 && OrdinaryStage(index) ? index : null;
         }
 
-        public TrajectoryPackage Finish()
+        public TrajectoryPackage Finish(TrajectoryPackage? sharedMetadata = null)
         {
             package.RunKey = lastRunKey ?? headerRunKey;
             package.TimeOriginMs = lastRunKey != null ? runTimeOrigin : headerTimeOrigin;
             if (package.RunKey == null || !package.TimeOriginMs.HasValue)
             { package.RunKey = null; package.TimeOriginMs = null; }
+            if (sharedMetadata != null)
+            { package.RunKey = sharedMetadata.RunKey; package.TimeOriginMs = sharedMetadata.TimeOriginMs; }
             string scope = package.RunKey ?? package.RecordingId;
             foreach (var pair in tracks)
             {
                 var track = pair.Value;
                 track.Value.Key = ReplayRouteRules.Hash("peak-memories/player/v1/" + scope + "/" + pair.Key);
                 track.Value.Evidence = track.EverMissingEvidence ? "legacy-unknown" : "native-state";
-                track.Value.Events.Sort((a, b) => a.TMs.CompareTo(b.TMs));
+                if (track.EverMissingEvidence)
+                    track.Value.Events.RemoveAll(value => value.Kind == "summit" || value.Kind == "checkpoint");
+                track.Value.Events = track.Value.Events.OrderBy(value => value.TMs).ToList();
             }
-            if (points < 2 || package.Players.Count == 0) throw new InvalidDataException("录像中的有效轨迹点不足，至少需要两个实际观测点。");
+            if (package.Players.Count == 0) throw new InvalidDataException("录像中没有可导出的队员信息。");
             return package;
         }
 
         private void Event(Track track, int time, string kind, int? stage = null)
         {
+            if (!retainData) return;
             var last = track.Value.Events.LastOrDefault();
             if (last != null && last.TMs == time && last.Kind == kind && last.StageIndex == stage) return;
-            if (++events > MaximumEvents) throw new InvalidDataException("Trajectory event limit exceeded.");
+            if (++events > MaximumRetainedEvents || track.Value.Events.Count >= MaximumEvents)
+                throw new PackageBudgetException("Trajectory event batch budget exceeded.");
             track.Value.Events.Add(new TrajectoryEvent { TMs = time, Kind = kind, StageIndex = stage });
         }
         private static double Distance(float[] a, float[] b)
@@ -455,7 +534,7 @@ public static class ReplayTrajectoryExporter
         public override void Write(byte[] buffer, int offset, int count)
         {
             cancellation.ThrowIfCancellationRequested();
-            if (count > maximum - BytesWritten) throw new InvalidDataException("轨迹包超过 12 MiB 压缩或 64 MiB 解压大小上限，已停止导出。");
+            if (count > maximum - BytesWritten) throw new PackageBudgetException("Trajectory packet byte budget exceeded.");
             inner.Write(buffer, offset, count); BytesWritten += count;
         }
         public override void Flush() { cancellation.ThrowIfCancellationRequested(); inner.Flush(); }

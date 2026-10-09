@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.2";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.3";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
@@ -177,7 +177,6 @@ public static class ReplayRules
     private static ReplayTrackValidation<CreatureReplayFrame> CreatureValidation() => new(x => x.Key, MaxCreatures, CreatureReplayRules.Validate, CreatureReplayRules.ValidateCounts);
     [ThreadStatic] private static HashSet<string>? objectKeys;
     [ThreadStatic] private static HashSet<string>? nodePaths;
-    public const int MaxActors = 16;
     public const int MaxFrames = 7201; // 120 seconds at the maximum configurable 60 Hz
     public const long MaxBytes = 512L * 1024 * 1024;
     public const int MaxLineCharacters = 8 * 1024 * 1024;
@@ -219,7 +218,7 @@ public static class ReplayRules
             h.GameAssembly == null || h.GameAssembly.Length > 64 || h.SampleHz < 1 || h.SampleHz > 60)
             throw new InvalidDataException("Unsupported or invalid replay header.");
         if (h.MapObjects == null || h.MapObjects.Length > 128 || h.MapObjects.Any(p => string.IsNullOrEmpty(p) || p.Length > 2048) ||
-            h.MapObjects.Distinct().Count() != h.MapObjects.Length || h.Participants == null || h.Participants.Length > MaxActors ||
+            h.MapObjects.Distinct().Count() != h.MapObjects.Length || h.Participants == null ||
             h.Participants.Any(n => n == null || n.Length > 256) || !Finite(h.Duration) || h.Duration < 0 || h.Duration > 121 ||
             h.FrameCount < 0 || h.FrameCount > MaxFrames || h.StartedUtc == null || h.StartedUtc.Length > 64 || h.SavedUtc == null || h.SavedUtc.Length > 64)
             throw new InvalidDataException("Invalid replay metadata.");
@@ -257,7 +256,7 @@ public static class ReplayRules
         if (!Finite(maximumStoredTime) || maximumStoredTime < 1 || maximumStoredTime > 4 * 60 * 60)
             throw new ArgumentOutOfRangeException(nameof(maximumStoredTime));
         if (frame.Type != "frame" || !Finite(frame.T) || frame.T < 0 || frame.T <= previous || (!capture && frame.T > maximumStoredTime) ||
-            frame.Actors == null || frame.Actors.Length > MaxActors)
+            frame.Actors == null)
             throw new InvalidDataException("Invalid replay time or actor count.");
         if (frame.World == null || frame.World.Segment < 0 || frame.World.Segment > 10 ||
             !Finite(frame.World.TimeOfDay) || frame.World.TimeOfDay < 0 || frame.World.TimeOfDay > 1000 ||
@@ -266,6 +265,7 @@ public static class ReplayRules
         EnvironmentReplayRules.Validate(frame.World.Environment);
         if (frame.World.Environment is { SampleTimeKnown: true } environment && environment.SampleTime > frame.T + .000001)
             throw new InvalidDataException("Environment sample time is outside its recording clock.");
+        var actorIds = objectKeys ??= new HashSet<string>(StringComparer.Ordinal); actorIds.Clear();
         for (int actorIndex = 0; actorIndex < frame.Actors.Length; actorIndex++)
         {
             ActorFrame a = frame.Actors[actorIndex];
@@ -277,8 +277,7 @@ public static class ReplayRules
             ReplayHudState.Validate(a.HudState);
             ReplayRouteRules.Validate(a.RouteState, frame.T);
             WebWrapReplayRules.Validate(a.WebWrap);
-            for (int prior = 0; prior < actorIndex; prior++)
-                if (frame.Actors[prior].Id == a.Id) throw new InvalidDataException("Duplicate replay actor.");
+            if (!actorIds.Add(a.Id)) throw new InvalidDataException("Duplicate replay actor.");
             Appearance look = a.Appearance;
             if (look == null || !Cosmetic(look.Skin) || !Cosmetic(look.Eyes) || !Cosmetic(look.Mouth) || !Cosmetic(look.Accessory) ||
                 !Cosmetic(look.Outfit) || !Cosmetic(look.Hat) || !Cosmetic(look.Sash) || !Cosmetic(look.Medal) ||
@@ -312,6 +311,7 @@ public static class ReplayRules
                     throw new InvalidDataException("Joint sample time is outside its recording clock.");
 
         }
+        actorIds.Clear();
         ValidateObjects(frame, capture, memo);
         (capture ? capturedRopes : memo?.Ropes ?? RopeValidation()).Validate(frame.Ropes);
         (capture ? capturedEffects : memo?.Effects ?? EffectValidation()).Validate(frame.Effects);
