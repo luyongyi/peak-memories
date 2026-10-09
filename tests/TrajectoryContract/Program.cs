@@ -70,6 +70,8 @@ ActorFrame Actor(double nativeTime, float z, string id = "private-photon-id-alph
     },
 };
 ReplayFrame Frame(double nativeTime, params ActorFrame[] actors) => new() { T = nativeTime, Actors = actors };
+ReplayFrame PhaseFrame(double frameTime, int segment, params ActorFrame[] actors)
+    => new() { T = frameTime, World = new WorldFrame { Segment = segment }, Actors = actors };
 FullReplayResult Save(string root, ReplayHeader header, IEnumerable<ReplayFrame> frames, bool interrupted = false)
 {
     var writer = new FullReplayWriter(root, header, new ContinuousReplayOptions { QueueFrameLimit = 7201 });
@@ -292,6 +294,138 @@ Test("no resampling creates points across native sample gaps or low source caden
     var package = builder.Finish(); Check(package.Players[0].Points.Count == 5);
     Check(package.Players[0].Points.Select(p => p[0]).SequenceEqual(new[] { 0, 250, 500, 5000, 10000 }));
     Check(package.Players[0].Events.Count(e => e.Kind == "break") == 2);
+});
+Test("real archive phase change proves campfire 54m before the title plane using frame time rather than cached actor time", () => InRoot(root =>
+{
+    var header = Header();
+    foreach (var stage in header.RouteContext!.Stages) { stage.EnterZCm *= 100; stage.ExitZCm *= 100; }
+    foreach (var landmark in header.RouteContext.Alignment!.Landmarks.Where(value => value.Kind == "progress-point")) landmark.PositionCm[2] *= 100;
+    var frames = new[]
+    {
+        PhaseFrame(200, 3, Actor(200, 3946)),
+        PhaseFrame(200.1, 3, Actor(200.1, 3946.1f)),
+        PhaseFrame(200.15, 4, Actor(200.1, 3946.1f)),
+        PhaseFrame(200.2, 4, Actor(200.2, 3946.2f)),
+    };
+    var source = Save(root, header, frames); var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "export"));
+    var package = ReadPackage(result.Path); var player = package["players"]![0]!;
+    var events = player["events"]!.ToArray();
+    Check(events.Count(value => (string?)value["kind"] == "game-stage") == 2);
+    Check(events.Any(value => (string?)value["kind"] == "game-stage" && (int?)value["stageIndex"] == 3 && (int?)value["tMs"] == 0));
+    Check(events.Any(value => (string?)value["kind"] == "game-stage" && (int?)value["stageIndex"] == 4 && (int?)value["tMs"] == 150));
+    Check(events.Count(value => (string?)value["kind"] == "checkpoint" && (int?)value["stageIndex"] == 3 && (int?)value["tMs"] == 150) == 1);
+    Check(!events.Any(value => (string?)value["kind"] == "finish"));
+    Check((int?)package["map"]!["stages"]![4]!["enterZCm"] == 400000);
+    var points = player["points"]!.ToArray();
+    Check(points.Select(value => (int)value[0]!).SequenceEqual(new[] { 0, 100, 200 }));
+    Check(points.All(value => (int)value[3]! < 400000) && (int?)package["sampleHz"] == 10);
+}));
+Test("same native phase emits one initial game-stage while old Z finish evidence remains available", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .2);
+    builder.Observe(PhaseFrame(0, 3, Actor(0, 39)));
+    builder.Observe(PhaseFrame(.1, 3, Actor(.1, 39.5f)));
+    builder.Observe(PhaseFrame(.2, 3, Actor(.2, 40.1f)));
+    var events = builder.Finish().Players[0].Events;
+    Check(events.Count(value => value.Kind == "game-stage") == 1 && events.First(value => value.Kind == "game-stage").StageIndex == 3);
+    Check(!events.Any(value => value.Kind == "checkpoint"));
+    Check(events.Any(value => value.Kind == "finish" && value.StageIndex == 3));
+});
+Test("initial midstage evidence does not invent a prior campfire completion", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .1);
+    builder.Observe(PhaseFrame(0, 3, Actor(0, 35)));
+    builder.Observe(PhaseFrame(.1, 3, Actor(.1, 35.1f)));
+    var events = builder.Finish().Players[0].Events;
+    Check(events.Count(value => value.Kind == "game-stage") == 1 && events.Single(value => value.Kind == "game-stage").StageIndex == 3);
+    Check(!events.Any(value => value.Kind == "checkpoint" || value.Kind == "finish"));
+});
+Test("global phase advances only the continuously alive player's own checkpoint, excluding dead, rejoined, late, warped and jumping actors", () =>
+{
+    ActorFrame Named(double time, string name, float z = 35) { var value = Actor(time, z, name, name == "valid"); value.Name = name; return value; }
+    ActorFrame[] ActorsAt(double time, bool second, bool changing)
+    {
+        var values = new List<ActorFrame> { Named(time, "valid"), Named(time, "dead"), Named(time, "warp"), Named(time, "jump"), Named(time, "unknown"), Named(time, "revive"), Named(time, "ongoing-warp") };
+        if (!second || changing) values.Add(Named(time, "rejoined"));
+        if (changing) values.Add(Named(time, "late"));
+        values.Single(value => value.Name == "dead").RouteState!.Alive = !changing;
+        values.Single(value => value.Name == "revive").RouteState!.Alive = changing;
+        values.Single(value => value.Name == "warp").RouteState!.WarpSequence = changing ? 1 : 0;
+        values.Single(value => value.Name == "ongoing-warp").RouteState!.Warping = true;
+        if (changing) values.Single(value => value.Name == "jump").RouteState!.Center[0] = 1000;
+        if (!changing) values.Single(value => value.Name == "unknown").RouteState = null;
+        return values.ToArray();
+    }
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .2);
+    builder.Observe(PhaseFrame(0, 3, ActorsAt(0, false, false)));
+    builder.Observe(PhaseFrame(.1, 3, ActorsAt(.1, true, false)));
+    builder.Observe(PhaseFrame(.2, 4, ActorsAt(.2, true, true)));
+    var package = builder.Finish();
+    Check(package.Players.Single(value => value.Name == "valid").Events.Count(value => value.Kind == "checkpoint" && value.StageIndex == 3 && value.TMs == 200) == 1);
+    Check(package.Players.Where(value => value.Name != "valid").All(value => !value.Events.Any(item => item.Kind == "checkpoint")));
+    Check(package.Players.All(value => value.Events.Any(item => item.Kind == "game-stage" && item.StageIndex == 4 && item.TMs == 200)));
+});
+Test("frame gaps, native observation gaps and unknown prior phases cannot supply a campfire checkpoint", () =>
+{
+    foreach (int scenario in new[] { 0, 1, 2 })
+    {
+        var builder = new ReplayTrajectoryExporter.Builder(Header(), 2);
+        builder.Observe(PhaseFrame(0, 3, Actor(0, 35)));
+        if (scenario == 1) builder.Observe(PhaseFrame(.9, 3, Actor(0, 35)));
+        if (scenario == 2) builder.Observe(PhaseFrame(.1, 8, Actor(.1, 35)));
+        double time = scenario == 2 ? .2 : 1.1;
+        builder.Observe(PhaseFrame(time, 4, Actor(time, 35.1f)));
+        var events = builder.Finish().Players[0].Events;
+        Check(events.Any(value => value.Kind == "game-stage" && value.StageIndex == 4));
+        Check(!events.Any(value => value.Kind == "checkpoint"));
+        if (scenario != 2) Check(events.Any(value => value.Kind == "break"));
+    }
+});
+Test("a previous path interruption remains a break but does not erase a later real continuous campfire advancement", () =>
+{
+    foreach (bool dying in new[] { false, true })
+    {
+        var builder = new ReplayTrajectoryExporter.Builder(Header(), .3);
+        builder.Observe(PhaseFrame(0, 3, Actor(0, 35)));
+        var broken = Actor(.1, 35); broken.RouteState!.Alive = !dying; broken.RouteState.WarpSequence = dying ? 0 : 1;
+        builder.Observe(PhaseFrame(.1, 3, broken));
+        var recovered = Actor(.2, 35); recovered.RouteState!.WarpSequence = dying ? 0 : 1;
+        builder.Observe(PhaseFrame(.2, 3, recovered));
+        var next = Actor(.3, 35.1f); next.RouteState!.WarpSequence = dying ? 0 : 1;
+        builder.Observe(PhaseFrame(.3, 4, next));
+        var events = builder.Finish().Players[0].Events;
+        Check(events.Any(value => value.Kind == "break"));
+        Check(events.Count(value => value.Kind == "checkpoint" && value.StageIndex == 3 && value.TMs == 300) == 1);
+    }
+});
+Test("Peak shares stage four and Void phase does not manufacture an ordinary completion or a missing route branch", () =>
+{
+    foreach (bool withVoid in new[] { true, false })
+    {
+        var header = Header();
+        if (withVoid) header.RouteContext!.Stages = header.RouteContext.Stages.Concat(new[] { new ReplayRouteStage { Index = 5, Name = "Void" } }).ToArray();
+        var builder = new ReplayTrajectoryExporter.Builder(header, .2);
+        builder.Observe(PhaseFrame(0, 4, Actor(0, 45)));
+        builder.Observe(PhaseFrame(.1, 5, Actor(.1, 45.1f)));
+        builder.Observe(PhaseFrame(.2, 6, Actor(.2, 45.2f)));
+        var events = builder.Finish().Players[0].Events;
+        Check(events.Count(value => value.Kind == "game-stage" && value.StageIndex == 4) == 1);
+        Check(events.Any(value => value.Kind == "game-stage" && value.StageIndex == 5 && value.TMs == 200) == withVoid);
+        Check(!events.Any(value => value.Kind == "checkpoint" || value.Kind == "finish"));
+    }
+});
+Test("nonadjacent and backwards phase changes are not completions and revisiting a checkpoint cannot duplicate it", () =>
+{
+    var builder = new ReplayTrajectoryExporter.Builder(Header(), .5);
+    builder.Observe(PhaseFrame(0, 0, Actor(0, 1)));
+    builder.Observe(PhaseFrame(.1, 3, Actor(.1, 1)));
+    builder.Observe(PhaseFrame(.2, 4, Actor(.2, 1)));
+    builder.Observe(PhaseFrame(.3, 3, Actor(.3, 1)));
+    builder.Observe(PhaseFrame(.4, 4, Actor(.4, 1)));
+    builder.Observe(PhaseFrame(.5, 2, Actor(.5, 1)));
+    var events = builder.Finish().Players[0].Events;
+    Check(events.Count(value => value.Kind == "checkpoint") == 1 && events.Single(value => value.Kind == "checkpoint").StageIndex == 3);
+    Check(events.Count(value => value.Kind == "game-stage") == 6);
 });
 Test("recording-scoped fallback hashes keep equal names separate and repeated exports stable", () =>
 {

@@ -228,7 +228,10 @@ public static class ReplayTrajectoryExporter
             public double LastFrameTime = -1;
             public int LastPointMs = -100;
             public float[]? LastPosition;
+            public int? GameStage;
+            public int? LastFrameGameStage;
             public readonly HashSet<int> FinishedStages = new();
+            public readonly HashSet<int> CheckpointStages = new();
             public Track(TrajectoryPlayer value) => Value = value;
         }
         private readonly Dictionary<string, Track> tracks = new(StringComparer.Ordinal);
@@ -276,6 +279,7 @@ public static class ReplayTrajectoryExporter
         public void Observe(ReplayFrame frame)
         {
             int frameMs = Milliseconds(frame.T);
+            int? gameStage = MappedGameStage(frame.World?.Segment);
             var present = new HashSet<string>(StringComparer.Ordinal);
             foreach (var actor in frame.Actors)
             {
@@ -294,6 +298,7 @@ public static class ReplayTrajectoryExporter
                 if (native == null) track.EverMissingEvidence = true;
                 track.Value.Owner |= native?.LocalOwner == true;
                 bool dead = native != null ? !native.Alive : actor.Appearance.EyeState == 2;
+                bool lifeChanged = track.Dead.HasValue && track.Dead != dead;
                 if (track.Dead != dead)
                 {
                     if (dead) Event(track, frameMs, "dead");
@@ -325,7 +330,8 @@ public static class ReplayTrajectoryExporter
                 }
                 bool warp = native != null && track.Native != null &&
                     (native.WarpSequence != track.Native.WarpSequence || native.Warping && !track.Native.Warping);
-                bool gap = track.LastFrameTime >= 0 && frame.T - track.LastFrameTime > 1;
+                bool gap = track.LastFrameTime >= 0 && frame.T - track.LastFrameTime > 1
+                    || native != null && track.Native != null && native.SampleTime - track.Native.SampleTime > 1;
                 bool jump = false;
                 if (track.LastPosition != null && observedMs > track.LastPointMs)
                 {
@@ -338,6 +344,29 @@ public static class ReplayTrajectoryExporter
                 if (warp) Event(track, frameMs, "warp");
                 if (warp || gap || jump || rejoining && track.LastFrameTime >= 0)
                 { Event(track, frameMs, "break"); track.LastPosition = null; }
+                // World.Segment is already recorded once per replay frame. It
+                // proves the native map phase even while its campfire is before
+                // the next title/progress Z plane. Keep this clock at frameMs,
+                // independent of the cached actor sample's earlier timestamp.
+                bool aliveNow = native?.Alive == true && !native.Warping;
+                bool continuousStep = aliveNow && track.Native?.Alive == true && !track.Native.Warping
+                    && !warp && !gap && !jump && !rejoining && !lifeChanged && track.LastFrameGameStage == track.GameStage;
+                if (gameStage.HasValue)
+                {
+                    if (track.GameStage != gameStage)
+                    {
+                        int? previousStage = track.GameStage;
+                        Event(track, frameMs, "game-stage", gameStage.Value);
+                        // This is the player's actual campfire advancement,
+                        // not a claim that the entire path is uninterrupted.
+                        // Earlier breaks remain exported for server filtering.
+                        if (previousStage.HasValue && continuousStep
+                            && gameStage.Value == previousStage.Value + 1 && OrdinaryStage(previousStage.Value)
+                            && OrdinaryStage(gameStage.Value) && track.CheckpointStages.Add(previousStage.Value))
+                            Event(track, frameMs, "checkpoint", previousStage.Value);
+                        track.GameStage = gameStage;
+                    }
+                }
                 bool sampled = observedMs >= track.LastPointMs + 100;
                 if (sampled)
                 {
@@ -358,11 +387,25 @@ public static class ReplayTrajectoryExporter
                         Array.FindLastIndex(package.Map.Stages, s => s.Name != "Void");
                     if (last >= 0 && track.FinishedStages.Add(last)) Event(track, frameMs, "finish", last);
                 }
-                track.Native = native; track.LastFrameTime = frame.T;
+                track.Native = native; track.LastFrameTime = frame.T; track.LastFrameGameStage = gameStage;
             }
             foreach (var pair in tracks)
                 if (pair.Value.Present && !present.Contains(pair.Key))
-                { Event(pair.Value, frameMs, "leave"); Event(pair.Value, frameMs, "break"); pair.Value.Present = false; pair.Value.LastPosition = null; }
+                { Event(pair.Value, frameMs, "leave"); Event(pair.Value, frameMs, "break"); pair.Value.Present = false;
+                    pair.Value.LastPosition = null; }
+        }
+
+        private bool OrdinaryStage(int index) => package.Map.Stages.Any(stage => stage.Index == index && stage.Name != "Void");
+
+        private int? MappedGameStage(int? nativeSegment)
+        {
+            if (nativeSegment == 6)
+            {
+                var nadir = package.Map.Stages.FirstOrDefault(stage => stage.Name == "Void");
+                return nadir?.Index;
+            }
+            int index = nativeSegment == 5 ? 4 : nativeSegment ?? -1;
+            return index >= 0 && index <= 4 && OrdinaryStage(index) ? index : null;
         }
 
         public TrajectoryPackage Finish()

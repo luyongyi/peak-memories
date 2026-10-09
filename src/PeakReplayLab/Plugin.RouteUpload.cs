@@ -100,7 +100,7 @@ public sealed partial class Plugin
                     $"压缩后 {routePackage.CompressedBytes / 1048576d:F2} MiB · {ClockLabel(routePackage.DurationMs / 1000d)}\n" +
                     $"地图：{routePackage.Scene} · {routePackage.DifficultyLabel}\n" +
                     "姓名：" + MemoriesLibraryModel.Plain(names, 240) +
-                    "\n只含轨迹、姓名、地图与难度及少量过关事件。\n投稿待审核；只将个人完整通过的关卡用于有效路线统计。";
+                    "\n只含轨迹、姓名、地图与难度及少量过关事件。\n有效投稿自动审核；只将个人完整线路用于路线与热力统计。";
                 if (!routePackage.NativeEvidence)
                     routeSummary += "\n旧录像缺少个人过关证据，保留为未知，不计入默认热力。";
                 else if (!routePackage.StageGatesKnown)

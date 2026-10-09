@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.1";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.2";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
