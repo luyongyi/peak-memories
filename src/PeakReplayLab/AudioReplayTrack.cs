@@ -727,7 +727,7 @@ internal sealed class AudioReplayPlayback : IDisposable
         var admitted = sceneEvents.Select(left, right, time, sceneLeftTime, sceneRightTime, includeSceneEvents);
         preparationVoices.Clear();
         foreach (var voice in admitted)
-            if (AudioSeekPreparationPolicy.ShouldPrepare(voice, time)) preparationVoices.Add(voice);
+            if (!AudioReplayRules.SuppressInReplay(voice.Clip) && AudioSeekPreparationPolicy.ShouldPrepare(voice, time)) preparationVoices.Add(voice);
         bool ready = seekPreparation.TryPrepare(seekSequence, Time.frameCount, Time.realtimeSinceStartupAsDouble,
             preparationVoices, preparationState, preparationLoad);
         if (seekPreparation.TimedOutClip.Length != 0)
@@ -768,6 +768,7 @@ internal sealed class AudioReplayPlayback : IDisposable
         for (int voiceIndex = 0; voiceIndex < admitted.Count; voiceIndex++)
         {
             var frame = admitted[voiceIndex];
+            if (AudioReplayRules.SuppressInReplay(frame.Clip)) continue;
             wanted.Add(frame.Key);
             if (voices.TryGetValue(frame.Key, out var changed) && changed.ClipKey != frame.Clip)
             { voices.Remove(frame.Key); changed.Stop(); pool.Enqueue(changed); }

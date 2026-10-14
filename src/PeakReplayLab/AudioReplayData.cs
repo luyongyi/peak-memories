@@ -30,6 +30,11 @@ public sealed class AudioReplayFrame
 public static class AudioReplayRules
 {
     public const int MaxVoices = 128;
+    // Playback-only exclusion: StaminaBar.noStaminaSFX uses Au_NoStamina.
+    // Match the exact escaped native clip name followed by the key separator;
+    // preserve every other stamina-related/game sound and recorded source data.
+    public static bool SuppressInReplay(string clipKey) =>
+        clipKey.StartsWith("Au_NoStamina|", StringComparison.Ordinal);
     // Native SFX adds a random pitch offset without a +/-3 clamp; throw charge
     // reaches 5 and rope motion can exceed that. This is a bounded recording
     // format limit, not a claim that every game/mod source has a native cap.
