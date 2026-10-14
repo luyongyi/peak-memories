@@ -140,6 +140,51 @@ Test("supported worm clock owns the child animation while its ground root remain
     Check(frame.IdleAnimation!=null&&frame.Pose.Position[0]==1&&capture.NativeReads-reads==5&&capture.ChildReads==children);
     Check(NativeVisualAppearance.Reads==appearances&&NativeCaptureAnimationActivity.TotalReads==0&&capture.WormGeometrySkips==5);
 });
+Test("settled modeled worms retain one frame and observation while only five Hertz root safety checks continue",()=>
+{
+    EarlyWormAnimationCapture.Enabled=true;var item=new MobItem{itemID=184};item.gameObject.Attach(new Animator());Item.ALL_ITEMS.Add(item);
+    item.rig!.isKinematic=false;using var capture=new ItemCapture();
+    for(int i=0;i<=60;i++){Time.timeAsDouble=10+i/30d;capture.Capture(Array.Empty<ActorFrame>());}
+    var held=capture.Capture(Array.Empty<ActorFrame>());Check(held[0].ClockMode==CreatureReplayRules.IdleClock&&held[0].IdleAnimation!=null);
+    long native=capture.NativeReads,children=capture.ChildReads,checks=capture.WormRootChecks;int appearances=NativeVisualAppearance.Reads;
+    for(int i=61;i<=360;i++){Time.timeAsDouble=10+i/30d;Check(ReferenceEquals(held,capture.Capture(Array.Empty<ActorFrame>())));}
+    Check(capture.NativeReads==native&&capture.ChildReads==children&&NativeVisualAppearance.Reads==appearances);
+    Check(capture.WormRootChecks-checks==50&&capture.WormIdleSkips>=50&&capture.AnimationProbes==0);
+});
+Test("a modeled worm moving after a long hold creates a fresh cut and keeps later five Hertz movement brackets",()=>
+{
+    EarlyWormAnimationCapture.Enabled=true;var item=new MobItem{itemID=184};item.gameObject.Attach(new Animator());Item.ALL_ITEMS.Add(item);
+    item.rig!.isKinematic=false;using var capture=new ItemCapture();
+    for(int i=0;i<=150;i++){Time.timeAsDouble=10+i/30d;capture.Capture(Array.Empty<ActorFrame>());}
+    var held=capture.Capture(Array.Empty<ActorFrame>())[0];long reads=capture.NativeReads;
+    Time.timeAsDouble=15.2;item.transform.position=new(.5f,0,0);item.rig.linearVelocity=new(1,0,0);
+    var resumed=capture.Capture(Array.Empty<ActorFrame>())[0];
+    Check(resumed.SampleTime==15.2&&resumed.SampleDiscontinuity&&resumed.ClockMode==CreatureReplayRules.ActiveClock&&resumed.Pose.Position[0]==.5f);
+    Check(held.Pose.Position[0]==0&&held.SampleTime<14&&capture.NativeReads==reads+1);
+    Time.timeAsDouble=15.4;item.transform.position=new(.7f,0,0);var next=capture.Capture(Array.Empty<ActorFrame>())[0];
+    Check(next.SampleTime==15.4&&!next.SampleDiscontinuity&&capture.NativeReads==reads+2);
+});
+Test("modeled worm pickup throw cook and unsupported clock bypass quiet holding",()=>
+{
+    foreach(int action in Enumerable.Range(0,4))
+    {
+        EarlyWormAnimationCapture.Enabled=true;Item.ALL_ITEMS.Clear();var item=new MobItem{itemID=184};item.gameObject.Attach(new Animator());Item.ALL_ITEMS.Add(item);
+        using var capture=new ItemCapture();for(int i=0;i<=60;i++){Time.timeAsDouble=10+i/30d;capture.Capture(Array.Empty<ActorFrame>());}
+        long reads=capture.NativeReads;Time.timeAsDouble=12.03;
+        if(action==0){item.itemState=ItemState.Held;item.trueHolderCharacter=new Character();}
+        if(action==1){item.rig!.isKinematic=false;item.rig.linearVelocity=new(2,0,0);item.transform.position=new(1,0,0);}
+        if(action==2)item.data=new(){data=new(){[DataEntryKey.CookedAmount]=new IntItemData{Value=1}}};
+        if(action==3)EarlyWormAnimationCapture.Last!.Supported=false;
+        if(action!=3)ItemCapture.MarkDirty(item);
+        else Time.timeAsDouble=12.2;
+        var resumed=capture.Capture(Array.Empty<ActorFrame>())[0];
+        Check(capture.NativeReads>reads&&resumed.SampleDiscontinuity&&resumed.SampleTime==Time.timeAsDouble);
+        if(action==0)Check(resumed.State==(int)ItemState.Held&&resumed.HolderId=="player");
+        if(action==1)Check(resumed.Pose.Position[0]==1);
+        if(action==2)Check(resumed.Cooked==1);
+        if(action==3)Check(resumed.IdleAnimation==null&&resumed.ClockMode==CreatureReplayRules.ActiveClock);
+    }
+});
 Test("stationary continuous wind hints retain the checkpoint and never renew a full-capture lease",()=>
 {
     var item=Born();item.rig!.isKinematic=false;using var capture=new ItemCapture();capture.Capture(Array.Empty<ActorFrame>());
@@ -244,7 +289,7 @@ Test("frog root safety motion returns to full capture without a native event",()
     FrogCaptureActivity.Enabled=true;var item=new MobItem{itemID=172};Item.ALL_ITEMS.Add(item);using var capture=new ItemCapture();
     for(int i=0;i<45;i++){Time.timeAsDouble=10+i/30d;capture.Capture(Array.Empty<ActorFrame>());}
     long reads=capture.NativeReads;FrogCaptureActivity.ForceRootWake=true;item.transform.position=new(.1f,0,0);Time.timeAsDouble+=1;
-    var frame=capture.Capture(Array.Empty<ActorFrame>())[0];Check(frame.IdleAnimation==null&&frame.Pose.Position[0]==.1f&&capture.NativeReads>reads);
+    var frame=capture.Capture(Array.Empty<ActorFrame>())[0];Check(frame.IdleAnimation==null&&frame.Pose.Position[0]==.1f&&capture.NativeReads>reads&&frame.SampleDiscontinuity);
 });
 Console.WriteLine($"TOTAL: {passed} contracts against actual ItemCapture passed. Native object/geometry adapters are controlled doubles, not Unity engine execution.");
 

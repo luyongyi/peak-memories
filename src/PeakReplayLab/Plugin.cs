@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.27")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.31")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {

@@ -43,6 +43,7 @@ void Test(string name, Action test)
     catch (Exception e) { Console.Error.WriteLine("FAIL " + name + ": " + e); Environment.Exit(1); }
 }
 void Check(bool value) { if (!value) throw new Exception("Assertion failed."); }
+if (args.Contains("--native-shared-packing-only")) { NativeSharedPackingTests.Run(Test); return; }
 if (args.Contains("--bounded-reference-only")) { BoundedReferenceCacheTests.Run(Test); return; }
 BoundedReferenceCacheTests.Run(Test);
 WorkerRebaseCacheTests.Run(Test);
@@ -87,6 +88,7 @@ if (args.Contains("--joint-times-only")) { ActorJointCodecTests.Run(Test); retur
 ReplayObjectNodeCodecTests.Run(Test);
 if (args.Contains("--nodes-only")) return;
 FullReplaySharedBlockTests.Run(Test);
+NativeSharedPackingTests.Run(Test);
 if (args.Contains("--shared-only")) return;
 ItemEventDrivenTests.Run(Test, Check);
 if (args.Contains("--items-only")) return;

@@ -5,6 +5,7 @@ namespace UnityEngine
     public class Object
     {
         public string name = "";
+        public int GetInstanceID() => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
         public static implicit operator bool(Object? value) => value != null;
     }
     public class GameObject : Object
@@ -103,6 +104,7 @@ namespace Peak.Island
         private UnityEngine.Animator anim = new();
         public UnityEngine.Animator Animator => anim;
         public bool IsLeaving;
+        public bool IsAssigned, CurrentlyStealing;
     }
 }
 namespace PeakReplayLab

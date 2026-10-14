@@ -6,8 +6,9 @@ namespace PeakReplayLab;
 
 // One cached native Animator, no bone traversal. Stable perches and the authored
 // fly-away clip share a clock/checkpoint until a real native edge, changed phase,
-// or unsupported visual input. The caller gates heavy Animator observations to
-// 5 Hz, with immediate native events and bounded post-coroutine confirmations.
+// or unsupported visual input. Native events wake immediately; an unassigned
+// supported bird gets a staggered 0.75–1 second safety audit. Voice assignment
+// and unknown inputs retain the existing five Hertz pose fallback.
 internal sealed class RavenAnimationCapture
 {
     internal static bool EventHooksHealthy;
@@ -19,13 +20,21 @@ internal sealed class RavenAnimationCapture
     private readonly List<AnimatorClipInfo> current = new(1);
     private CreatureIdleAnimation? last;
     private bool dirty = true;
+    private bool scheduleObserved, scheduledActive, scheduledAssigned, scheduledStealing, scheduledLeaving;
+    private int confirmations;
+    private double nextAudit = double.NegativeInfinity;
+    private readonly double auditInterval;
     internal long Checks { get; private set; }
+    internal long ScheduleSkips { get; private set; }
+    internal long SemanticWakes { get; private set; }
     internal long MouthFallbacks { get; private set; }
     internal bool LowRateSafe { get; private set; }
     internal int State => last?.Clip == CreatureIdleAnimationRules.RavenFlyAway ? 1 : 0;
     internal RavenAnimationCapture(Peak.Island.VoiceThief raven)
     {
         this.raven = raven;
+        // One native ID query at admission; entries audit at different phases.
+        auditInterval = .75 + (raven.GetInstanceID() & 1023) / 4096d;
         if (!raven || RavenAnimationRuntime.NativeAnimator == null) return;
         animator = RavenAnimationRuntime.NativeAnimator(raven);
         if (!animator) return;
@@ -34,7 +43,22 @@ internal sealed class RavenAnimationCapture
         safeController = RavenAnimationRuntime.CanReference(animator!);
         LowRateSafe = EventHooksHealthy && safeController;
     }
-    internal void NotifyNativeEvent() => dirty = true;
+    internal void NotifyNativeEvent() { dirty = true; confirmations = 2; }
+    internal bool Due(double now, bool active, bool force = false)
+    {
+        if (!raven || !CreatureIdleAnimationRules.Finite(now)) return true;
+        bool assigned = raven.IsAssigned, stealing = raven.CurrentlyStealing, leaving = raven.IsLeaving;
+        bool edge = !scheduleObserved || scheduledActive != active || scheduledAssigned != assigned ||
+            scheduledStealing != stealing || scheduledLeaving != leaving;
+        scheduleObserved = true; scheduledActive = active; scheduledAssigned = assigned;
+        scheduledStealing = stealing; scheduledLeaving = leaving;
+        if (edge) { NotifyNativeEvent(); SemanticWakes++; }
+        // Assigned local victims drive the mouth even while not stealing.
+        // Until that path is separately resource-driven, retain its 5 Hz poses.
+        if (force || dirty || confirmations != 0 || assigned || stealing || !EventHooksHealthy ||
+            !safeController || !LowRateSafe || last == null || now + 1e-8 >= nextAudit) return true;
+        ScheduleSkips++; return false;
+    }
     internal CreatureIdleAnimation Reanchor(double now)
     {
         if (last == null) throw new InvalidOperationException("No supported raven animation to re-anchor.");
@@ -45,6 +69,8 @@ internal sealed class RavenAnimationCapture
     internal bool TryObserve(double now, bool active, out CreatureIdleAnimation? animation, out bool changed)
     {
         Checks++; animation = null; changed = false;
+        nextAudit = now + auditInterval;
+        if (confirmations != 0) confirmations--;
         if (!EventHooksHealthy || !safeController || !active || !raven || !animator || !controller || !idle || !fly || !mouth ||
             !CreatureIdleAnimationRules.Finite(now) || Math.Abs(now) > 1_000_000 ||
             !animator!.enabled || !animator.gameObject.activeInHierarchy || animator.runtimeAnimatorController != controller ||

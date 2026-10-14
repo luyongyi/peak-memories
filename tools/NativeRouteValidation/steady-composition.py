@@ -21,9 +21,9 @@ GROUPS = {
     "Spawned": "Scene", "Balloons": "Scene", "Effects": "Effects", "EffectHistory": "Effects",
     "Audio": "Audio", "TimelineAndControl": "Other", "PageFraming": "Other",
     "SharedVisuals": "Other", "SharedLights": "Other", "SharedPoseNodes": "Other",
+    "SharedOrder": "Other", "SharedCreatureDirectory": "Creatures",
 }
-SHARED = {0: "Items", 1: "Crates", 2: "Ropes", 3: "Creatures", 4: "Interactions",
-          5: "Spawned", 6: "SharedVisuals", 7: "SharedLights", 8: "SharedPoseNodes"}
+SHARED = composition.SHARED_NAMES
 LABELS = {"Shore": "海岸", "Roots": "森蕈", "Alpine": "高山", "Swamp": "雾沼"}
 ORDER = ("Players", "Creatures", "Items", "Scene", "Effects", "Audio", "Other")
 CHINESE = dict(zip(ORDER, ("玩家", "生物", "物品", "场景与机关", "特效及历史", "声音", "共享叶块与时序")))
@@ -69,6 +69,10 @@ class CreatureFamilyAttribution:
             defaults = (False, 0, 0) if entry.get("Full") or previous is None else previous
             clock = (entry.get("SampleTimeKnown", defaults[0]),
                      entry.get("SampleTime", defaults[1]), entry.get("ClockMode", defaults[2]))
+        self.observe_clock(bucket,key,clock)
+
+    def observe_clock(self,bucket,key,clock):
+        row=self.rows[bucket];previous=self.clocks.get((bucket[0],key))
         known, time, _ = clock
         if known:
             inside = self.start <= time <= self.end
@@ -84,7 +88,25 @@ class CreatureFamilyAttribution:
                 row["RepeatedKnownSampleTimeEntries"] += 1
         else:
             row["UnknownSampleTimeEntries"] += 1
-        self.clocks[(track, key)] = clock
+        self.clocks[(bucket[0], key)] = clock
+
+    def directory_membership(self,family,key,clock):
+        bucket=('Creatures',family)
+        self.rows[bucket]['MainStaticDirectoryMemberships']+=1
+        self.keys[bucket].add(key)
+        self.observe_clock(bucket,key,clock)
+
+    def directory_block(self,text,block):
+        entry_bytes=0
+        for name,_,_,start,_,_ in composition.object_field_spans(text):
+            if name!='Value':continue
+            for value,begin,finish in composition.array_entry_spans(text,start):
+                bucket=('Creatures',value['Kind']);size=len(text[begin:finish].encode('utf-8'));entry_bytes+=size
+                self.rows[bucket]['NewStaticDirectoryEntries']+=1
+                self.rows[bucket]['NewStaticDirectoryEntryRawBytes']+=size
+                self.keys[bucket].add(value['Key'])
+                self._fields(bucket,'NewStaticDirectoryEntryFieldRawBytes',text,begin,size)
+        self.overhead['NewStaticDirectoryWrapperAndSeparators']+=block['RawBytes']-entry_bytes
 
     def block(self, track, family, value, text, block):
         assert isinstance(family, str) and family, "New creature block has no known family"
@@ -112,11 +134,11 @@ class CreatureFamilyAttribution:
 
     def report(self, total, creature_group, creature_track, item_reclassified):
         rows = []
-        entity_bytes = sum(row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"] for row in self.rows.values())
+        entity_bytes = sum(row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"] + row['NewStaticDirectoryEntryRawBytes'] for row in self.rows.values())
         assert entity_bytes + sum(self.overhead.values()) == creature_group, "Creature family accounting does not conserve the group"
         track_entity_bytes = collections.Counter()
         for (track, _), row in self.rows.items():
-            track_entity_bytes[track] += row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"]
+            track_entity_bytes[track] += row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"] + row['NewStaticDirectoryEntryRawBytes']
         assert track_entity_bytes["Creatures"] + sum(self.overhead.values()) == creature_track
         assert track_entity_bytes["Items"] == item_reclassified
         for bucket, source in self.rows.items():
@@ -127,12 +149,14 @@ class CreatureFamilyAttribution:
                          "SubsequentSampleTimeChanges", "SubsequentSampleTimeChangesInsideWindow", "RepeatedKnownSampleTimeEntries",
                          "UnknownSampleTimeEntries", "MainEntryPoseNodesValueRawBytes", "NewWholeBlockPoseNodesValueRawBytes"):
                 row.setdefault(name, 0)
-            size = row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"]
+            for name in ('MainStaticDirectoryMemberships','NewStaticDirectoryEntries','NewStaticDirectoryEntryRawBytes','NewStaticDirectoryEntryPoseNodesValueRawBytes'):row.setdefault(name,0)
+            size = row["MainEntryRawBytes"] + row["NewWholeEntityBlockRawBytes"] + row['NewStaticDirectoryEntryRawBytes']
             assert row["MainEntityEntries"] == row["MainSharedReferenceEntries"] + row["MainInlineEntityEntries"]
             assert row["MainEntityEntries"] == row["MainBaselineEntries"] + row["MainDeltaEntries"]
-            assert row["MainEntityEntries"] == row["FirstSeenKnownClockStates"] + row["SubsequentSampleTimeChanges"] + row["RepeatedKnownSampleTimeEntries"] + row["UnknownSampleTimeEntries"]
+            assert row["MainEntityEntries"] + row['MainStaticDirectoryMemberships'] == row["FirstSeenKnownClockStates"] + row["SubsequentSampleTimeChanges"] + row["RepeatedKnownSampleTimeEntries"] + row["UnknownSampleTimeEntries"]
             for source_name, expected in (("MainEntryFieldRawBytes", row["MainEntryRawBytes"]),
-                                          ("NewWholeBlockFieldRawBytes", row["NewWholeEntityBlockRawBytes"])):
+                                          ("NewWholeBlockFieldRawBytes", row["NewWholeEntityBlockRawBytes"]),
+                                          ('NewStaticDirectoryEntryFieldRawBytes',row['NewStaticDirectoryEntryRawBytes'])):
                 row[source_name] = dict(self.fields[bucket][source_name])
                 assert sum(row[source_name].values()) == expected
             rows.append({"Track": bucket[0], "Family": bucket[1], "RawBytes": size,
@@ -217,9 +241,10 @@ def analyze(root, output):
         families = composition.EntityFamilyAttribution()
         shared_clocks = {}
         for identifier, block in enumerate(blocks):
-            if block["Kind"] in (0, 3):
+            if block["Kind"] in (0, 3, 10):
                 payload = member(block)
                 families.shared_block(identifier, block["Kind"], payload)
+                if block['Kind']==10:continue
                 value = json.loads(payload)
                 shared_clocks[identifier] = (value.get("SampleTimeKnown", False), value.get("SampleTime", 0), value.get("ClockMode", 0))
 
@@ -231,6 +256,7 @@ def analyze(root, output):
             records = unique_records = 0
             item_creatures = collections.Counter()
             creatures = CreatureFamilyAttribution(shared_clocks, window["Start"], window["End"])
+            shared_kinds=collections.defaultdict(collections.Counter)
             for page in selected:
                 payload = member(page)
                 page_raw = collections.Counter()
@@ -244,6 +270,7 @@ def analyze(root, output):
                         if fields.get("ObjectsFull"):
                             for identities in families.identities.values():
                                 identities.clear()
+                        families.seed_directory(fields)
                         for track in ("Items", "Creatures"):
                             removed = fields.get("Removed" + track, [])
                             creatures.remove(track, removed)
@@ -273,6 +300,9 @@ def analyze(root, output):
                                     creatures.item_metadata["ItemArrayFieldAndFraming"] += framing
                             elif key in ("RemovedCreatures", "CreatureOrder"):
                                 creatures.overhead[key] += count
+                            elif key=='StaticCreatures':
+                                creatures.overhead[key]+=count
+                                for identity,family,clock in families.static_entries(fields):creatures.directory_membership(family,identity,clock)
                             elif key in ("RemovedItems", "ItemOrder"):
                                 creatures.item_metadata[key] += count
                         page_raw["TimelineAndControl"] += len(line) - attributed
@@ -288,6 +318,7 @@ def analyze(root, output):
                 physical["EffectHistory"] += history["Length"]
                 for block in page_blocks[page["Index"]]:
                     module = SHARED[block["Kind"]]
+                    shared_kinds[block['Kind']].update(Blocks=1,RawBytes=block['RawBytes'],CompressedBytes=block['Length'])
                     raw[module] += block["RawBytes"]
                     physical["NewSharedBlocks"] += block["Length"]
                     if block["Kind"] in (0, 3):
@@ -299,6 +330,7 @@ def analyze(root, output):
                             creatures.block("Items" if block["Kind"] == 0 else "Creatures", family, value, text, block)
                         if block["Kind"] == 0 and family in ITEM_CREATURES:
                             item_creatures[value["Prefab"]] += block["RawBytes"]
+                    elif block['Kind']==10:creatures.directory_block(member(block).decode('utf-8'),block)
             grouped = collections.Counter()
             for module, count in raw.items():
                 grouped[GROUPS[module]] += count
@@ -326,21 +358,23 @@ def analyze(root, output):
                                         "Percent": 100 * grouped[group] / total} for group in ORDER],
                             "TrackGroups": [{"Group": group, "RawBytes": track_grouped[group], "Percent": 100 * track_grouped[group] / total} for group in ORDER],
                             "ItemCreatureRawBytesReclassified": dict(item_creatures),
-                            "CreatureAttribution": creatures.report(total, grouped["Creatures"], raw["Creatures"], reclassified),
+                            "CreatureAttribution": creatures.report(total, grouped["Creatures"], raw["Creatures"]+raw['SharedCreatureDirectory'], reclassified),
+                            'NewSharedBlockKinds':[{'Kind':kind,'Module':SHARED[kind],**dict(counts)} for kind,counts in sorted(shared_kinds.items())],
                             "Modules": dict(raw), "ExactRawAccounting": True, "ExactPhysicalWindowAccounting": True})
     report = {"Session": root.name, "Version": summary["InstalledVersion"], "Mvid": summary["InstalledMvid"],
-              "Schema": header["Schema"], "Windows": results,
+              "Schema": header["Schema"], "OfflineRepack":summary.get('OfflineRepack'), "Windows": results,
               "Method": "Whole independent seek pages strictly inside first/last native FarIdle heartbeat clocks; all pending admissions are zero. Original field UTF-8 spans, full companion effect history and newly emitted shared blocks from each selected page are counted once. Existing shared blocks established before the window are excluded. Regular page baselines/overlap and history repetition remain because they are actual new storage for independent seeking. Header/global final index/footer excluded.",
               "SceneGroup": "World, Crates, Ropes, Interactions, Spawned, Balloons, including newly emitted entity snapshots of these types.",
-              "OtherGroup": "Timeline/control/event framing, page metadata, newly emitted renderer/light/pose-node leaves with shared cross-track ownership.",
+              "OtherGroup": "Timeline/control/event framing, page metadata, newly emitted renderer/light/pose-node/order leaves with shared cross-track ownership.",
               "ItemCreatureClassification": "Frog, EarlyWorm, Mandrake_Hidden original stored Item entries and newly emitted whole-item blocks are attributed to Creatures. TrackGroups retains the unmodified physical track classification. Item-array framing/order/removal fields remain on Items; cross-track shared leaves stay Other.",
-              "CreatureFamilyMethod": "Each family counts actual original main entity entry spans and newly emitted whole-entity blocks (kind 3, plus item kind 0 for Frog/EarlyWorm/Mandrake_Hidden). Creature-array field/framing, removed and order fields are separate overhead; Item-track array/framing/order/removal remains on Items. PercentOfCreatureGroup includes that overhead in its denominator; PercentOfCreatureEntityBytes excludes it. Shared kind 6/7/8 stays Other. Main shared references and inline patches are counted separately. Clock metadata alone is retained across page baselines: first known states are separate from subsequent SampleTime changes inside the native FarIdle window. These are stored observation-clock transitions, including cheap native phase corrections, not native geometry reads or physics samples. New block publication is never counted as an extra observation on top of its main reference.",
+              "CreatureFamilyMethod": "Each family counts actual original main entity entry spans, newly emitted whole-entity blocks (kind 3, plus item kind 0 for Frog/EarlyWorm/Mandrake_Hidden), and original typed entity spans in new static directories (kind 10). Creature array/framing, removed/order fields, StaticCreatures reference fields and new directory wrappers/separators are separate overhead. Item track metadata remains on Items. PercentOfCreatureGroup includes overhead; PercentOfCreatureEntityBytes excludes it. Shared kinds 6/7/8/9 stay Other. Main shared references, inline patches and static directory memberships are separate counts. A directory reference seeds identities and clocks without re-attributing old directory payload bytes or inventing entity update/geometry samples. First known states are separate from subsequent SampleTime changes inside the native FarIdle window; those transitions can include cheap native phase corrections. New block publication is never counted as an extra observation on top of its main reference.",
               "Limits": "Percentages are additive actual uncompressed stored bytes, not gzip disk shares or CPU shares. Cross-track shared leaf data remains separate rather than inventing ownership. Complete-page cropping excludes less than roughly one second at each end. Single-player fixed-route waits do not represent every action or multiplayer. physical MiB/min uses complete finished-page bytes; prior heartbeat growth is a regression slope of asynchronous flushed bytes and can differ."}
     output.mkdir(parents=True, exist_ok=True)
     (output / "steady-composition.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = ["# 稳定等待窗口的数据类型占比", "", f"会话：{root.name}；版本：{report['Version']}；MVID：{report['Mvid']}。", "",
              "排除初态与切关，只统计 FarIdle 内完整页。百分比为压缩前实际写入字节，包含同页特效历史及首次写入的共享块，不能当作压缩后磁盘占比或 CPU 占比。", "",
              "| 区域 | 有效秒数 | 玩家 | 生物 | 物品 | 场景与机关 | 特效及历史 | 声音 | 其他 |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    if summary.get('OfflineRepack'):lines.insert(3,'这是相同原生观察的离线存储重写，保留原会话的稳态时间窗；不代表新版本原生性能。')
     for result in results:
         lines.append("| " + result["Label"] + f" | {result['Seconds']:.1f} | " + " | ".join(f"{group['Percent']:.2f}%" for group in result["Groups"]) + " |")
     lines += ["", "场景与机关包含世界状态、箱子、绳索、互动机关、生成物与气球。生物合并了物品轨实现的青蛙、EarlyWorm 和曼德拉草；仅转移其实际条目及新共享实体块的编码字节，物品数组／顺序／移除字段仍在物品。其他包含时序／页元数据，以及窗口内新共享的外观、灯光和骨骼叶块。空轨道仍有字段与索引开销，占比不等于活跃对象数量或采集 CPU。JSON 同时保留原始轨道分类 TrackGroups。", "",
@@ -351,15 +385,15 @@ def analyze(root, output):
         physical = result["PhysicalComponents"]
         total = result["PhysicalBytes"]
         lines.append(f"| {result['Label']} | {total / 1048576:.3f} | {100 * physical.get('MainPages', 0) / total:.2f}% | {100 * physical.get('EffectHistory', 0) / total:.2f}% | {100 * physical.get('NewSharedBlocks', 0) / total:.2f}% |")
-    lines += ["", "## 稳态生物种类归因", "", "只计算真实写入的条目及首次写入的整实体共享块。引用条目不是重新采样；样本时钟变化也可能只是原生动画相位校正，不能当作骨骼读取次数。生物内占比的分母包含下面单列的轨道开销。共享外观／灯光／骨骼叶块继续留在其他组。"]
+    lines += ["", "## 稳态生物种类归因", "", "只计算真实写入的主条目、首次写入的整实体共享块及新静态目录内的原始实体片段。目录成员引用不重复摊入旧目录字节，也不是重新采样；样本时钟变化可能只是原生动画相位校正，不能当作骨骼读取次数。生物内占比分母包含单列轨道开销。共享外观／灯光／骨骼／顺序叶块留在其他组。"]
     for result in results:
         attribution = result["CreatureAttribution"]
         lines += ["", f"### {result['Label']}（{result['Seconds']:.2f} 秒）", "",
-                  "| 种类 | 轨道 | 原始 MiB | 全窗口占比 | 生物内占比 | 主条目 B | 新整块 B | 实体数 | 内联条目 | 引用条目 | 窗口内后续样本时钟变化 |",
-                  "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                  "| 种类 | 轨道 | 原始 MiB | 全窗口占比 | 生物内占比 | 主条目 B | 新整块 B | 新目录条目 B | 实体数 | 内联条目 | 引用条目 | 目录成员引用 | 窗口内后续样本时钟变化 |",
+                  "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for row in attribution["Families"]:
-            lines.append(f"| {row['Family']} | {row['Track']} | {row['RawBytes'] / 1048576:.3f} | {row['PercentOfWindow']:.2f}% | {row['PercentOfCreatureGroup']:.2f}% | {row['MainEntryRawBytes']} | {row['NewWholeEntityBlockRawBytes']} | {row['DistinctKnownKeys']} | {row['MainInlineEntityEntries']} | {row['MainSharedReferenceEntries']} | {row['SubsequentSampleTimeChangesInsideWindow']} |")
-        lines.append(f"| 轨道字段／排序／移除／数组外壳 | Creatures | {attribution['TrackOverheadRawBytes'] / 1048576:.3f} | {attribution['TrackOverheadPercentOfWindow']:.2f}% | {attribution['TrackOverheadPercentOfCreatureGroup']:.2f}% | {attribution['TrackOverheadRawBytes']} | 0 | — | — | — | — |")
+            lines.append(f"| {row['Family']} | {row['Track']} | {row['RawBytes'] / 1048576:.3f} | {row['PercentOfWindow']:.2f}% | {row['PercentOfCreatureGroup']:.2f}% | {row['MainEntryRawBytes']} | {row['NewWholeEntityBlockRawBytes']} | {row['NewStaticDirectoryEntryRawBytes']} | {row['DistinctKnownKeys']} | {row['MainInlineEntityEntries']} | {row['MainSharedReferenceEntries']} | {row['MainStaticDirectoryMemberships']} | {row['SubsequentSampleTimeChangesInsideWindow']} |")
+        lines.append(f"| 轨道字段／排序／移除／目录外壳 | Creatures | {attribution['TrackOverheadRawBytes'] / 1048576:.3f} | {attribution['TrackOverheadPercentOfWindow']:.2f}% | {attribution['TrackOverheadPercentOfCreatureGroup']:.2f}% | {attribution['TrackOverheadRawBytes']} | 0 | 0 | — | — | — | — | — |")
     (output / "steady-composition.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps({"Session": root.name, "Windows": [{"Label": result["Label"], "Seconds": result["Seconds"], "Groups": result["Groups"]} for result in results]}, ensure_ascii=False))
 

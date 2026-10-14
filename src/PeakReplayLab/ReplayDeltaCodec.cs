@@ -8,7 +8,7 @@ using Newtonsoft.Json.Linq;
 
 namespace PeakReplayLab;
 
-// Schemas 10–25 are storage codecs, not simulation. All work
+// Schemas 10–26 are storage codecs, not simulation. All work
 // happens on the save/read worker. Expanded frames remain immutable seek points.
 internal static partial class ReplayDeltaCodec
 {
@@ -382,6 +382,9 @@ internal static partial class ReplayDeltaCodec
                 record.Add("Interactions", n.Updates); record.Add("RemovedInteractions", n.Removed);
                 if (n.Order != null) record.Add("InteractionOrder", n.Order);
             }
+            if (schema >= 26)
+                foreach (string name in record.Keys.ToArray())
+                    if (name != "Events" && record[name] is Array empty && empty.Length == 0) record.Remove(name);
             world = frame.World; return record;
         }
     }
@@ -398,7 +401,8 @@ internal static partial class ReplayDeltaCodec
         { this.key = key; this.keyField = keyField; this.maximum = maximum; this.keyLength = keyLength; }
         public T[] Decode(JToken? updatesToken, JToken? removedToken, JToken? orderToken, bool full, int schema)
         {
-            JArray updates = ArrayToken(updatesToken, maximum), removed = ArrayToken(removedToken, maximum);
+            JArray updates = schema >= 26 && updatesToken == null ? new JArray() : ArrayToken(updatesToken, maximum);
+            JArray removed = schema >= 26 && removedToken == null ? new JArray() : ArrayToken(removedToken, maximum);
             if (full && removed.Count != 0) throw Error("A full baseline cannot remove entities.");
             if (full) { values.Clear(); previous = Array.Empty<T>(); }
             var touched = new HashSet<string>(StringComparer.Ordinal);
@@ -474,9 +478,11 @@ internal static partial class ReplayDeltaCodec
         private static readonly HashSet<string> interactionFields = new(StringComparer.Ordinal) { "Interactions", "RemovedInteractions", "InteractionOrder" };
         internal static bool AllowsField(string name, int schema) => recordFields.Contains(name) || presentationFields.Contains(name) ||
             spawnedFields.Contains(name) || attachmentFields.Contains(name) || schema >= 12 && creatureFields.Contains(name) || schema >= 15 && interactionFields.Contains(name) ||
+            schema >= 26 && name == "StaticCreatures" ||
             schema >= 22 && (name == nameof(ReplayFrame.SceneSampleTimeKnown) || name == nameof(ReplayFrame.SceneSampleTime));
         public ReplayFrame Decode(JObject token)
         {
+            if (token["StaticCreatures"] != null) throw Error("Static creature directories require a container resolver.");
             foreach (var field in token.Properties())
                 if (!AllowsField(field.Name, schema)) throw Error("Unknown frame field.");
             if (token["Type"]?.Type != JTokenType.String || (string?)token["Type"] != "frame") throw Error("Invalid frame type.");

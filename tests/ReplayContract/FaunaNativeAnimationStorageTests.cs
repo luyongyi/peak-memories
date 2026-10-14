@@ -40,7 +40,7 @@ internal static class FaunaNativeAnimationStorageTests
         });
         test("older schema item baselines keep exact omitted field and native limits", () =>
         {
-            Check(ReplayRules.CurrentSchema == 25 && !ReplayRules.SupportedSchema(9));
+            Check(ReplayRules.CurrentSchema == 26 && ReplayRules.SupportedSchema(25) && !ReplayRules.SupportedSchema(9));
             foreach (int schema in Enumerable.Range(10, 14))
             {
                 var plain = Frog(0).WithIdleAnimation(null); var token = JObject.FromObject(new ReplayDeltaCodec.Writer(schema).Encode(Frame(0, plain)));
@@ -58,7 +58,7 @@ internal static class FaunaNativeAnimationStorageTests
         });
         test("animation descriptor baselines and species gates reject malformed mixed clocks", () =>
         {
-            var encoded = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(0, Frog(0), Raven(0, false))));
+            var encoded = JObject.FromObject(new ReplayDeltaCodec.Writer(24).Encode(Frame(0, Frog(0), Raven(0, false))));
             foreach (string field in new[] { "Clip", "AnchorTime", "ClipTime", "Speed", "RopePhase" })
             {
                 foreach (string track in new[] { "Items", "Creatures" })
@@ -79,7 +79,7 @@ internal static class FaunaNativeAnimationStorageTests
             {
                 Reject(() => new ReplayDeltaCodec.Reader(schema).Decode((JObject)encoded.DeepClone()));
                 Reject(() => new ReplayDeltaCodec.StreamReader(schema).DecodeRecord(encoded.ToString(Formatting.None)));
-                var ravenOnly = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(0, null, Raven(0, false))));
+                var ravenOnly = JObject.FromObject(new ReplayDeltaCodec.Writer(24).Encode(Frame(0, null, Raven(0, false))));
                 Reject(() => new ReplayDeltaCodec.Reader(schema).Decode(ravenOnly));
                 Reject(() => new ReplayDeltaCodec.StreamReader(schema).DecodeRecord(ravenOnly.ToString(Formatting.None)));
             }

@@ -60,6 +60,7 @@ internal sealed class CreatureReplayCapture : IDisposable
         public readonly CreatureSamplingCadence Cadence = new();
         public CreatureIdleAnimationRuntime.Capture? IdleCapture;
         public RavenAnimationCapture? RavenCapture;
+        public NativeCreatureQuietCapture? QuietCapture;
         public Func<ObjectPose>? RavenRoot;
         public FrogTongueCaptureActivity? TongueActivity;
         public LineRenderer? Line;
@@ -101,6 +102,8 @@ internal sealed class CreatureReplayCapture : IDisposable
     private long spiderIdleReads, spiderIdleSkips, spiderActionReads, beetleAwakeReads, beetleSleepingSkips;
     private long ravenClockChecks, ravenGeometryReads, ravenGeometrySkips, ravenMouthFallbacks;
     private long ravenPhaseCorrections, ravenPhaseRootReads;
+    private long ravenScheduleSkips, ravenSemanticWakes;
+    private long venusQuietSkips, capybaraQuietSkips, quietGeometryReads, quietSafetyChecks;
     private long frogTongueIdleSkips, frogTongueActiveReads;
     private long lowRateSkips, lowRateReads, actionConfirmations;
     internal object Diagnostics => new
@@ -111,9 +114,11 @@ internal sealed class CreatureReplayCapture : IDisposable
         BeetleAwakeReads = beetleAwakeReads, BeetleSleepingSkips = beetleSleepingSkips,
         RavenClockChecks = ravenClockChecks, RavenGeometryReads = ravenGeometryReads, RavenGeometrySkips = ravenGeometrySkips, RavenMouthFallbacks = ravenMouthFallbacks,
         RavenPhaseCorrections = ravenPhaseCorrections, RavenPhaseRootReads = ravenPhaseRootReads,
+        RavenScheduleSkips = ravenScheduleSkips, RavenSemanticWakes = ravenSemanticWakes,
+        VenusQuietSkips = venusQuietSkips, CapybaraQuietSkips = capybaraQuietSkips, QuietGeometryReads = quietGeometryReads, QuietSafetyChecks = quietSafetyChecks,
         FrogTongueIdleSkips = frogTongueIdleSkips, FrogTongueActiveReads = frogTongueActiveReads,
         LowRateSkips = lowRateSkips, LowRateReads = lowRateReads, ActionConfirmations = actionConfirmations,
-        Measurement = "Active creature geometry and Raven Animator checks use a 5 Hz cadence; cached semantic state remains on the scene clock. Native events receive two bounded follow-up confirmations. Sleeping beetles, closed tongues and validated idle spiders retain their checkpoint; Raven perches/flights retain a native clip clock."
+        Measurement = "Active creature geometry uses a 5 Hz cadence; cached semantic edges remain on the scene clock. Unassigned audited Raven clips use staggered 0.75-1 second Animator/root safety audits; assignment and unknown inputs retain pose fallback. Native events receive bounded follow-up confirmations. Sleeping beetles, closed tongues, validated idle spiders, static Capybaras and audited already-disabled Venus idle poses retain their checkpoint."
     };
     private static readonly AccessTools.FieldRef<Condor, Condor.CondorState> condorState =
         AccessTools.FieldRefAccess<Condor, Condor.CondorState>("_state");
@@ -156,6 +161,8 @@ internal sealed class CreatureReplayCapture : IDisposable
             InitialUrgent = urgent, InitialAppearanceObserved = kind == "frog-tongue" };
         entry.Activity = new CreatureCaptureActivity(spider, kind == "beetle" ? source.GetComponent<Mob>() : null, followSceneClock: true);
         entry.ActionState = new CreatureActionState(source, kind);
+        if (kind == "venus-flytrap" || kind == "capybara")
+            entry.QuietCapture = new NativeCreatureQuietCapture(source, kind, resource);
         if (spider) entry.IdleCapture = new CreatureIdleAnimationRuntime.Capture(spider!, resource);
         if (kind == "voice-thief")
         {
@@ -194,8 +201,9 @@ internal sealed class CreatureReplayCapture : IDisposable
             entry.RetryAfter = entry.AppearanceRetryAfter = 0;
             entry.IdleRetryAfter = 0;
             entry.Activity.NotifyNativeEvent();
-            entry.Cadence.NotifyNativeEvent(Time.timeAsDouble, entry.TongueActivity != null ? .3 : 0);
+            entry.Cadence.NotifyNativeEvent(Time.timeAsDouble, entry.TongueActivity != null ? .3 : entry.Kind == "venus-flytrap" ? 1 : 0);
             entry.RavenCapture?.NotifyNativeEvent();
+            entry.QuietCapture?.NotifyNativeEvent(Time.timeAsDouble);
             entry.TongueActivity?.NotifyNativeEvent();
             // Arise converts a player zombie after Awake. Its canonical visual
             // must follow the final native variant, not the temporary birth flag.
@@ -257,13 +265,37 @@ internal sealed class CreatureReplayCapture : IDisposable
                 }
                 int nativeState = entry.Spider ? (int)entry.Spider!.spiderState : entry.Zombie ? (int)entry.Zombie!.currentState :
                     entry.Condor ? (int)condorState(entry.Condor!) : entry.ActionState.State;
+                bool quietBoundary = false;
+                if (entry.QuietCapture != null)
+                {
+                    long oldSafetyChecks = entry.QuietCapture.QuietSafetyChecks;
+                    bool due = entry.QuietCapture.Due(now, entry.Last,
+                        entry.AppearanceDirty || !entry.InitialAppearanceObserved || entry.Cadence.NeedsConfirmation);
+                    quietSafetyChecks += entry.QuietCapture.QuietSafetyChecks - oldSafetyChecks;
+                    if (!due)
+                    {
+                        if (entry.Kind == "venus-flytrap") venusQuietSkips++; else capybaraQuietSkips++;
+                        if (entry.Last != null) frames.Add(entry.Last);
+                        continue;
+                    }
+                    quietBoundary = entry.QuietCapture.LastWasBoundary;
+                    if (entry.QuietCapture.RequiresAppearanceRead) entry.AppearanceDirty = true;
+                }
+                if (entry.RavenCapture != null)
+                {
+                    long oldWakes = entry.RavenCapture.SemanticWakes;
+                    bool due = entry.RavenCapture.Due(now, active,
+                        entry.AppearanceDirty || !entry.InitialAppearanceObserved || entry.Cadence.NeedsConfirmation);
+                    ravenSemanticWakes += entry.RavenCapture.SemanticWakes - oldWakes;
+                    if (!due) { lowRateSkips++; ravenScheduleSkips++; if (entry.Last != null) frames.Add(entry.Last); continue; }
+                }
                 // The native frog can reveal its tongue after an attack delay.
                 // One visibility/pulling edge gets a fixed detail window; the
                 // continually changing 200 points cannot renew that window.
                 if (entry.TongueActivity?.LastWasBoundary == true && !entry.TongueActivity.Quiet)
                     entry.Cadence.ConfirmShortAction(now);
                 bool scheduled = entry.Cadence.Due(now, active, nativeState,
-                    entry.Activity.LastWasBoundary || entry.TongueActivity?.LastWasBoundary == true);
+                    entry.Activity.LastWasBoundary || entry.TongueActivity?.LastWasBoundary == true || quietBoundary);
                 if (entry.ActionState.Reliable && (entry.RavenCapture?.LowRateSafe ?? true) && !scheduled)
                 { lowRateSkips++; if (entry.Last != null) frames.Add(entry.Last); continue; }
                 lowRateReads++;
@@ -275,8 +307,9 @@ internal sealed class CreatureReplayCapture : IDisposable
                     long oldMouth = entry.RavenCapture.MouthFallbacks;
                     ravenReady = entry.RavenCapture.TryObserve(now, active, out ravenAnimation, out bool ravenChanged);
                     ravenClockChecks++; ravenMouthFallbacks += entry.RavenCapture.MouthFallbacks - oldMouth;
-                    if (ravenReady && !ravenChanged && entry.Last?.IdleAnimation == ravenAnimation &&
-                        !entry.AppearanceDirty && entry.InitialAppearanceObserved && !activeChanged)
+                    if (ravenReady && !ravenChanged && entry.Last != null && entry.Last.IdleAnimation == ravenAnimation &&
+                        !entry.AppearanceDirty && entry.InitialAppearanceObserved && !activeChanged &&
+                        RavenPhaseCheckpointCapture.SameRoot(entry.Last.Pose, entry.RavenRoot!()))
                     { ravenGeometrySkips++; frames.Add(entry.Last!); continue; }
                     if (ravenReady && ravenChanged && RavenPhaseCheckpointCapture.TryCorrect(entry.Last, ravenAnimation!, entry.RavenCapture.State,
                         entry.InitialAppearanceObserved, entry.AppearanceDirty, activeChanged, entry.Cadence.LastWasBoundary,
@@ -306,6 +339,7 @@ internal sealed class CreatureReplayCapture : IDisposable
                 // its native tongue line, without a duplicate creature mesh.
                 var pose = entry.Kind == "frog-tongue" ? FrogPose(entry) : VisualReplica.Capture(entry.Root, true, CreatureReplayRules.MaximumNodes);
                 geometryReads++; nodeVisits += pose.Nodes.Length;
+                if (entry.QuietCapture != null) quietGeometryReads++;
                 if (entry.RavenCapture != null) ravenGeometryReads++;
                 if (entry.TongueActivity != null && !entry.TongueActivity.Quiet) frogTongueActiveReads++;
                 if (entry.TongueActivity?.LastWasBoundary ?? entry.Activity.LastWasBoundary) boundaryReads++;
@@ -318,6 +352,7 @@ internal sealed class CreatureReplayCapture : IDisposable
                 var line = entry.Line ? SampleLine(entry, entry.Line!) : null;
                 if (line != null) { lineReads++; linePointVisits += line.Points.Length / 3; }
                 var visuals = entry.Last?.Visuals;
+                bool appearanceReadFailed = false;
                 if (entry.Kind != "frog-tongue" && now >= entry.AppearanceRetryAfter)
                     try
                     {
@@ -327,6 +362,7 @@ internal sealed class CreatureReplayCapture : IDisposable
                     }
                     catch (Exception e)
                     {
+                        appearanceReadFailed = true;
                         // Appearance metadata must not discard valid observed
                         // bone motion (the native zombie has 295 renderers).
                         Warn(entry.Kind + "-appearance", "生物外观采样暂不可用，继续记录骨骼动作：" + e.Message);
@@ -340,9 +376,10 @@ internal sealed class CreatureReplayCapture : IDisposable
                 // Sleeping/inactive entries never enter this read path.
                 entry.Last = new CreatureReplayFrame { Key = entry.Key, Kind = entry.Kind, Resource = entry.Resource,
                     SourcePath = entry.Path, State = state, Pose = pose, Line = line, Visuals = visuals,
-                    SampleTimeKnown = true, SampleTime = now, SampleDiscontinuity = entry.Cadence.LastWasBoundary,
+                    SampleTimeKnown = true, SampleTime = now, SampleDiscontinuity = entry.Cadence.LastWasBoundary || quietBoundary,
                     ClockMode = ravenReady ? CreatureReplayRules.IdleClock :
-                        entry.TongueActivity?.ClockMode ?? entry.Activity.ClockMode, IdleAnimation = idleAnimation };
+                        entry.QuietCapture?.ClockMode ?? entry.TongueActivity?.ClockMode ?? entry.Activity.ClockMode, IdleAnimation = idleAnimation };
+                entry.QuietCapture?.CompleteRead(entry.Last, !appearanceReadFailed && entry.InitialAppearanceObserved && !entry.AppearanceDirty);
                 frames.Add(entry.Last!);
             }
             catch (Exception e)

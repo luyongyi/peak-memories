@@ -8,6 +8,52 @@ internal static class ReplayDeltaTests
 {
     public static void Run(Action<string, Action> test)
     {
+        test("schema26 absent empty tracks hold deltas and reset full baselines in tree and streaming readers", () =>
+        {
+            var populated = Sample().Frames[0]; populated.T = .02;
+            var held = Copy(populated); held.T = .04;
+            var frames = new[] { new ReplayFrame(), populated, held, new ReplayFrame { T = .06 } };
+            var writer = new ReplayDeltaCodec.Writer(26); var tree = new ReplayDeltaCodec.Reader(26);
+            var stream = new ReplayDeltaCodec.StreamReader(26);
+            foreach (var expected in frames)
+            {
+                var token = Token(writer.Encode(expected));
+                if (expected.T == 0 || expected.T == .04)
+                    foreach (string field in new[] { "Actors", "Items", "Crates", "Creatures", "RemovedActors", "RemovedItems", "RemovedCreatures" })
+                        Check(token[field] == null);
+                Check(token["Events"] is JArray);
+                Check(Equal(expected, tree.Decode(token), new Dictionary<object, object>(new IdentityComparer())));
+                Check(Equal(expected, stream.DecodeRecord(token.ToString(Formatting.None)), new Dictionary<object, object>(new IdentityComparer())));
+            }
+            tree.Decode(Token(new ReplayDeltaCodec.Writer(26).Encode(populated)));
+            stream.DecodeRecord(Token(new ReplayDeltaCodec.Writer(26).Encode(populated)).ToString(Formatting.None));
+            var reset = Token(new ReplayDeltaCodec.Writer(26).Encode(new ReplayFrame { T = .08 }));
+            Check(tree.Decode(reset).Items.Length == 0 && stream.DecodeRecord(reset.ToString(Formatting.None))!.Actors.Length == 0);
+            foreach (string field in new[] { "Items", "RemovedItems" })
+            {
+                var invalid = (JObject)reset.DeepClone(); invalid[field] = JValue.CreateNull();
+                Bad(() => new ReplayDeltaCodec.Reader(26).Decode(invalid));
+                Bad(() => new ReplayDeltaCodec.StreamReader(26).DecodeRecord(invalid.ToString(Formatting.None)));
+            }
+            reset.Remove("Events");
+            Bad(() => new ReplayDeltaCodec.Reader(26).Decode(reset));
+            Bad(() => new ReplayDeltaCodec.StreamReader(26).DecodeRecord(reset.ToString(Formatting.None)));
+        });
+        test("schema25 still requires explicit empty update and removal tracks in baselines and deltas", () =>
+        {
+            var writer = new ReplayDeltaCodec.Writer(25);
+            var baseline = Token(writer.Encode(new ReplayFrame()));
+            var delta = Token(writer.Encode(new ReplayFrame { T = .02 }));
+            foreach (string track in new[] { "Actors", "Items", "Crates", "Ropes", "Effects", "Audio", "Spawned", "Balloons", "Creatures", "Interactions" })
+            foreach (string field in new[] { track, "Removed" + track })
+            foreach (bool full in new[] { true, false })
+            {
+                var record = (JObject)(full ? baseline : delta).DeepClone(); Check(record[field] is JArray); record.Remove(field);
+                var tree = new ReplayDeltaCodec.Reader(25); var stream = new ReplayDeltaCodec.StreamReader(25);
+                if (!full) { tree.Decode(baseline); stream.DecodeRecord(baseline.ToString(Formatting.None)); }
+                Bad(() => tree.Decode(record)); Bad(() => stream.DecodeRecord(record.ToString(Formatting.None)));
+            }
+        });
         test("current codec omits unchanged actor inventory appearance and item nodes", () =>
         {
             var clip = Sample(); var writer = new ReplayDeltaCodec.Writer();
@@ -96,11 +142,11 @@ internal static class ReplayDeltaTests
         test("current codec rejects duplicate updates and update removal conflicts", () =>
         {
             var tokens = Records(); ((JArray)tokens[1]["Items"]!).Add(tokens[1]["Items"]![0]!.DeepClone()); BadSecond(tokens);
-            tokens = Records(); ((JArray)tokens[1]["RemovedItems"]!).Add("item-one"); BadSecond(tokens);
+            tokens = Records(); tokens[1]["RemovedItems"] = new JArray("item-one"); BadSecond(tokens);
         });
         test("current codec rejects duplicate unknown removals and invalid ordering", () =>
         {
-            var tokens = Records(); ((JArray)tokens[1]["RemovedActors"]!).Add("missing"); BadSecond(tokens);
+            var tokens = Records(); tokens[1]["RemovedActors"] = new JArray("missing"); BadSecond(tokens);
             tokens = Records(); tokens[1]["ActorOrder"] = new JArray("missing"); BadSecond(tokens);
             tokens = Records(); tokens[1]["RemovedCrates"] = new JArray("crate-one", "crate-one"); BadSecond(tokens);
         });

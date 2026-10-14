@@ -362,7 +362,10 @@ public sealed class FullReplayWriter
             object record = codec.Encode(frame);
             // Publication/capture only queues immutable frames. All hashing,
             // compression and snapshot catalogue work stays on this worker.
-            if (Frames == 0) owner.shared.EncodeBaseline(record, native);
+            // Typed directory leaves serialize their source DTOs directly.
+            // They must use the same whole-run clock as the encoded patch;
+            // the bounded rebaser preserves held identities across pages.
+            if (Frames == 0) owner.shared.EncodeBaseline(record, frame);
             string line = JsonConvert.SerializeObject(record, ReplayFiles.Json);
             long size = Encoding.UTF8.GetByteCount(line) + 1L;
             // The line and each referenced block are separate bounded records.

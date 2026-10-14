@@ -4,6 +4,7 @@ using PeakReplayLab;
 
 internal static class ParticleCheckpointStorageTests
 {
+    private const int CheckpointSchema = 23;
     internal static void Run(Action<string, Action> test)
     {
         test("compressed particle checkpoint wire stays lossless in full DTO delta dictionary tree and stream paths", () =>
@@ -11,7 +12,7 @@ internal static class ParticleCheckpointStorageTests
             var checkpoint = Checkpoint(); checkpoint.Count = 256;
             checkpoint.Data = Enumerable.Range(0,256*132).Select(i=>(byte)(i%132==0?i/132:0)).ToArray();
             checkpoint.Digest = EffectParticleCheckpointRules.Digest(checkpoint);
-            var token = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(10,checkpoint)));
+            var token = JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(Frame(10,checkpoint)));
             Check(token["Effects"]![0]!["Particles"]![0]!["Checkpoint"]!["Data"]!.Value<string>()!.StartsWith("PS23D1:",StringComparison.Ordinal));
             Both(token,frame=>Check(frame.Effects[0].Particles![0].Checkpoint!.Data.SequenceEqual(checkpoint.Data)));
             var patch = typeof(ReplayDeltaCodec).GetMethod("Patch",System.Reflection.BindingFlags.Static|System.Reflection.BindingFlags.NonPublic)!
@@ -25,7 +26,7 @@ internal static class ParticleCheckpointStorageTests
         test("particle checkpoint tree and streaming storage retain bytes and reject corrupt payloads", () =>
         {
             var source = Frame(10, Checkpoint());
-            var token = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(source));
+            var token = JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(source));
             Both(token, value => Check(value.Effects[0].Particles![0].Checkpoint!.Data.SequenceEqual(new byte[] { 5, 6, 7, 8 })));
             foreach (string field in new[] { "Digest", "Count", "State", "Data", "Layout" })
             {
@@ -64,14 +65,14 @@ internal static class ParticleCheckpointStorageTests
                 var source = Frame(10, initial ? null : checkpoint);
                 if (initial) source.Effects[0].InitialState = new EffectReplayInitialState
                 { ObservedAt = 9.5, UntilTime = 9.6, Seeds = source.Effects[0].Seeds, Particles = Frame(10, checkpoint).Effects[0].Particles };
-                var token = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(source));
+                var token = JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(source));
                 RejectBoth(token);
-                string text = Json(new ReplayHeader { Scene = "Level_CheckpointTime" }) + "\n" + Json(token) + "\n{\"Type\":\"end\"}\n";
+                string text = Json(new ReplayHeader { Schema = CheckpointSchema, Scene = "Level_CheckpointTime" }) + "\n" + Json(token) + "\n{\"Type\":\"end\"}\n";
                 Reject(() => ReplayFiles.Read(new StringReader(text), allowSingleFrame: true));
                 Reject(() => ReplayFiles.ReadEffects(new StringReader(text), allowSingleFrame: true));
             }
             var past = Checkpoint(); past.ObservedAt = -.5;
-            Both(JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(0, past))), value => Check(value.Effects[0].Particles![0].Checkpoint!.ObservedAt == -.5));
+            Both(JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(Frame(0, past))), value => Check(value.Effects[0].Particles![0].Checkpoint!.ObservedAt == -.5));
         });
         test("particle checkpoint nullable field is omitted in legacy current and initial module JSON", () =>
         {
@@ -89,7 +90,7 @@ internal static class ParticleCheckpointStorageTests
         });
         test("particle checkpoint byte arrays have strict types complete fields and bounded allocation", () =>
         {
-            var valid = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(10, Checkpoint())));
+            var valid = JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(Frame(10, Checkpoint())));
             foreach (string field in new[] { "State", "Data" })
             foreach (JToken bad in new JToken[] { JValue.CreateNull(), new JArray(1,2,3,4), new JValue(123), new JValue(true), new JValue("") })
             { var token=(JObject)valid.DeepClone(); token["Effects"]![0]!["Particles"]![0]!["Checkpoint"]![field]=bad.DeepClone(); RejectBoth(token); }
@@ -97,11 +98,11 @@ internal static class ParticleCheckpointStorageTests
             { var token=(JObject)valid.DeepClone(); ((JObject)token["Effects"]![0]!["Particles"]![0]!["Checkpoint"]!).Remove(field); RejectBoth(token); }
             var oversized=(JObject)valid.DeepClone();oversized["Effects"]![0]!["Particles"]![0]!["Checkpoint"]!["Data"]=Convert.ToBase64String(new byte[EffectParticleCheckpointRules.MaximumDataBytes+1]);RejectBoth(oversized);
             var maximum=Checkpoint();maximum.Count=EffectParticleCheckpointRules.MaximumParticles;maximum.State=new byte[EffectParticleCheckpointRules.MaximumStateBytes];maximum.Data=new byte[EffectParticleCheckpointRules.MaximumDataBytes];maximum.Digest=EffectParticleCheckpointRules.Digest(maximum);
-            Both(JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(10,maximum))), value=>Check(value.Effects[0].Particles![0].Checkpoint!.Data.Length==EffectParticleCheckpointRules.MaximumDataBytes));
+            Both(JObject.FromObject(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(Frame(10,maximum))), value=>Check(value.Effects[0].Particles![0].Checkpoint!.Data.Length==EffectParticleCheckpointRules.MaximumDataBytes));
         });
         test("particle checkpoint full module replacement can clear a prior checkpoint without inheritance", () =>
         {
-            var writer=new ReplayDeltaCodec.Writer();var tree=new ReplayDeltaCodec.Reader();var stream=new ReplayDeltaCodec.StreamReader(23);
+            var writer=new ReplayDeltaCodec.Writer(CheckpointSchema);var tree=new ReplayDeltaCodec.Reader(CheckpointSchema);var stream=new ReplayDeltaCodec.StreamReader(CheckpointSchema);
             var first=writer.Encode(Frame(10,Checkpoint()));tree.Decode(JObject.FromObject(first));stream.DecodeRecord(Json(first));
             var next=writer.Encode(Frame(10.02,null));var a=tree.Decode(JObject.FromObject(next));var b=stream.DecodeRecord(Json(next))!;
             Check(a.Effects[0].Particles![0].Checkpoint==null&&b.Effects[0].Particles![0].Checkpoint==null);
@@ -117,9 +118,9 @@ internal static class ParticleCheckpointStorageTests
         });
         test("duplicate checkpoint JSON fields are rejected in ordinary and projected effects readers", () =>
         {
-            string record=Json(new ReplayDeltaCodec.Writer().Encode(Frame(10,Checkpoint())));string duplicated=record.Replace("\"State\":","\"State\":\"AQIDBA==\",\"State\":",StringComparison.Ordinal);Check(duplicated!=record);
-            Reject(()=>new ReplayDeltaCodec.StreamReader(23).DecodeRecord(duplicated));
-            string text=Json(new ReplayHeader{Scene="Level_CheckpointDuplicate"})+"\n"+duplicated+"\n{\"Type\":\"end\"}\n";
+            string record=Json(new ReplayDeltaCodec.Writer(CheckpointSchema).Encode(Frame(10,Checkpoint())));string duplicated=record.Replace("\"State\":","\"State\":\"AQIDBA==\",\"State\":",StringComparison.Ordinal);Check(duplicated!=record);
+            Reject(()=>new ReplayDeltaCodec.StreamReader(CheckpointSchema).DecodeRecord(duplicated));
+            string text=Json(new ReplayHeader{Schema=CheckpointSchema,Scene="Level_CheckpointDuplicate"})+"\n"+duplicated+"\n{\"Type\":\"end\"}\n";
             Reject(()=>ReplayFiles.Read(new StringReader(text),allowSingleFrame:true));Reject(()=>ReplayFiles.ReadEffects(new StringReader(text),allowSingleFrame:true));
         });
         test("particle checkpoint independent reverse pages and effect-only history retain exact state", () =>
@@ -162,8 +163,8 @@ internal static class ParticleCheckpointStorageTests
             Particles = new[] { new EffectParticleFrame(new NodePose { Path = "0:particle" }, Enumerable.Repeat(1f, 8).ToArray(), parameters) { Checkpoint = checkpoint } } } } };
     }
     private static void Both(JObject token, Action<ReplayFrame> check)
-    { var tree = new ReplayDeltaCodec.Reader().Decode(token); ReplayRules.ValidateCapture(tree, -1); check(tree); var stream = new ReplayDeltaCodec.StreamReader(23).DecodeRecord(Json(token))!; ReplayRules.ValidateCapture(stream, -1); check(stream); }
-    private static void RejectBoth(JObject token) { Reject(() => Both(token, _ => { })); Reject(() => { var frame = new ReplayDeltaCodec.StreamReader(23).DecodeRecord(Json(token))!; ReplayRules.ValidateCapture(frame, -1); }); }
+    { var tree = new ReplayDeltaCodec.Reader(CheckpointSchema).Decode(token); ReplayRules.ValidateCapture(tree, -1); check(tree); var stream = new ReplayDeltaCodec.StreamReader(CheckpointSchema).DecodeRecord(Json(token))!; ReplayRules.ValidateCapture(stream, -1); check(stream); }
+    private static void RejectBoth(JObject token) { Reject(() => Both(token, _ => { })); Reject(() => { var frame = new ReplayDeltaCodec.StreamReader(CheckpointSchema).DecodeRecord(Json(token))!; ReplayRules.ValidateCapture(frame, -1); }); }
     private static string Json(object value) => JsonConvert.SerializeObject(value, ReplayFiles.Json);
     private static void Check(bool value) { if (!value) throw new Exception("Particle checkpoint storage assertion failed."); }
     private static void Reject(Action action) { try { action(); } catch (Exception e) when (e is InvalidDataException or JsonException or ArgumentOutOfRangeException) { return; } throw new Exception("Invalid particle checkpoint accepted."); }

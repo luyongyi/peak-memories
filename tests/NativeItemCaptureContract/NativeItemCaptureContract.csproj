@@ -5,6 +5,7 @@
     <Compile Include="../../src/PeakReplayLab/ItemSamplingPolicy.cs" Link="ItemSamplingPolicy.cs" />
     <Compile Include="../../src/PeakReplayLab/ItemActivityPolicy.cs" Link="ItemActivityPolicy.cs" />
     <Compile Include="../../src/PeakReplayLab/ItemDistancePolicy.cs" Link="ItemDistancePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeItemQuietCapture.cs" Link="NativeItemQuietCapture.cs" />
     <Compile Include="../../src/PeakReplayLab/CaptureBootstrapWorkBudget.cs" Link="CaptureBootstrapWorkBudget.cs" />
   </ItemGroup>
 </Project>

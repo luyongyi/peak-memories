@@ -52,6 +52,36 @@ Test("sleeping alone does not authorize idling during water or a current native 
         var a=FrogCaptureActivity.Create(f.Item)!;Check(!a.TryEnter(0,new(),true,out _),"action "+action);
     }
 });
+Test("ordinary native Map hits are not water and use only the cached surface tag",()=>
+{
+    var f=Fixture();var terrain=f.Frog.SetWaterHit("Terrain")!;var a=FrogCaptureActivity.Create(f.Item)!;
+    int components=f.Item.gameObject.ComponentReads;var checkpoint=Enter(a);
+    for(int i=0;i<60;i++)Check(a.TryHold(i/60d,checkpoint,false,false));
+    Check(terrain.TagComparisons==61&&f.Item.gameObject.ComponentReads==components&&f.Item.transform.PositionReads==0);
+    Check(a.Rejections(FrogIdleRejection.Water)==0&&a.LastRejection==FrogIdleRejection.None);
+});
+Test("a cached actual Water hit rejects idle and releases a held dry-land frog",()=>
+{
+    var f=Fixture();var a=FrogCaptureActivity.Create(f.Item)!;var checkpoint=Enter(a);f.Frog.SetWaterHit("Water");
+    Check(!a.TryHold(.1,checkpoint,false,false)&&!a.Holding&&a.LastRejection==FrogIdleRejection.Water);
+    Check(a.Rejections(FrogIdleRejection.Water)==1&&f.Item.transform.PositionReads==0);
+    Check(!a.TryEnter(1,checkpoint,true,out _)&&a.Rejections(FrogIdleRejection.Water)==2);
+});
+Test("inconsistent native water flag and missing cached hit retain capture fallback",()=>
+{
+    var f=Fixture();f.Frog.SetWaterHit(null);var a=FrogCaptureActivity.Create(f.Item)!;
+    Check(!a.TryEnter(0,new(),true,out _)&&a.LastRejection==FrogIdleRejection.UnknownWater&&a.Rejections(FrogIdleRejection.UnknownWater)==1);
+    f.Frog.SetWaterHit("Water",nativeInWater:false);Enter(a);
+});
+Test("idle rejection counters distinguish unsettled roots event grace ownership and animation",()=>
+{
+    var f=Fixture();var a=FrogCaptureActivity.Create(f.Item)!;
+    Check(!a.TryEnter(0,new(),false,out _)&&a.Rejections(FrogIdleRejection.Unsettled)==1);
+    f.Item.itemState=ItemState.Held;Check(!a.TryEnter(0,new(),true,out _)&&a.Rejections(FrogIdleRejection.Ownership)==1);
+    f.Item.itemState=ItemState.Ground;FrogCaptureActivity.NotifyNativeEvent(f.Frog);
+    Check(!a.TryEnter(.1,new(),true,out _)&&a.Rejections(FrogIdleRejection.EventGrace)==1);
+    f.Frog.anim.Transition=true;Check(!a.TryEnter(.8,new(),true,out _)&&a.Rejections(FrogIdleRejection.CurrentAnimation)==1);
+});
 Test("completed native tongue retraction may finish slightly below zero",()=>
 {
     var f=Fixture();f.Frog.SetAction(tongue:-.02f);var a=FrogCaptureActivity.Create(f.Item)!;Enter(a);

@@ -180,8 +180,12 @@ foreach(var target in endpointTargets)
         NativeFrogCount=frogChecks.Length,FrogChecks=frogChecks,Passed=endpointPassed});
 }
 var fauna=FaunaRecordingVerification.RunIfAvailable(args[0],summary,path,info,output);
+var sharedNames=new[]{"Items","Crates","Ropes","Creatures","Interactions","Spawned","Visuals","Lights","PoseNodes","Order","StaticCreatureDirectory"};
+var sharedKinds=(info.SharedBlocks??Array.Empty<FullReplaySharedBlock>()).GroupBy(block=>block.Kind).OrderBy(group=>group.Key)
+    .Select(group=>new{Kind=group.Key,Type=sharedNames[group.Key],Blocks=group.Count(),RawBytes=group.Sum(block=>(long)block.RawBytes),CompressedBytes=group.Sum(block=>block.Length)}).ToArray();
 bool? nativeVisualPassed=summary["FaunaVisual"] is JObject visualSummary?(bool?)visualSummary["Passed"]:null;
 var report=new{Version=(string?)summary["InstalledVersion"],Mvid=(string?)summary["InstalledMvid"],SummarySuccess=summarySucceeded,Complete=info.Complete,ContainerVersion=info.Version,Schema=info.Header.Schema,
+    SharedBlockKinds=sharedKinds,OfflineRepack=summary["OfflineRepack"],
     Duration=info.Duration,FileBytes=new FileInfo(path).Length,TotalPages=info.Pages.Length,UniqueFrames=seen.Count,ExpectedFrames=info.FrameCount,FrameCountMatches=countOk,AllPagesReverseReadable=true,AllIndependentEffectHistoriesEqual=true,
     NativeActionChecks=checks,ActionChecksPassed=covered,ActionChecksFailed=failures,NativeCensusCoverage=nativeCoverage,NativeCensusMissing=missingNative,NativeCensusUnresolved=unresolvedNative,CoverageComplete=false,
     RecordedCreatureKinds=kinds.OrderBy(x=>x).ToArray(),RecordedEffectResources=births.Values.Select(x=>x.Resource).Distinct().OrderBy(x=>x).ToArray(),

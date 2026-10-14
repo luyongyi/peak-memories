@@ -2,6 +2,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/EarlyWormAnimationContract/EarlyWormAnimationContract.csproj" />
     <Project Path="tests/CreatureSamplingCadenceContract/CreatureSamplingCadenceContract.csproj" />
+    <Project Path="tests/NativeCreatureQuietContract/NativeCreatureQuietContract.csproj" />
     <Project Path="tests/FrogCaptureContract/FrogCaptureContract.csproj" />
     <Project Path="tests/FrogTongueSamplingContract/FrogTongueSamplingContract.csproj" />
     <Project Path="tests/CratePlaybackContract/CratePlaybackContract.csproj" />

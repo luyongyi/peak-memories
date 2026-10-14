@@ -97,7 +97,7 @@ internal static class SparseItemObservationTests
             var index = Index(true, Frame(0, a), Frame(.2, edge), Frame(.4, after));
             Check(index.TrySample(a.Key, .1, out var left, out var right, out float mix) && ReferenceEquals(left, right) && mix == 0);
             Check(index.TrySample(a.Key, .3, out left, out right, out mix) && ReferenceEquals(edge, left) && ReferenceEquals(after, right) && Math.Abs(mix - .5) < .00001);
-            var writer = new ReplayDeltaCodec.Writer(); var tree = new ReplayDeltaCodec.Reader(); var stream = new ReplayDeltaCodec.StreamReader(25);
+            var writer = new ReplayDeltaCodec.Writer(25); var tree = new ReplayDeltaCodec.Reader(25); var stream = new ReplayDeltaCodec.StreamReader(25);
             foreach (var packet in new[] { a, edge, after })
             {
                 string encoded = Json(writer.Encode(Frame(packet.SampleTime, packet)));
@@ -113,7 +113,7 @@ internal static class SparseItemObservationTests
                 SampleDiscontinuity = boundary, Pose = new ObjectPose { Position = new[] { position, 0f, 0f } } };
             var a = Creature(0, 0); var edge = Creature(.2, 2, true); var after = Creature(.4, 3);
             var builder = new CreatureObservationTimeline.Builder();
-            var writer = new ReplayDeltaCodec.Writer(); var stream = new ReplayDeltaCodec.StreamReader(25);
+            var writer = new ReplayDeltaCodec.Writer(25); var stream = new ReplayDeltaCodec.StreamReader(25);
             foreach (var packet in new[] { a, edge, after })
             {
                 var frame = new ReplayFrame { T = packet.SampleTime, Creatures = new[] { packet } }; builder.Observe(frame);
@@ -128,9 +128,9 @@ internal static class SparseItemObservationTests
         test("standalone event flags cannot bypass complete observation clocks in either decoder", () =>
         {
             var a = Item(0, 0); a.SampleTimeKnown = false;
-            var token = JObject.FromObject(new ReplayDeltaCodec.Writer().Encode(Frame(0, a)));
+            var token = JObject.FromObject(new ReplayDeltaCodec.Writer(25).Encode(Frame(0, a)));
             token["Items"]![0]!["SampleDiscontinuity"] = true;
-            Reject(() => new ReplayDeltaCodec.Reader().Decode(token)); Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(Json(token)));
+            Reject(() => new ReplayDeltaCodec.Reader(25).Decode(token)); Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(Json(token)));
         });
         test("dormant and native clip item checkpoints never request speculative future samples", () =>
         {
@@ -184,7 +184,7 @@ internal static class SparseItemObservationTests
         });
         test("schema twenty five item clocks roundtrip both readers and leave retained packets immutable", () =>
         {
-            var writer = new ReplayDeltaCodec.Writer(); var tree = new ReplayDeltaCodec.Reader(); var stream = new ReplayDeltaCodec.StreamReader(ReplayRules.CurrentSchema);
+            var writer = new ReplayDeltaCodec.Writer(25); var tree = new ReplayDeltaCodec.Reader(25); var stream = new ReplayDeltaCodec.StreamReader(25);
             var a = Item(0, 0); var b = Item(.2, 2); var rest = Item(.4, 3); rest.ClockMode = CreatureReplayRules.SleepingClock;
             var retained = new List<(ItemFrame Frame, string Json)>();
             foreach (var frame in new[] { Frame(0, a), Frame(.1, a), Frame(.2, b), Frame(.4, rest), Frame(60, rest) })

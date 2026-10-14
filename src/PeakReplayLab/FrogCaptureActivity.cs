@@ -5,6 +5,13 @@ using UnityEngine;
 
 namespace PeakReplayLab;
 
+internal enum FrogIdleRejection
+{
+    None, Unsettled, Hooks, Fields, EventGrace, Ownership, Cooked, Pulling, Thrown,
+    Water, UnknownWater, Tongue, Target, UnsupportedAnimation, HiddenVisibility,
+    CurrentAnimation, Interrupted, SleepChanged, RootMotion, ClockChanged,
+}
+
 // A Frog's inherited sleeping flag does not stop its overridden FixedUpdate or
 // existing coroutines. This gate combines native action fields, an audited clip
 // and the existing staggered item root safety poll; no hierarchy is searched here.
@@ -14,6 +21,7 @@ internal sealed class FrogCaptureActivity
     private static readonly AccessTools.FieldRef<FrogTongue, bool>? pulling = Resolve<bool>("_isPulling");
     private static readonly AccessTools.FieldRef<FrogTongue, bool>? thrown = Resolve<bool>("_thrown");
     private static readonly AccessTools.FieldRef<FrogTongue, bool>? inWater = Resolve<bool>("inWater");
+    private static readonly AccessTools.FieldRef<FrogTongue, RaycastHit>? waterHit = Resolve<RaycastHit>("waterCastHit");
     private static readonly AccessTools.FieldRef<FrogTongue, float>? tongueLength = Resolve<float>("_tongueLength");
     private static readonly AccessTools.FieldRef<FrogTongue, Character>? targetCharacter = Resolve<Character>("_targetCharacter");
     private static readonly AccessTools.FieldRef<FrogTongue, Rigidbody>? targetBody = Resolve<Rigidbody>("_targetRig");
@@ -29,11 +37,14 @@ internal sealed class FrogCaptureActivity
     private double eventUntil = double.NegativeInfinity;
     private double nextIdleProbe = double.NegativeInfinity;
     private bool hidden;
+    private readonly long[] rejections = new long[(int)FrogIdleRejection.ClockChanged + 1];
     internal bool Holding { get; private set; }
     internal long RootChecks { get; private set; }
     internal long IdleSkips { get; private set; }
     internal long IdleTransitions { get; private set; }
     internal long AnimationValidationReads => idle.ValidationReads;
+    internal FrogIdleRejection LastRejection { get; private set; }
+    internal long Rejections(FrogIdleRejection reason) => rejections[(int)reason];
 
     private FrogCaptureActivity(FrogTongue frog, Item item)
     {
@@ -59,12 +70,15 @@ internal sealed class FrogCaptureActivity
         if (frog.mobItem) ItemCapture.MarkDirty(frog.mobItem);
     }
     internal static bool IsDormant(FrogTongue frog) =>
-        activities.TryGetValue(frog, out var activity) && activity.Holding && activity.SemanticallyQuiet(Time.timeAsDouble);
+        activities.TryGetValue(frog, out var activity) && activity.Holding && activity.SemanticallyQuiet(Time.timeAsDouble, countRejection: false);
 
     internal bool TryEnter(double now, ItemFrame checkpoint, bool settled, out CreatureIdleAnimation? animation)
     {
         animation = null;
-        if (!settled || now < nextIdleProbe || !SemanticallyQuiet(now) || !idle.Supported) return false;
+        if (!settled) return Reject(FrogIdleRejection.Unsettled);
+        if (now < nextIdleProbe) return false;
+        if (!SemanticallyQuiet(now)) return false;
+        if (!idle.Supported) return Reject(FrogIdleRejection.UnsupportedAnimation);
         // ItemRestPolicy has just confirmed the sampled root and velocities.
         // Retry an unsupported current animation at a bounded rate, rather than
         // adding another set of Animator/Transform getters to every action tick.
@@ -72,41 +86,65 @@ internal sealed class FrogCaptureActivity
         bool sleeping = frog.sleeping;
         if (sleeping)
         {
-            if (!animator || animator!.enabled || !visuals || visuals!.gameObject.activeSelf) return false;
+            if (!animator || animator!.enabled || !visuals || visuals!.gameObject.activeSelf) return Reject(FrogIdleRejection.HiddenVisibility);
         }
-        else if (!idle.TryCapture(now, out animation)) return false;
+        else if (!idle.TryCapture(now, out animation)) return Reject(FrogIdleRejection.CurrentAnimation);
+        LastRejection = FrogIdleRejection.None;
         Holding = true; hidden = sleeping; IdleTransitions++;
         return true;
     }
     internal bool TryHold(double now, ItemFrame checkpoint, bool interrupted, bool safetyProbe)
     {
         if (!Holding) return false;
-        if (interrupted || !SemanticallyQuiet(now) || hidden != frog.sleeping)
-        { Holding = false; return false; }
+        if (interrupted) { Holding = false; return Reject(FrogIdleRejection.Interrupted); }
+        if (!SemanticallyQuiet(now)) { Holding = false; return false; }
+        if (hidden != frog.sleeping) { Holding = false; return Reject(FrogIdleRejection.SleepChanged); }
         if (safetyProbe)
         {
             RootChecks++;
-            if (!RootStable(checkpoint.Pose)) { Holding = false; return false; }
+            if (!RootStable(checkpoint.Pose)) { Holding = false; return Reject(FrogIdleRejection.RootMotion); }
             if (hidden)
             {
                 if (!animator || animator!.enabled || !visuals || visuals!.gameObject.activeSelf)
-                { Holding = false; return false; }
+                { Holding = false; return Reject(FrogIdleRejection.HiddenVisibility); }
             }
             else if (!idle.TryCapture(now, out var observed) || !SameClock(checkpoint.IdleAnimation, observed!, now))
-            { Holding = false; return false; }
+            { Holding = false; return Reject(FrogIdleRejection.ClockChanged); }
         }
+        LastRejection = FrogIdleRejection.None;
         IdleSkips++; return true;
     }
     internal void Release() => Holding = false;
 
-    private bool SemanticallyQuiet(double now) =>
-        EventHooksHealthy && ItemCapture.EventHooksHealthy && pulling != null && thrown != null && inWater != null &&
-        tongueLength != null && targetCharacter != null && targetBody != null &&
-        now >= eventUntil && item.itemState == ItemState.Ground &&
-        !(item.cooking && item.cooking!.timesCookedLocal > 0) &&
-        !pulling(frog) && !thrown(frog) && !inWater(frog) &&
-        Finite(tongueLength(frog)) && tongueLength(frog) <= .00001f && tongueLength(frog) >= -1 &&
-        ReferenceEquals(targetCharacter(frog), null) && ReferenceEquals(targetBody(frog), null);
+    private bool SemanticallyQuiet(double now, bool countRejection = true)
+    {
+        FrogIdleRejection reason;
+        if (!EventHooksHealthy || !ItemCapture.EventHooksHealthy) reason = FrogIdleRejection.Hooks;
+        else if (pulling == null || thrown == null || inWater == null || waterHit == null || tongueLength == null ||
+            targetCharacter == null || targetBody == null) reason = FrogIdleRejection.Fields;
+        else if (now < eventUntil) reason = FrogIdleRejection.EventGrace;
+        else if (item.itemState != ItemState.Ground) reason = FrogIdleRejection.Ownership;
+        else if (item.cooking && item.cooking!.timesCookedLocal > 0) reason = FrogIdleRejection.Cooked;
+        else if (pulling(frog)) reason = FrogIdleRejection.Pulling;
+        else if (thrown(frog)) reason = FrogIdleRejection.Thrown;
+        else
+        {
+            // Native inWater means its Map ray hit something, including ordinary
+            // terrain. Read the completed cached hit's actual tag; never repeat
+            // the raycast or search a hierarchy to decide whether floating is live.
+            var hit = inWater(frog) ? waterHit(frog).transform : null;
+            if (inWater(frog) && !hit) reason = FrogIdleRejection.UnknownWater;
+            else if (hit && hit!.gameObject.CompareTag("Water")) reason = FrogIdleRejection.Water;
+            else if (!Finite(tongueLength(frog)) || tongueLength(frog) > .00001f || tongueLength(frog) < -1) reason = FrogIdleRejection.Tongue;
+            else if (!ReferenceEquals(targetCharacter(frog), null) || !ReferenceEquals(targetBody(frog), null)) reason = FrogIdleRejection.Target;
+            else return true;
+        }
+        if (countRejection) Reject(reason);
+        return false;
+    }
+
+    private bool Reject(FrogIdleRejection reason)
+    { LastRejection = reason; rejections[(int)reason]++; return false; }
 
     private bool RootStable(ObjectPose pose)
     {

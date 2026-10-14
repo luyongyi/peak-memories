@@ -29,7 +29,7 @@ internal static class RavenPhaseCheckpointCapture
         };
         return true;
     }
-    private static bool SameRoot(ObjectPose a, ObjectPose b)
+    internal static bool SameRoot(ObjectPose a, ObjectPose b)
     {
         if (a.Active != b.Active) return false;
         if (ReferenceEquals(a, b)) return true;

@@ -1,4 +1,4 @@
-<Project>
-  <Import Project="../ReplayContract/ReplayContract.csproj" />
-  <ItemGroup><Compile Include="../../local/checks/full-remediation-0.8.25-20261013/far-seek-probe/Metadata.cs" Link="Metadata.cs" /></ItemGroup>
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../ReplayContract/ReplayContract.csproj" /></ItemGroup>
 </Project>

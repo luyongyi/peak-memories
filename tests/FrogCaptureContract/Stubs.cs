@@ -10,6 +10,8 @@ namespace UnityEngine
     public class GameObject : Object
     {
         public bool activeSelf = true, activeInHierarchy = true;
+        public string Tag = "Untagged"; public int TagComparisons;
+        public bool CompareTag(string value) { TagComparisons++; return Tag == value; }
         public readonly Transform transform;
         public int ComponentReads;
         private readonly Dictionary<Type, Component> components = new();
@@ -34,6 +36,7 @@ namespace UnityEngine
     }
     public struct Vector3 { public float x,y,z; public Vector3(float x,float y,float z) { this.x=x;this.y=y;this.z=z; } public float sqrMagnitude => x*x+y*y+z*z; }
     public struct Quaternion { public float x,y,z,w; public Quaternion(float x,float y,float z,float w) { this.x=x;this.y=y;this.z=z;this.w=w; } }
+    public struct RaycastHit { public Transform? transform; }
     public class Rigidbody : Component { public bool isKinematic; public Vector3 linearVelocity,angularVelocity; }
     public class Animator : Component
     {
@@ -97,11 +100,14 @@ public class FrogTongue : UnityEngine.Component
     public MobItem mobItem=null!;public UnityEngine.Animator anim=new();public UnityEngine.Transform visuals=new UnityEngine.GameObject().transform;
     public bool sleeping;
     private bool _isPulling,_thrown,inWater;
+    private UnityEngine.RaycastHit waterCastHit;
     private float _tongueLength;
     private Character? _targetCharacter;
     private UnityEngine.Rigidbody? _targetRig;
     public void SetAction(bool pulling=false,bool thrown=false,bool water=false,float tongue=0,Character? character=null,UnityEngine.Rigidbody? target=null)
-    {_isPulling=pulling;_thrown=thrown;inWater=water;_tongueLength=tongue;_targetCharacter=character;_targetRig=target;}
+    {_isPulling=pulling;_thrown=thrown;inWater=water;waterCastHit=water?new(){transform=new UnityEngine.GameObject{Tag="Water"}.transform}:default;_tongueLength=tongue;_targetCharacter=character;_targetRig=target;}
+    public UnityEngine.GameObject? SetWaterHit(string? tag,bool nativeInWater=true)
+    {var surface=tag==null?null:new UnityEngine.GameObject{Tag=tag};inWater=nativeInWater;waterCastHit=new(){transform=surface?.transform};return surface;}
     public bool FieldsInitialized => _isPulling||_thrown||inWater||_tongueLength!=0||_targetCharacter!=null||_targetRig!=null;
 }
 namespace PeakReplayLab

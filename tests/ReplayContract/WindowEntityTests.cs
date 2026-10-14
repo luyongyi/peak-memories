@@ -92,10 +92,11 @@ internal static class WindowEntityTests
             Check(patch["Ropes"]![0]!["Points"]!["Changes"]![0]![1]!.Value<int>() == 31);
             Check(JToken.DeepEquals(Token(frame), Token(reader.Decode(patch))));
         });
-        test("current format requires the complete balloon baseline even when empty", () =>
+        test("schema25 requires the complete balloon baseline even when empty", () =>
         {
-            var token = Token(new ReplayDeltaCodec.Writer(ReplayRules.CurrentSchema).Encode(new ReplayFrame()));
-            token.Remove("Balloons"); Reject(() => new ReplayDeltaCodec.Reader(ReplayRules.CurrentSchema).Decode(token));
+            var token = Token(new ReplayDeltaCodec.Writer(25).Encode(new ReplayFrame()));
+            token.Remove("Balloons"); Reject(() => new ReplayDeltaCodec.Reader(25).Decode(token));
+            Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(token.ToString(Formatting.None)));
         });
         test("current format malformed rope point deltas rejected", () =>
         {

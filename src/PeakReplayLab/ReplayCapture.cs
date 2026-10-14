@@ -292,6 +292,7 @@ internal sealed class RollingCapture : IDisposable
         items.RootReads, items.ChildReads, items.LightReads, items.AnimationProbes, items.SleepTransitions, items.WakeTransitions,
         items.FrogRootChecks, items.FrogIdleSkips, items.FrogIdleTransitions,
         items.SparseSkips, items.WormClockChecks, items.WormGeometrySkips, items.WormDescriptorChanges,
+        items.WormRootChecks, items.WormIdleSkips, items.FrogIdleRejections,
         items.ContinuousRootProbes, items.MetadataReads,
         Measurement = "Cumulative item work since this capture session started; cached-distance checks do not read Unity objects. Counters are work counts, not elapsed time.",
     };

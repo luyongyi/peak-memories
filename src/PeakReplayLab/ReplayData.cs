@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.25";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.31";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
@@ -145,7 +145,7 @@ public sealed class ReplayClip
 
 public static class ReplayRules
 {
-    public const int CurrentSchema = 25;
+    public const int CurrentSchema = 26;
     public static bool SupportedSchema(int schema) => schema >= 10 && schema <= CurrentSchema;
     // Scoped to one immutable save/read operation, never trusts a previous operation.
     internal sealed class ValidationMemo

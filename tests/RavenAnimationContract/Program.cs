@@ -255,6 +255,35 @@ internal static class Program
                 Check(!RavenPhaseCheckpointCapture.TryCorrect(frame,action!,0,true,false,false,false,()=>{roots++;return new(){Position=new float[]{1,0,0},Nodes=frame.Pose.Nodes};},out _));
                 Check(roots==1&&frame.SampleTime==10&&ReferenceEquals(frame.IdleAnimation,idle));
             });
+            Test("unassigned native loops use staggered watchdogs while assignment and native events wake immediately",()=>
+            {
+                var raven=Native();var capture=new RavenAnimationCapture(raven);var cadence=new CreatureSamplingCadence();
+                int reads=0;
+                for(int i=0;i<1800;i++)
+                {
+                    double now=i/30d;var state=raven.Animator.State;state.normalizedTime=12.25f+(float)(now/3);raven.Animator.State=state;
+                    if(!capture.Due(now,true,cadence.NeedsConfirmation)||!cadence.Due(now,true,0))continue;
+                    Check(capture.TryObserve(now,true,out _,out _));reads++;
+                }
+                Check(reads>=50&&reads<90&&capture.ScheduleSkips>1600,"normal loop retained five Hertz queries");
+                Check(!capture.Due(60.001,true));capture.NotifyNativeEvent();
+                Check(capture.Due(60.001,true)&&capture.TryObserve(60.001,true,out _,out bool changed)&&changed);
+                raven.IsAssigned=true;
+                Check(capture.Due(60.002,true)&&capture.TryObserve(60.002,true,out _,out _));
+                for(int i=1;i<=30;i++)Check(capture.Due(60.002+i/30d,true),"assigned local mouth was throttled by normal watchdog");
+                raven.IsAssigned=false;raven.IsLeaving=true;
+                Check(capture.Due(61.1,true)&&!capture.TryObserve(61.1,true,out _,out _));
+                Fly(raven,.01f);Check(capture.Due(61.133,true)&&capture.TryObserve(61.133,true,out var fly,out changed)&&changed&&fly!.Clip==CreatureIdleAnimationRules.RavenFlyAway);
+                Check(capture.Due(61.134,false),"hidden boundary was skipped");
+            });
+            Test("unsupported resources keep conservative scheduling and root safety checks distinguish movement",()=>
+            {
+                var raven=Native();raven.Animator.runtimeAnimatorController!.name="Unknown";var capture=new RavenAnimationCapture(raven);
+                for(int i=0;i<100;i++)Check(capture.Due(i/30d,true));
+                var root=new ObjectPose{Nodes=new object[44]};
+                Check(RavenPhaseCheckpointCapture.SameRoot(root,root));
+                Check(!RavenPhaseCheckpointCapture.SameRoot(root,new(){Position=new float[]{.1f,0,0},Nodes=root.Nodes}));
+            });
             Console.WriteLine($"{passed} raven animation contract checks passed."); return 0;
         }
         catch (Exception error) { Console.Error.WriteLine(error); return 1; }

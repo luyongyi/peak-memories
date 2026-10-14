@@ -50,6 +50,8 @@ jobs:
           - os: windows-latest
             project: CreatureIdleAnimationContract
           - os: windows-latest
+            project: NativeCreatureQuietContract
+          - os: windows-latest
             project: RavenAnimationContract
           - os: windows-latest
             project: EarlyWormAnimationContract

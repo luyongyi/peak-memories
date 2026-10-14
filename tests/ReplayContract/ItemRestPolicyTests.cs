@@ -180,8 +180,8 @@ internal static class ItemRestPolicyTests
             var writer = new ReplayDeltaCodec.Writer(); var reader = new ReplayDeltaCodec.Reader();
             reader.Decode(Token(writer.Encode(first)));
             var delta = Token(writer.Encode(suspended));
-            check(delta["RemovedItems"] is JArray removed && removed.Count == 0);
-            check(delta["Items"] is JArray updated && updated.Count == 0);
+            check(delta["RemovedItems"] == null);
+            check(delta["Items"] == null);
             var replayed = reader.Decode(delta);
             check(replayed.Items.Length == 1 && replayed.Items[0].Pose.Position[0] == 50);
             check(baseline.Pose.Position[0] == 50);

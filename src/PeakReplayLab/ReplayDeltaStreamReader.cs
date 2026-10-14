@@ -52,7 +52,7 @@ internal static partial class ReplayDeltaCodec
             "RemovedActors", "RemovedItems", "RemovedCrates", "RemovedRopes", "RemovedEffects", "RemovedAudio",
             "RemovedSpawned", "RemovedBalloons", "RemovedCreatures", "ActorOrder", "ItemOrder", "CrateOrder",
             "RopeOrder", "EffectOrder", "AudioOrder", "SpawnedOrder", "BalloonOrder", "CreatureOrder",
-            "Interactions", "RemovedInteractions", "InteractionOrder", "SceneSampleTimeKnown", "SceneSampleTime"
+            "Interactions", "RemovedInteractions", "InteractionOrder", "SceneSampleTimeKnown", "SceneSampleTime", "StaticCreatures"
         };
         private static readonly Dictionary<string, int> frameIndices = Indices(frameNames);
         private static readonly Dictionary<Type, Dictionary<string, int>> fieldIndices = FieldIndices();
@@ -132,13 +132,27 @@ internal static partial class ReplayDeltaCodec
                     { MaxDepth = 24, DateParseHandling = DateParseHandling.None, PropertyNameTable = names, ArrayPool = jsonBuffers });
                 Read(json); Require(json, JsonToken.StartObject);
                 if (!NextProperty(json, out string name) || name != "Value") throw Error("Invalid shared leaf wrapper.");
-                object value = ReadValue(json, type)!;
+                object value = type == typeof(string[]) ? ReadStrings(json, ReplayRules.MaxCreatures) : ReadValue(json, type)!;
                 if (NextProperty(json, out _) || json.Read()) throw Error("Shared leaf requires one complete array.");
+                if (value is string[] strings)
+                    foreach (string text in strings) ValidKey(text, 2048);
+                if (value is CreatureReplayFrame[] directory)
+                {
+                    CreatureReplayRules.ValidateCounts(directory);
+                    var keys = new HashSet<string>(StringComparer.Ordinal);
+                    foreach (var creature in directory)
+                    {
+                        CreatureReplayRules.Validate(creature);
+                        if (!FullReplaySharedWriter.StaticDirectoryEntry(creature) || !keys.Add(creature.Key))
+                            throw Error("Invalid static creature directory entry.");
+                    }
+                }
                 return value;
             }
             catch (OverflowException e) { throw new InvalidDataException("Shared leaf number outside range.", e); }
         }
-        private static bool SharedValueType(Type type) => type == typeof(NativeRendererFrame[]) || type == typeof(NativeLightFrame[]) || type == typeof(NodePose[]);
+        private bool SharedValueType(Type type) => type == typeof(NativeRendererFrame[]) || type == typeof(NativeLightFrame[]) || type == typeof(NodePose[]) ||
+            schema >= 26 && (type == typeof(string[]) || type == typeof(CreatureReplayFrame[]));
         private object ResolveSharedValue(ReplayTokenReader json, Type type)
         {
             if (schema < 17 || sharedSnapshots == null || !SharedValueType(type)) throw Error("Invalid shared leaf reference context.");
@@ -218,13 +232,15 @@ internal static partial class ReplayDeltaCodec
                     13 => ReadPatches(frameJson, typeof(CreatureReplayFrame), nameof(CreatureReplayFrame.Key), ReplayRules.MaxCreatures),
                     32 => ReadPatches(frameJson, typeof(InteractionReplayFrame), nameof(InteractionReplayFrame.Key), ReplayRules.MaxInteractions),
                     35 => Boolean(frameJson), 36 => Number(frameJson),
-                    _ => ReadStrings(frameJson, MaximumEntities(index)),
+                    37 => ReadSharedValue(frameJson, typeof(CreatureReplayFrame[])),
+                    _ => index >= 23 && index <= 31 || index == 34 ? ReadOrder(frameJson, MaximumEntities(index)) : ReadStrings(frameJson, MaximumEntities(index)),
                 };
             }
             if (frameJson.Read()) throw Error("Multiple JSON values in one record.");
             if (values[0] is not string type || type != "frame") throw Error("Invalid frame type.");
             if (values[1] is not double time || values[2] is not bool full) throw Error("Missing frame clock or baseline marker.");
             if (world == null && !full) throw Error("First frame requires a complete baseline.");
+            if (values[37] != null && !full) throw Error("Static creature directories require a full page baseline.");
             world = (WorldFrame)ApplyPatch(values[3] as ObjectPatch ?? throw Error("Missing world patch."), full ? null : world);
             var result = new ReplayFrame
             {
@@ -240,11 +256,19 @@ internal static partial class ReplayDeltaCodec
                 Audio = audio.Decode(values[10], values[19], values[28], full),
                 Spawned = spawned.Decode(values[11], values[20], values[29], full),
                 Balloons = balloons.Decode(values[12], values[21], values[30], full),
-                Creatures = schema >= 12 ? creatures.Decode(values[13], values[22], values[31], full) : Array.Empty<CreatureReplayFrame>(),
+                Creatures = schema >= 12 ? creatures.Decode(values[13], values[22], values[31], full, values[37] as CreatureReplayFrame[]) : Array.Empty<CreatureReplayFrame>(),
                 Interactions = schema >= 15 ? interactions.Decode(values[32], values[33], values[34], full) : Array.Empty<InteractionReplayFrame>(),
             };
             ReplayRules.ValidateVersion(result, schema, versionMemo);
             return result;
+        }
+
+        private string[] ReadOrder(ReplayTokenReader json, int? maximum)
+        {
+            if (json.TokenType != JsonToken.StartObject) return ReadStrings(json, maximum);
+            var order = (string[])ReadSharedValue(json, typeof(string[]));
+            if (maximum.HasValue && order.Length > maximum.Value) throw Error("Oversized entity order.");
+            return order;
         }
 
         private sealed class ObjectPatch
@@ -387,7 +411,8 @@ internal static partial class ReplayDeltaCodec
                     element == typeof(NativeShaderPropertyFrame) ? NativeVisualAppearanceRules.MaximumProperties :
                     element == typeof(NativeLightFrame) ? NativeLightRules.MaximumLights :
                     element == typeof(EffectParticleFrame) ? 64 :
-                    element == typeof(RopeReplayPoint) ? RopeReplayRules.MaximumPoints : throw Error("Unsupported array type.");
+                    element == typeof(RopeReplayPoint) ? RopeReplayRules.MaximumPoints :
+                    schema >= 26 && element == typeof(CreatureReplayFrame) ? ReplayRules.MaxCreatures : throw Error("Unsupported array type.");
                 if (element == typeof(float)) return ReadFloats(json, maximum);
                 return ReadArray(json, element, maximum);
             }
@@ -667,13 +692,20 @@ internal static partial class ReplayDeltaCodec
             private readonly int keyLength;
             internal StreamSet(Func<T, string> key, string keyField, int? maximum, int keyLength)
             { this.key = key; this.keyField = keyField; this.maximum = maximum; this.keyLength = keyLength; }
-            internal T[] Decode(object? updateValues, object? removedValues, object? orderValues, bool full)
+            internal T[] Decode(object? updateValues, object? removedValues, object? orderValues, bool full, T[]? directory = null)
             {
-                var updates = updateValues as ObjectPatch[] ?? throw Error("Missing entity updates.");
-                var removed = removedValues as string[] ?? throw Error("Missing entity removals.");
+                var updates = updateValues as ObjectPatch[] ?? (patchReader!.schema >= 26 && updateValues == null ? Array.Empty<ObjectPatch>() : throw Error("Missing entity updates."));
+                var removed = removedValues as string[] ?? (patchReader!.schema >= 26 && removedValues == null ? Array.Empty<string>() : throw Error("Missing entity removals."));
                 if (full && removed.Length != 0) throw Error("A full baseline cannot remove entities.");
                 if (full) { values.Clear(); previous = Array.Empty<T>(); }
                 touched.Clear(); removedKeys.Clear(); additions.Clear();
+                if (directory != null)
+                    foreach (T value in directory)
+                    {
+                        string id = ValidKey(key(value), keyLength);
+                        if (!touched.Add(id)) throw Error("Duplicate static creature directory identity.");
+                        values.Add(id, value); additions.Add(id);
+                    }
                 foreach (var patch in updates)
                 {
                     string id = ValidKey(patch.Key, keyLength);
@@ -711,7 +743,7 @@ internal static partial class ReplayDeltaCodec
                     }
                     return previous = result;
                 }
-                if (updates.Length == 0 && removed.Length == 0) return previous;
+                if (updates.Length == 0 && removed.Length == 0 && additions.Count == 0) return previous;
                 var expanded = new T[values.Count]; int index = 0;
                 foreach (var old in previous) if (values.TryGetValue(key(old), out var value)) expanded[index++] = value;
                 foreach (string id in additions) expanded[index++] = values[id];

@@ -40,6 +40,8 @@ dotnet build tools/NativeRouteValidation/driver/RouteAuditProbe.csproj -c Releas
 
 `-FaunaVisual` 显式开启青蛙／乌鸦／EarlyWorm 原生动画对照，输出 `fauna-visual.json`。每个状态只复制一次初始子节点及形变权重，后续用冻结基线重建当前姿态，不能通过复制当前原生骨骼取得假阳性。探针在同一原生帧比较位置、旋转、缩放、显隐、世界根及每项 blend-shape，并检查源对象权重、材质引用和着色器数值未被回放写入。等待阶段通过原生近身传送尝试乌鸦惊飞，随后以原生拾取和烹饪 API 验证 Worm 地面、手持、熟制三态；建议最后一关 `FinalWait` 至少 40 秒。未触发状态不算通过。此模式会增加测试工作和改变玩家位置，`PerformanceMeasurementValid=false`，不能将该次 CPU／体积数据用于稳态性能对比。性能路线应另跑且不带此开关。
 
+0.8.31 的乌鸦对照同时执行生产 `Due` 事件／错峰安全检查调度，不能用每次强制读取 Animator 隐藏检查之间的误差。JSON 分别记录生产时钟误差、明确的 10 ms 子帧预算及旧 2 ms 预算是否满足；精确相位的姿态 oracle 容差不变。2 ms 是生产检查时的纠偏阈值，不能当作整个安全检查区间的连续误差上界。整体通过还要求真实惊飞、手持和熟制状态验证成功。
+
 启动器支持以下路径参数：
 
 | 参数 | 含义 |
@@ -57,6 +59,8 @@ dotnet build tools/NativeRouteValidation/driver/RouteAuditProbe.csproj -c Releas
 启动器优先使用工具目录 `driver/PeakReplayLab.LocalRouteAudit.0827.dll` 中显式随包提供的伴随 DLL；无该文件时使用仓库 `artifacts` 产物。源码仓库不提交 DLL。
 
 启动时备份快速存档与 BepInEx 配置，测试中阻止存档/配置和成就写入，在独立离线录像目录执行路线。正常结束后恢复会话设置并核对存档、配置哈希。工具会实际替换游戏插件目录内同名测试伴随 DLL，所以应仅用于测试机上的受控会话。
+
+BepInEx 可能在保护插件启动前，因正式模组版本更新而重写其配置注释头。退出监视器只在所有非注释设置一致时，恢复原始模组配置文件并再次核对哈希，结果列在 `RestoredCommentOnlyHeaders`；设置内容不同时不会覆盖，仍报告失败。原始磁盘校验证据保留，不把运行中的哈希代替进程退出后的核对。
 
 `watch-route.ps1` 随启动器自动在隐藏窗口运行。连续 **120 秒没有新的心跳或阶段文件**，或总运行超过 1500 秒，会核对进程名、PID 和启动时间后终止本次 PEAK 进程，写出 `watchdog.json`，随后再次核对磁盘保护结果。进程内路线另有 1400 秒上限。强制退出必须算失败，即使已写出的部分录像仍可读；不能以 watchdog 结束代替正常封盘与恢复通过。
 
@@ -88,6 +92,23 @@ dotnet tools/NativeRouteValidation/verify/bin/Release/net8.0/RouteVerify.dll too
 只统计初态结束后的稳定类型占比，可运行 `python tools/NativeRouteValidation/steady-composition.py <session-directory> <output-directory>`。工具使用 FarIdle 心跳的原生时间减去录像 FirstCapture，只选完全位于窗口内的独立页，并统计原始 UTF-8 字段、配套 EffectHistory 及相邻页 SharedThrough 之差对应的首次写入共享块；旧共享初态不重复摊入。原始分类保留在 TrackGroups，青蛙、EarlyWorm 和曼德拉草的物品条目合并归入生物。每页原始字节及物理 offset 连续性均校验守恒；压缩前类型占比与可精确相加的物理 gzip 块占比分开报告。
 
 `analyze-route.py` 默认把报告写入会话 `analysis/`，也可追加输出目录参数。组成分析和离线检查器接受 `summary.json` 及输出目录两个参数；它们读取 summary 中的原始录像绝对路径，移动录像时须维护本地路径关联。
+
+### Schema 26 与同源存储对照
+
+分析器支持 v4 容器的 Schema 26：kind 9 是直接共享的顺序字符串数组，kind 10 是不包含嵌套引用的静态生物目录。`StaticCreatures` 引用归入生物轨道开销；目录中首次写入的完整 DTO 原始片段按家族归因，外壳／分隔符单列。每页目录成员引用只恢复身份和样本时钟，不重复摊入旧目录字节，也不能算新增几何采样。顺序叶保持单列共享开销。空更新／移除字段省略时按协议恢复空初态或延续前态。
+
+可在原生测试正常结束、PEAK 完全退出后运行同源重写：
+
+```powershell
+python tools/NativeRouteValidation/test-composition.py
+dotnet build tools/NativeRouteValidation/repack/ReplayRepack.csproj -c Release
+dotnet tools/NativeRouteValidation/repack/bin/Release/net8.0/ReplayRepack.dll <source-summary.json> <new-private-session-directory>
+python tools/NativeRouteValidation/steady-composition.py <new-private-session-directory> <new-analysis-directory>
+```
+
+工具保留原独立页边界与玩家关节 wire，逐页逆序核对所有 DTO、浮点位、joint SampleTime 及独立 effect history。原会话的版本、MVID 和采集心跳保持原值，并显式标记 `OfflineRepack`；离线重写不测新版本原生 CPU、内存或动作覆盖。
+
+正式存储对照须用相同 runner、.NET／JSON／GZip 管线，把冻结的旧 schema DLL 产生的 control 与新 DLL 的输出按同一稳态窗口比较。原 Unity/Mono 录像与 .NET 重写可因浮点文本和压缩实现不同而变化，不能把这层差异算作协议收益或回归。细节见 [repack/README.md](repack/README.md)。原始录像及对照输出仍只保存在被忽略的私人会话目录，不进入公开工具包。
 
 成功必须同时检查正常原生路线完成、存档/配置保护、完整封盘、accepted/written 帧数对账、全部页面读回、原生事件匹配、关卡归属及播放跳转状态。离线检查器要求 `summary.Success=true` 和 `info.Complete=true`，不会将一个健康的已写前缀判为成功完整录像。
 

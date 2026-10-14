@@ -79,11 +79,12 @@ internal static class PresentationTrackTests
         }));
         test("schema 5 cannot silently discard current format tracks", () => Temp(dir =>
         { var clip = Clip(); clip.Header.Schema = 5; Reject(() => ReplayArchive.Save(dir, clip)); }));
-        test("current format requires complete presentation arrays while schema 5 rejects them", () =>
+        test("schema25 requires complete presentation arrays while schema5 rejects them", () =>
         {
-            var token = Token(new ReplayDeltaCodec.Writer(ReplayRules.CurrentSchema).Encode(Clip().Frames[0]));
+            var token = Token(new ReplayDeltaCodec.Writer(25).Encode(Clip().Frames[0]));
             Reject(() => new ReplayDeltaCodec.Reader(5).Decode(token));
-            token.Remove("Ropes"); Reject(() => new ReplayDeltaCodec.Reader(ReplayRules.CurrentSchema).Decode(token));
+            token.Remove("Ropes"); Reject(() => new ReplayDeltaCodec.Reader(25).Decode(token));
+            Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(token.ToString(Formatting.None)));
         });
         test("current format validates duplicate presentation identities and seed ranges", () =>
         {

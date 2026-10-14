@@ -72,7 +72,7 @@ internal sealed class FaunaVisualAudit : IDisposable
         internal GameObject Source = null!, Root = null!;
         internal object Capture = null!, Visual = null!;
         internal Animator? Animator;
-        internal object? Runtime;
+        internal object? Runtime, LastClock;
         internal Node[] Nodes = Array.Empty<Node>();
         internal Renderer[] Renderers = Array.Empty<Renderer>();
         internal Renderer[] NativeRenderers = Array.Empty<Renderer>();
@@ -142,6 +142,10 @@ internal sealed class FaunaVisualAudit : IDisposable
     private SpiderStimulus? spiderStimulus;
     private bool spiderRequired;
     private double maximumRavenClockDrift;
+    // The watchdog can cross the 2ms re-anchor threshold before its next audit.
+    // Keep the exact-phase geometry oracle separate and impose an explicit
+    // 10ms sub-frame budget on the recorded production clock between audits.
+    private const double RavenClockDriftBudgetSeconds = .01;
 
     internal FaunaVisualAudit(string output)
     {
@@ -174,11 +178,14 @@ internal sealed class FaunaVisualAudit : IDisposable
         FrogIdleVerified = Verified("frog-idle-v1"), RavenIdleVerified = Verified("raven-idle-v1"), RavenFlightVerified = Verified("raven-fly-away-v1"),
         WormWalkVerified = Verified("early-worm-walk-v1"), WormInHandVerified = Verified("early-worm-in-hand-v1"), WormCookedVerified = Verified("early-worm-cooked-v1"),
         SpiderIdleRequired = spiderRequired, SpiderIdleVerified = Verified("spider-idle-v1"),
-        MaximumRavenClockDriftSeconds = maximumRavenClockDrift, RavenClockDriftWithinBound = maximumRavenClockDrift <= .00200001,
-        Passed = Verified("frog-idle-v1") && Verified("raven-idle-v1") && Verified("early-worm-walk-v1") && Verified("early-worm-in-hand-v1") &&
+        MaximumRavenClockDriftSeconds = maximumRavenClockDrift,
+        RavenClockDriftBudgetSeconds, RavenClockUsesProductionSchedule = true,
+        RavenClockWithinLegacyTwoMillisecondBudget = maximumRavenClockDrift <= .00200001,
+        RavenClockDriftWithinBound = maximumRavenClockDrift <= RavenClockDriftBudgetSeconds,
+        Passed = Verified("frog-idle-v1") && Verified("raven-idle-v1") && Verified("raven-fly-away-v1") && Verified("early-worm-walk-v1") && Verified("early-worm-in-hand-v1") &&
             Verified("early-worm-cooked-v1") && wormStimulus?.Completed == true && failed == 0 && sourceMutations == 0 &&
             baselineFailures == 0 && sourceBlendShapeMutations == 0 && sourceMaterialMutations == 0 && errors.Count == 0 && mappingFailures == 0 &&
-            (!spiderRequired || Verified("spider-idle-v1") && spiderStimulus?.ReturnedToBaseCamp == true && spiderStimulus.Error.Length == 0) && maximumRavenClockDrift <= .00200001,
+            (!spiderRequired || Verified("spider-idle-v1") && spiderStimulus?.ReturnedToBaseCamp == true && spiderStimulus.Error.Length == 0) && maximumRavenClockDrift <= RavenClockDriftBudgetSeconds,
         CoverageComplete = false,
     };
     private bool Verified(string clip) => stateCounts.TryGetValue(clip, out int count) && count >= 2 && !stateFailures.ContainsKey(clip) &&
@@ -346,8 +353,13 @@ internal sealed class FaunaVisualAudit : IDisposable
     {
         if (entry.Kind == "raven")
         {
+            // Exercise the production event/watchdog gate as well as its clip
+            // evaluator; repeatedly calling TryObserve would hide drift between
+            // the new staggered safety audits.
+            bool due = (bool)ravenCaptureType.GetMethod("Due", Instance)!.Invoke(entry.Capture, new object[] { nativeTime, true, false })!;
+            if (!due) return entry.LastClock;
             object?[] arguments = { nativeTime, true, null, false };
-            return (bool)ravenCaptureType.GetMethod("TryObserve", Instance)!.Invoke(entry.Capture, arguments)! ? arguments[2] : null;
+            return entry.LastClock = (bool)ravenCaptureType.GetMethod("TryObserve", Instance)!.Invoke(entry.Capture, arguments)! ? arguments[2] : null;
         }
         if (entry.Kind == "worm")
         {

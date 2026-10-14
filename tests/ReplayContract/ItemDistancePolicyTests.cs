@@ -141,8 +141,8 @@ internal static class ItemDistancePolicyTests
             var writer = new ReplayDeltaCodec.Writer(); var reader = new ReplayDeltaCodec.Reader();
             var initialRead = reader.Decode(Token(writer.Encode(first)));
             var distantDelta = Token(writer.Encode(distant));
-            check(distantDelta["RemovedItems"] is JArray removed && removed.Count == 0);
-            check(distantDelta["Items"] is JArray updates && updates.Count == 0);
+            check(distantDelta["RemovedItems"] == null);
+            check(distantDelta["Items"] == null);
             var distantRead = reader.Decode(distantDelta);
             var returnedRead = reader.Decode(Token(writer.Encode(returned)));
             check(initialRead.Items.Length == 1 && distantRead.Items.Length == 1 && returnedRead.Items.Length == 1);

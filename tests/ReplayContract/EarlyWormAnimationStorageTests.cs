@@ -20,7 +20,7 @@ internal static class EarlyWormAnimationStorageTests
         });
         test("schema twenty five worm asset and spin anchors preserve tree stream retained snapshots", () =>
         {
-            var writer = new ReplayDeltaCodec.Writer(); var tree = new ReplayDeltaCodec.Reader(); var stream = new ReplayDeltaCodec.StreamReader(ReplayRules.CurrentSchema);
+            var writer = new ReplayDeltaCodec.Writer(25); var tree = new ReplayDeltaCodec.Reader(25); var stream = new ReplayDeltaCodec.StreamReader(25);
             var retained = new List<(ItemFrame Item, string Json)>();
             int number = 0;
             foreach (string clip in new[] { CreatureIdleAnimationRules.EarlyWormWalk, CreatureIdleAnimationRules.EarlyWormInHand, CreatureIdleAnimationRules.EarlyWormCooked })
@@ -104,7 +104,7 @@ internal static class EarlyWormAnimationStorageTests
                 new ContinuousReplayOptions { SegmentSeconds = .4, SegmentFrameLimit = 9 });
             foreach (var frame in frames) Check(writer.TryEnqueue(frame));
             var result = writer.CompleteAsync().GetAwaiter().GetResult(); Check(result.Status == "completed");
-            var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == 25 && info.Version == 4 && info.Pages.Length >= 8);
+            var info = FullReplayArchive.ReadInfo(result.FilePath); Check(info.Header.Schema == ReplayRules.CurrentSchema && info.Version == 4 && info.Pages.Length >= 8);
             foreach (var page in info.Pages.AsEnumerable().Reverse())
             {
                 var decoded = FullReplayArchive.ReadPage(result.FilePath, info, page.Index);

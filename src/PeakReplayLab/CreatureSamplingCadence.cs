@@ -13,6 +13,7 @@ public sealed class CreatureSamplingCadence
     private double nextRegular = double.NegativeInfinity;
     private double detailUntil = double.NegativeInfinity;
     public bool LastWasBoundary { get; private set; }
+    internal bool NeedsConfirmation => pending || followUps > 0;
     public long RegularReads { get; private set; }
     public long BoundaryReads { get; private set; }
 
@@ -28,7 +29,7 @@ public sealed class CreatureSamplingCadence
 
     public void ConfirmShortAction(double now, double seconds = .3)
     {
-        if (!double.IsNaN(now) && !double.IsInfinity(now) && seconds > 0 && seconds <= .3)
+        if (!double.IsNaN(now) && !double.IsInfinity(now) && seconds > 0 && seconds <= 1)
             detailUntil = now + seconds;
     }
 

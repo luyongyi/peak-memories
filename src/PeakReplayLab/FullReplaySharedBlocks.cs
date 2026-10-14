@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -51,6 +52,8 @@ internal sealed class FullReplaySharedScratchPool : IDisposable
 // The bounded catalogue stores hashes/offsets, not the history's object trees.
 internal sealed class FullReplaySharedWriter
 {
+    private readonly int schema;
+    internal FullReplaySharedWriter(int schema = ReplayRules.CurrentSchema) { this.schema = schema; }
     private sealed class Cached { internal int Id; internal Cached(int id) { Id = id; } }
     private sealed class NodeTemplate
     {
@@ -89,10 +92,41 @@ internal sealed class FullReplaySharedWriter
         // Match SharedSnapshotReader: count each resolved block ID once for
         // this page, separately from the 8 MiB limit on any individual record.
         pageReferences.Clear(); pageRawBytes = 0;
+        // A direct typed directory owns complete immutable records, never
+        // references to entity/leaf blocks. Only large cold scene directories
+        // use it; active native clocks remain small independent page patches.
+        bool packedDirectory = schema >= 26 && EncodeStaticDirectory();
         Encode("Items", source.Items, 0); Encode("Crates", source.Crates, 1);
-        Encode("Ropes", source.Ropes, 2); Encode("Creatures", source.Creatures, 3);
+        Encode("Ropes", source.Ropes, 2);
+        if (!packedDirectory) Encode("Creatures", source.Creatures, 3);
         Encode("Interactions", source.Interactions, 4); Encode("Spawned", source.Spawned, 5);
+        foreach (string name in new[] { "ActorOrder", "ItemOrder", "CrateOrder", "RopeOrder", "EffectOrder", "AudioOrder", "SpawnedOrder", "BalloonOrder", "CreatureOrder", "InteractionOrder" })
+            if (schema >= 26 && record.TryGetValue(name, out var order) && order is string[] keys &&
+                keys.Length <= ReplayRules.MaxCreatures && (keys.Length >= 256 || keys.Sum(key => (long)key.Length) >= 8192) && TryLeaf(keys, 9, out int id))
+            { record[name] = Reference(id); CountReference(id); }
         return pageRawBytes;
+
+        bool EncodeStaticDirectory()
+        {
+            if (!record.TryGetValue("Creatures", out var field) || field is not object[] updates) return false;
+            if (updates.Length != source.Creatures.Length) throw new InvalidDataException("Shared snapshots require a full page baseline.");
+            int count = source.Creatures.Count(StaticDirectoryEntry);
+            // Below this point, individual references have lower replacement
+            // cost when one entity wakes or changes state.
+            if (count < 256) return false;
+            var cold = source.Creatures.Where(StaticDirectoryEntry).ToArray();
+            if (cold.Sum(CreatureReplayRules.Estimate) > ReplayRules.MaxLineCharacters) return false;
+            if (!TryLeaf(cold, 10, out int id)) return false;
+            record["StaticCreatures"] = Reference(id); CountReference(id);
+            var active = new List<object>();
+            var activeValues = new List<CreatureReplayFrame>();
+            for (int i = 0; i < updates.Length; i++)
+                if (!StaticDirectoryEntry(source.Creatures[i])) { active.Add(updates[i]); activeValues.Add(source.Creatures[i]); }
+            record["Creatures"] = active.ToArray();
+            Encode("Creatures", activeValues.ToArray(), 3);
+            if (active.Count == 0) record.Remove("Creatures");
+            return true;
+        }
 
         void Encode<T>(string track, T[] values, int kind) where T : class
         {
@@ -101,6 +135,15 @@ internal sealed class FullReplaySharedWriter
             if (updates.Length != values.Length) throw new InvalidDataException("Shared snapshots require a full page baseline.");
             for (int i = 0; i < updates.Length; i++)
             {
+                // Audited native animation checkpoints keep immutable geometry
+                // in direct leaves BEFORE any full entity JSON/hash work. A
+                // phase anchor can never enter deferred whole-rig promotion.
+                if (values[i] is CreatureReplayFrame { IdleAnimation: not null } || values[i] is ItemFrame { IdleAnimation: not null })
+                {
+                    var nativePatch = (Dictionary<string, object?>)updates[i];
+                    EncodeLeaves(nativePatch, kind + ":" + (string)nativePatch["Key"]!);
+                    continue;
+                }
                 int id;
                 if (identities.TryGetValue(values[i], out var cached)) id = cached.Id;
                 else
@@ -151,6 +194,9 @@ internal sealed class FullReplaySharedWriter
         }
     }
 
+    internal static bool StaticDirectoryEntry(CreatureReplayFrame frame) => CreatureReplayRules.CompactStaticTrap(frame) ||
+        frame.Kind == "spider" && frame.ClockMode == CreatureReplayRules.IdleClock && frame.IdleAnimation != null;
+
     private void CountReference(int id)
     {
         if (!pageReferences.Add(id)) return;
@@ -181,7 +227,8 @@ internal sealed class FullReplaySharedWriter
                 {
                     // These values are absolute against one immutable leaf, not
                     // cumulative changes against a preceding page.
-                    changes.Add("$Shared", template.Id); pose["Nodes"] = changes;
+                    if (changes["Changes"] is object[] empty && empty.Length == 0) pose["Nodes"] = Reference(template.Id);
+                    else { changes.Add("$Shared", template.Id); pose["Nodes"] = changes; }
                     CountReference(template.Id); shared = true;
                 }
                 else UseNewNodes(); // Topology changed: complete independent leaf.
@@ -212,7 +259,11 @@ internal sealed class FullReplaySharedWriter
         byte[] raw = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new Dictionary<string, object?> { ["Value"] = value }, ReplayFiles.Json));
         id = -1;
         if (raw.Length < 256) return false;
-        if (raw.Length > ReplayRules.MaxLineCharacters) throw new InvalidDataException("Shared leaf exceeds its raw byte limit.");
+        if (raw.Length > ReplayRules.MaxLineCharacters)
+        {
+            if (kind == 10) return false; // Grouping must never reduce valid page capacity.
+            throw new InvalidDataException("Shared leaf exceeds its raw byte limit.");
+        }
         string hash = FullReplayArchive.SharedHash(kind, raw);
         if (!hashes.TryGetValue(hash, out id))
         {
@@ -271,7 +322,7 @@ public static partial class FullReplayArchive
     public const int MaximumSharedBlocks = 32768;
     private static readonly Type[] SharedTypes = { typeof(ItemFrame), typeof(CrateFrame), typeof(RopeReplayFrame),
         typeof(CreatureReplayFrame), typeof(InteractionReplayFrame), typeof(SpawnedReplayFrame),
-        typeof(NativeRendererFrame[]), typeof(NativeLightFrame[]), typeof(NodePose[]) };
+        typeof(NativeRendererFrame[]), typeof(NativeLightFrame[]), typeof(NodePose[]), typeof(string[]), typeof(CreatureReplayFrame[]) };
 
     internal static string SharedHash(int kind, byte[] raw, int length = -1)
     {
@@ -371,6 +422,8 @@ public static partial class FullReplayArchive
             InteractionReplayFrame x => InteractionReplayRules.Estimate(x), SpawnedReplayFrame x => SpawnedReplayRules.Estimate(x),
             NativeRendererFrame[] x => NativeVisualAppearanceRules.Estimate(x), NativeLightFrame[] x => NativeLightRules.Estimate(x),
             NodePose[] x => FullReplaySharedWriter.EstimateNodes(x),
+            string[] x => 32 + x.Length * 8L + x.Sum(text => 24 + text.Length * 2L),
+            CreatureReplayFrame[] x => 32 + x.Length * 8L + x.Sum(CreatureReplayRules.Estimate),
             _ => throw Invalid("Unsupported shared snapshot entity."),
         };
         public void Dispose()

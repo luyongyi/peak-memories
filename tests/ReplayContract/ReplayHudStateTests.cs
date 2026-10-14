@@ -111,7 +111,7 @@ internal static class ReplayHudStateTests
             var writer = new ReplayDeltaCodec.Writer(); var reader = new ReplayDeltaCodec.Reader();
             var first = reader.Decode(Token(writer.Encode(Frame(0, State(1)))));
             var same = Token(writer.Encode(Frame(.25, State(1))));
-            Check(((JArray)same["Actors"]!).Count == 0, "Equal HUD snapshots should not force actor updates.");
+            Check(same["Actors"] == null, "Equal HUD snapshots should not force actor updates.");
             var unchanged = reader.Decode(same);
             Check(ReferenceEquals(first.Actors[0].HudState, unchanged.Actors[0].HudState));
             var source = State(1); source.Afflictions[2] = .731f;

@@ -1,8 +1,28 @@
 """Reduce protected native route heartbeats; standard library, no game access."""
-import json, math, statistics, sys
+import collections, json, math, statistics, struct, sys
 from pathlib import Path
 
 MIB = 1024 ** 2
+def recording_storage(summary):
+    """Index metadata only; never expand snapshots while measuring heartbeats."""
+    path=Path(summary.get('RecordingFile',''))
+    if not path.is_file():return None
+    with path.open('rb') as stream:
+        if stream.read(8)!=b'PEAKRUN1':return None
+        length=struct.unpack('<i',stream.read(4))[0]
+        assert 0<length<=8*MIB
+        header=json.loads(stream.read(length))
+        stream.seek(-16,2);footer=stream.read(16)
+        if footer[8:]!=b'PEAKEND1':return {'Schema':header['Schema'],'IndexComplete':False}
+        length=struct.unpack('<q',footer[:8])[0]
+        assert 0<length<=64*MIB
+        stream.seek(-16-length,2);index=json.loads(stream.read(length))
+    kinds=collections.defaultdict(collections.Counter)
+    for block in index.get('SharedBlocks',[]):
+        kinds[block['Kind']].update(Blocks=1,RawBytes=block['RawBytes'],CompressedBytes=block['Length'])
+    return {'Schema':header['Schema'],'ContainerVersion':index['Version'],'IndexComplete':True,
+            'SharedBlockKinds':[{'Kind':kind,**dict(counts)} for kind,counts in sorted(kinds.items())]}
+
 def get(row, path):
     for key in path.split('.'):
         if not isinstance(row, dict): return None
@@ -88,6 +108,7 @@ def main():
         counts[key]['Succeeded' if action.get('Success') else 'UnavailableOrFailed']+=1
     report={'Session':root.name,'Snapshots':len(rows),'NativeSuccess':summary.get('Success'),
             'InstalledVersion':summary.get('InstalledVersion'),'InstalledMvid':summary.get('InstalledMvid'),
+            'RecordingStorage':recording_storage(summary),'OfflineRepack':summary.get('OfflineRepack'),
             'CompletedBiomes':summary.get('CompletedBiomes'),'RecordingResult':summary.get('RecordingResult'),
             'ActionCounts':counts,'Phases':phases,'ParticleArrayReadsObserved':max((get(r,'Work.Effects.NativeParticleStateReads') or 0 for r in rows),default=0),
             'Notes':['No forced GC or runtime settings change.','Heartbeat reflection and native memory metrics run at1Hz; serialization is on a worker. Probe timing measures this diagnostic cost.',
@@ -98,6 +119,7 @@ def main():
     lines=['# 自动路线测量','',f"版本：{report['InstalledVersion']}；路线成功：{report['NativeSuccess']}；快照：{len(rows)}。",'',
            '| 关卡／阶段 | 窗口秒 | 录像增量 MiB | 增长 MiB/min | 滚动缓存末 MiB | 采样调用平均 ms | 管理堆末 MiB |',
            '|---|---:|---:|---:|---:|---:|---:|']
+    if report['OfflineRepack']:lines.insert(3,'录像经过离线同源存储重写；心跳、采集计时与工作计数仍来自原始原生会话，不能用作新版本采集性能。')
     for p in phases:
         if p['Phase'] not in ('BaselineIdle','EventObservation','FarIdle'): continue
         w=p['WriterMiB'] or {}; b=p['RollingMiB'] or {}; c=p['MainThread'].get('SampledCapture') or {}; m=p['MemoryMiB']['ManagedBytes'] or {}

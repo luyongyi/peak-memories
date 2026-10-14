@@ -8,6 +8,14 @@ from pathlib import Path
 DECODER=json.JSONDecoder()
 UNKNOWN_FAMILY='<unknown>'
 FAMILY_FIELDS={'Items':'Prefab','Creatures':'Kind'}
+SHARED_NAMES={0:'Items',1:'Crates',2:'Ropes',3:'Creatures',4:'Interactions',5:'Spawned',
+              6:'SharedVisuals',7:'SharedLights',8:'SharedPoseNodes',9:'SharedOrder',10:'SharedCreatureDirectory'}
+
+def direct_reference(value):
+    assert isinstance(value,dict) and set(value)=={'$Shared'}, 'Expected a direct shared leaf reference'
+    identifier=value['$Shared']
+    assert isinstance(identifier,int) and not isinstance(identifier,bool) and identifier>=0, 'Invalid shared leaf ID'
+    return identifier
 
 def skip_space(text,i):
     while i<len(text) and text[i].isspace():i+=1
@@ -49,7 +57,10 @@ def array_entry_spans(text,start):
 class EntityFamilyAttribution:
     """Attribute only stored main-page array entries; no reconstructed JSON."""
     def __init__(self):
-        self.shared={};self.identities={track:{} for track in FAMILY_FIELDS}
+        self.shared={};self.directories={};self.identities={track:{} for track in FAMILY_FIELDS}
+        self.directory_memberships=collections.Counter()
+        self.directory_bytes=collections.Counter();self.directory_entries=collections.Counter();self.directory_keys=collections.defaultdict(set)
+        self.directory_raw=0;self.directory_framing=0
         self.totals=collections.defaultdict(collections.Counter)
         self.bytes=collections.defaultdict(collections.Counter)
         self.counts=collections.defaultdict(collections.Counter)
@@ -60,10 +71,41 @@ class EntityFamilyAttribution:
         self.unknown_reasons=collections.defaultdict(collections.Counter)
 
     def shared_block(self,identifier,kind,payload):
+        if kind==10:
+            value=json.loads(payload)
+            assert isinstance(value,dict) and set(value)=={'Value'} and isinstance(value['Value'],list)
+            entries=[];keys=set()
+            for entry in value['Value']:
+                assert isinstance(entry,dict) and '$Shared' not in entry and isinstance(entry.get('Key'),str) and isinstance(entry.get('Kind'),str)
+                assert entry['Key'] not in keys, 'Duplicate static directory key'
+                keys.add(entry['Key'])
+                entries.append((entry['Key'],entry['Kind'],(entry.get('SampleTimeKnown',False),entry.get('SampleTime',0),entry.get('ClockMode',0))))
+            self.directories[identifier]=entries
+            text=payload.decode('utf-8');entry_bytes=0
+            for name,_,_,start,_,_ in object_field_spans(text):
+                if name!='Value':continue
+                for entry,begin,end in array_entry_spans(text,start):
+                    size=len(text[begin:end].encode('utf-8'));family=entry['Kind'];entry_bytes+=size
+                    self.directory_bytes[family]+=size;self.directory_entries[family]+=1;self.directory_keys[family].add(entry['Key'])
+            self.directory_raw+=len(payload);self.directory_framing+=len(payload)-entry_bytes
+            return
         track={0:'Items',3:'Creatures'}.get(kind)
         if track is None:return
         value=json.loads(payload)
         self.shared[identifier]=(track,value.get('Key'),value.get(FAMILY_FIELDS[track]))
+
+    def static_entries(self,record):
+        if 'StaticCreatures' not in record:return []
+        assert record.get('ObjectsFull') is True, 'Static directory outside a page baseline'
+        identifier=direct_reference(record['StaticCreatures'])
+        assert identifier in self.directories, 'Missing or wrong-kind static directory'
+        return self.directories[identifier]
+
+    def seed_directory(self,record):
+        for key,family,_ in self.static_entries(record):
+            self.identities['Creatures'][key]=family
+            self.entities[('Creatures',family)].add(key)
+            self.directory_memberships[family]+=1
 
     def family(self,track,value):
         if not isinstance(value,dict):return None,UNKNOWN_FAMILY,'non-object-entry'
@@ -87,6 +129,7 @@ class EntityFamilyAttribution:
     def record(self,text,record,biome,spans):
         if record.get('ObjectsFull'):
             for identities in self.identities.values():identities.clear()
+        self.seed_directory(record)
         for track in FAMILY_FIELDS:
             for key in record.get('Removed'+track,[]):self.identities[track].pop(key,None)
         for track,_,_,start,end,_ in spans:
@@ -131,6 +174,7 @@ class EntityFamilyAttribution:
             assert total+totals.get('ArrayFramingRawBytes',0)==totals.get('TrackArrayValueRawBytes',0)
             # Always expose an unknown count, even when no unknown row exists.
             report[track]={'FamilyField':FAMILY_FIELDS[track],**totals,'Families':families,
+                'StaticDirectoryMembershipReferencesByFamily':dict(self.directory_memberships) if track=='Creatures' else {},
                 'UnknownRawBytes':self.bytes[track][UNKNOWN_FAMILY],
                 'UnknownEntityUpdates':self.counts[track][UNKNOWN_FAMILY],
                 'UnknownRawPercent':100*self.bytes[track][UNKNOWN_FAMILY]/total if total else 0,
@@ -147,7 +191,15 @@ class EntityFamilyAttribution:
                 for family,size in values.most_common()]}
         return dict(report)
 
+    def directory_report(self):
+        assert sum(self.directory_bytes.values())+self.directory_framing==self.directory_raw
+        return {'RawBytes':self.directory_raw,'EntityPayloadRawBytes':sum(self.directory_bytes.values()),
+                'WrapperAndSeparatorsRawBytes':self.directory_framing,'ExactEntryAccounting':True,
+                'Families':[{'Family':family,'RawBytes':size,'DirectoryEntries':self.directory_entries[family],
+                             'DistinctKnownKeys':len(self.directory_keys[family])} for family,size in self.directory_bytes.most_common()]}
+
 def category(key):
+    if key=='StaticCreatures':return 'Creatures'
     for track in ('Actors','Items','Crates','Ropes','Effects','Audio','Creatures','Interactions','Spawned','Balloons'):
         singular=track[:-1] if track.endswith('s') else track
         if key==track or key=='Removed'+track or key==singular+'Order':return 'Players' if track=='Actors' else track
@@ -159,7 +211,7 @@ def main():
     biomes={int(x['Index']):str(x['Index'])+': '+x['Biome'] for x in summary.get('NativeCensus',[])}
     raw=collections.Counter();regions=collections.defaultdict(collections.Counter);physical=collections.Counter();updates=collections.defaultdict(collections.Counter)
     families=EntityFamilyAttribution()
-    per_page=[];shared_names={0:'Items',1:'Crates',2:'Ropes',3:'Creatures',4:'Interactions',5:'Spawned',6:'SharedVisuals',7:'SharedLights',8:'SharedPoseNodes'}
+    per_page=[];shared_kinds=collections.defaultdict(collections.Counter)
     with path.open('rb') as f:
         assert f.read(8)==b'PEAKRUN1';header_length=struct.unpack('<i',f.read(4))[0];header=json.loads(f.read(header_length));header_bytes=12+header_length
         f.seek(-16,2);footer=f.read(16);assert footer[8:]==b'PEAKEND1';index_length=struct.unpack('<q',footer[:8])[0]
@@ -167,8 +219,9 @@ def main():
         physical['HeaderIndexFooter']=header_bytes+index_length+16;raw['HeaderIndexFooter']=physical['HeaderIndexFooter']
         def member(entry):f.seek(entry['Offset']);return gzip.decompress(f.read(entry['Length']))
         for identifier,block in enumerate(index.get('SharedBlocks',[])):
-            module=shared_names[block['Kind']];physical['Shared'+module]+=block['Length'];raw[module]+=block['RawBytes']
-            if block['Kind'] in (0,3):families.shared_block(identifier,block['Kind'],member(block))
+            module=SHARED_NAMES[block['Kind']];physical['Shared'+module]+=block['Length'];raw[module]+=block['RawBytes']
+            shared_kinds[block['Kind']].update(Blocks=1,RawBytes=block['RawBytes'],CompressedBytes=block['Length'])
+            if block['Kind'] in (0,3,10):families.shared_block(identifier,block['Kind'],member(block))
         for page in index['Pages']:
             physical['MainPages']+=page['Length'];main_bytes=member(page);segment=0;page_counts=collections.Counter();page_raw=collections.Counter()
             for data in main_bytes.splitlines(keepends=True):
@@ -197,21 +250,25 @@ def main():
     pct=lambda values:[{'Module':k,'RawBytes':v,'RawPercent':100*v/sum(values.values()) if sum(values.values()) else 0} for k,v in values.most_common()]
     family_report=families.report()
     report={'ContainerVersion':index['Version'],'Schema':header['Schema'],'Duration':index['Duration'],'Frames':index['FrameCount'],
+            'OfflineRepack':summary.get('OfflineRepack'),
             'FileBytes':path.stat().st_size,'ExactPhysicalBytes':dict(physical),'ExactPhysicalAccounting':True,'TotalUncompressedBytes':total,
             'RawModuleSharesIncludingSharedSnapshotsAndHistory':pct(raw),
+            'SharedBlockKinds':[{'Kind':kind,'Module':SHARED_NAMES[kind],**dict(counts)} for kind,counts in sorted(shared_kinds.items())],
             'RawPageFieldSharesByBiome':{k:pct(v) for k,v in regions.items()},'EntityUpdateCountsByBiome':{k:dict(v) for k,v in updates.items()},'Pages':per_page,
             'MainPageEntityPayloadActualUtf8BytesByFamily':family_report,
+            'StaticDirectoryPayloadActualUtf8BytesByFamily':families.directory_report(),
             'MainPageEntityPayloadActualUtf8BytesByFamilyAndBiome':families.region_report(),
             'Limits':['Raw percentages use actual UTF-8 field slices and actual shared payload lengths, before gzip. They are not compressed-file module percentages.',
-                      'Cross-page shared renderer data, lights and pose-node leaves stay in SharedVisuals, SharedLights and SharedPoseNodes; they are not additional full module totals. Separate effect-history framing stays in EffectHistory.',
+                      'Cross-page renderer/light/node/order leaves stay in SharedVisuals, SharedLights, SharedPoseNodes and SharedOrder. Typed schema26 static directories stay in SharedCreatureDirectory; their main-page references are Creature metadata, not expanded entity bytes. Separate effect-history framing stays in EffectHistory.',
                       'Per-biome raw page fields exclude cross-page shared snapshots and history, because assigning those to one biome would invent ownership.',
                       'A whole page can cross a biome boundary. Its compressed byte size cannot be split additively by track or biome.',
                       'Family attribution counts original UTF-8 spans of Items/Creatures main-page array entries only. Array brackets, separators, shared-block payloads, removal/order arrays and root track property names are not assigned to families.',
-                      'Family identity comes from shared entity blocks or cumulative inline full/delta patches; unresolved identities remain <unknown>. A $Shared entry contributes only the bytes of its main-page reference.',
+                      'Family identity comes from shared entity blocks, typed static directory memberships or cumulative inline full/delta patches; unresolved identities remain <unknown>. A $Shared entry contributes only the bytes of its main-page reference. StaticDirectoryMembershipReferencesByFamily counts retained members separately and never invents main-entry bytes or observations.',
                       'EntryFieldRawBytes plus ObjectFramingRawBytes equals each family payload. PoseNodesValueRawBytes and NonNullLineValueRawBytes are nested subtotals already included in their containing entry fields, not additional bytes.']}
     (out/'recording-composition.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     lines=['# 录像字节组成','',f"完整文件 {path.stat().st_size:,} 字节；{index['Duration']:.2f} 秒；{index['FrameCount']:,} 帧。",'',
            '以下为压缩前实际编码字节占比，不能当作压缩后磁盘文件占比。','', '| 模块 | 原始字节 | 占比 |','|---|---:|---:|']
+    if summary.get('OfflineRepack'):lines.insert(3,'这是相同原生观察的离线存储重写；不代表新版本重新采集或原生性能测量。')
     for row in pct(raw):lines.append(f"| {row['Module']} | {row['RawBytes']:,} | {row['RawPercent']:.2f}% |")
     lines+=['','## 主页面实体条目按家族归因','',
             '以下仅统计 Items/Creatures 数组中每个实际条目的原始 UTF-8 片段。百分比分母是各轨道的主页面条目，不含共享块、数组外壳、移除/排序数组，也不是压缩后字节。', '',

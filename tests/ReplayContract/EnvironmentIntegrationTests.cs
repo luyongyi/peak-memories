@@ -64,13 +64,16 @@ internal static class EnvironmentIntegrationTests
                 ReplayRules.Validate(result, source.T - 1);
             }
         });
-        test("current baseline requires explicit environment and creature tracks", () =>
+        test("current baseline requires explicit environment and schema25 still requires creature tracks", () =>
         {
             var writer = new ReplayDeltaCodec.Writer();
             var token = Token(writer.Encode(Frame(0, null)));
             var missingWorld = (JObject)token.DeepClone(); ((JObject)missingWorld["World"]!).Remove("Environment");
             Reject(() => new ReplayDeltaCodec.Reader().Decode(missingWorld));
-            token.Remove("Creatures"); Reject(() => new ReplayDeltaCodec.Reader().Decode(token));
+            Reject(() => new ReplayDeltaCodec.StreamReader(ReplayRules.CurrentSchema).DecodeRecord(Json(missingWorld)));
+            token = Token(new ReplayDeltaCodec.Writer(25).Encode(Frame(0, null)));
+            token.Remove("Creatures"); Reject(() => new ReplayDeltaCodec.Reader(25).Decode(token));
+            Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(Json(token)));
         });
         test("historical codec rejects new recorded environment instead of silently dropping it", () =>
         {

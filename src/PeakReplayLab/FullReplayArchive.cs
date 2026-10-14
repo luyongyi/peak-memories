@@ -244,6 +244,7 @@ public static partial class FullReplayArchive
                     var block = info.SharedBlocks[sharedThrough++];
                     ValidateSharedBlock(block, expectedOffset, info.IndexOffset);
                     if (info.Version == 3 && block.Kind >= 6) throw Invalid("Legacy shared container has unsupported leaf blocks.");
+                    if (info.Header.Schema < 26 && block.Kind >= 9) throw Invalid("Legacy replay schema has unsupported directory blocks.");
                     expectedOffset += block.Length;
                 }
             }

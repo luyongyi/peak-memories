@@ -1,3 +1,4 @@
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using PeakReplayLab;
 
@@ -51,13 +52,14 @@ internal static class PresentationRegressionTests
             Check(ReferenceEquals(saved.Frames[0].Spawned[0], values[0]));
             buffer.Add(new ReplayFrame { T = 622 }); Check(buffer.Count == 1 && buffer.EstimatedBytes == RollingBuffer.Estimate(new ReplayFrame()));
         });
-        test("schema 6 cannot silently omit generated terrain and schema 7 requires it", () =>
+        test("schema25 cannot silently omit generated terrain and schema6 rejects it", () =>
         {
             var frame = new ReplayFrame { Spawned = new[] { Mushroom() } };
             Reject(() => new ReplayDeltaCodec.Writer(6).Encode(frame));
-            var token = JObject.FromObject(new ReplayDeltaCodec.Writer(ReplayRules.CurrentSchema).Encode(frame));
+            var token = JObject.FromObject(new ReplayDeltaCodec.Writer(25).Encode(frame));
             Reject(() => new ReplayDeltaCodec.Reader(6).Decode(token));
-            token.Remove("Spawned"); Reject(() => new ReplayDeltaCodec.Reader(ReplayRules.CurrentSchema).Decode(token));
+            token.Remove("Spawned"); Reject(() => new ReplayDeltaCodec.Reader(25).Decode(token));
+            Reject(() => new ReplayDeltaCodec.StreamReader(25).DecodeRecord(token.ToString(Formatting.None)));
         });
         test("generated terrain identity and full pose validated inside frame", () =>
         {

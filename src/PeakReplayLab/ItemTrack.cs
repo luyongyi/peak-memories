@@ -130,8 +130,25 @@ internal sealed class ItemCapture : IDisposable
     internal long WormClockChecks { get; private set; }
     internal long WormGeometrySkips { get; private set; }
     internal long WormDescriptorChanges { get; private set; }
+    internal long WormRootChecks { get; private set; }
+    internal long WormIdleSkips { get; private set; }
     internal long ContinuousRootProbes { get; private set; }
     internal long MetadataReads { get; private set; }
+    internal object FrogIdleRejections => new
+    {
+        Unsettled = FrogRejected(FrogIdleRejection.Unsettled), Hooks = FrogRejected(FrogIdleRejection.Hooks),
+        Fields = FrogRejected(FrogIdleRejection.Fields), EventGrace = FrogRejected(FrogIdleRejection.EventGrace),
+        Ownership = FrogRejected(FrogIdleRejection.Ownership), Cooked = FrogRejected(FrogIdleRejection.Cooked),
+        Pulling = FrogRejected(FrogIdleRejection.Pulling), Thrown = FrogRejected(FrogIdleRejection.Thrown),
+        Water = FrogRejected(FrogIdleRejection.Water), UnknownWater = FrogRejected(FrogIdleRejection.UnknownWater),
+        Tongue = FrogRejected(FrogIdleRejection.Tongue), Target = FrogRejected(FrogIdleRejection.Target),
+        UnsupportedAnimation = FrogRejected(FrogIdleRejection.UnsupportedAnimation), HiddenVisibility = FrogRejected(FrogIdleRejection.HiddenVisibility),
+        CurrentAnimation = FrogRejected(FrogIdleRejection.CurrentAnimation), Interrupted = FrogRejected(FrogIdleRejection.Interrupted),
+        SleepChanged = FrogRejected(FrogIdleRejection.SleepChanged), RootMotion = FrogRejected(FrogIdleRejection.RootMotion),
+        ClockChanged = FrogRejected(FrogIdleRejection.ClockChanged),
+    };
+    private long FrogRejected(FrogIdleRejection reason)
+    { long count = 0; foreach (var entry in tracked.Values) count += entry.Frog?.Rejections(reason) ?? 0; return count; }
     internal bool InitialBaselineReady => started && initialPending.Count == 0 && registrationRetry.Count == 0;
 
     public ItemCapture(Action<string>? warning = null, Func<float>? captureDistance = null)
@@ -361,6 +378,18 @@ internal sealed class ItemCapture : IDisposable
             WormGeometrySkips += entry.Worm.GeometrySkips - skips;
             WormDescriptorChanges += entry.Worm.DescriptorChanges - changes;
         }
+        if (wormReady && !wormChanged && !semanticBoundary && entry.Frame != null &&
+            entry.Frame.ClockMode == CreatureReplayRules.IdleClock && entry.Rest.Settled &&
+            item.itemState == ItemState.Ground && !entry.Attached && now >= identity.MotionUntil &&
+            ReferenceEquals(entry.Frame.IdleAnimation, wormAnimation))
+        {
+            // The audited clip and spin own the children. Only the physical
+            // root needs its five Hertz safety check; an unchanged result keeps
+            // the same immutable packet, sample time and page baseline.
+            WormRootChecks++;
+            if (NativeItemQuietCapture.RootStable(item, entry.Frame.Pose))
+            { WormIdleSkips++; entry.Sparse.Observed(now); return; }
+        }
         bool frogHeld = entry.Frog?.Holding == true || entry.Frame?.IdleAnimation != null;
         if (entry.Frog != null && entry.Frame != null)
         {
@@ -382,7 +411,7 @@ internal sealed class ItemCapture : IDisposable
         if (notified) entry.Rest.Wake();
         bool fixedPlacement = entry.Backpack != null && SameBackpackPlacement(item, entry.Backpack);
         bool attachmentChanged = entry.Backpack != null && !fixedPlacement;
-        bool animationMoving = entry.Animation?.Advancing == true || ProceduralChildrenMoving(entry);
+        bool animationMoving = !wormReady && entry.Animation?.Advancing == true || ProceduralChildrenMoving(entry);
         bool continuous = entry.Mob || entry.ExemptDistance || entry.Frog != null || animationMoving;
         bool hot = entry.Attached || continuous || now < identity.MotionUntil || !entry.Rest.Settled;
         bool appearanceDue = !wormReady && entry.Frame != null && NativeVisualAppearance.NeedsCaptureAtTime(entry.Transform,
@@ -448,7 +477,7 @@ internal sealed class ItemCapture : IDisposable
             sample.Pose = old.Pose;
         }
         else if (!(ReferenceEquals(sample, old) && old?.ClockMode == observedMode && observedMode != CreatureReplayRules.ActiveClock))
-            sample = sample.WithObservation(now, observedMode, semanticBoundary || wormChanged);
+            sample = sample.WithObservation(now, observedMode, semanticBoundary || wormChanged || NativeItemQuietCapture.ResumesHeld(old, observedMode));
         if (!ReferenceEquals(entry.Frame, sample)) { entry.Frame = sample; framesDirty = true; }
         initialPending.Remove(entry);
         entry.Attached = attached; entry.Backpack = backpack; entry.SeenRevision = identity.Revision;

@@ -46,6 +46,15 @@ Test("stalled frames do one read without a catch-up loop and invalid clocks cann
     Check(clock.Due(90_000, true, 0) && !clock.Due(90_000.01, true, 0));
     Check(clock.RegularReads == 2);
 });
+Test("native Venus release retains a finite one second tail and rejects longer leases", () =>
+{
+    var clock = new CreatureSamplingCadence(); Check(clock.Due(0, true, 0));
+    clock.NotifyNativeEvent(.01, 1);
+    for (int i = 1; i < 30; i++) Check(clock.Due(.01 + i / 30d, true, 0));
+    Check(clock.Due(1.02, true, 0) && !clock.Due(1.03, true, 0) && !clock.Due(1.05, true, 0));
+    var invalid = new CreatureSamplingCadence(); Check(invalid.Due(0, true, 0));
+    invalid.ConfirmShortAction(.01, 1.00001); Check(!invalid.Due(.02, true, 0));
+});
 Test("sparse scheduling allocates no managed data during 30 Hz polling", () =>
 {
     var clock = new CreatureSamplingCadence(); clock.Due(0, true, 0);

@@ -7,12 +7,13 @@ internal sealed class EarlyWormAnimationCapture
     internal static bool Enabled;
     internal static EarlyWormAnimationCapture? Last;
     internal long ClockChecks,GeometrySkips,DescriptorChanges;
+    internal bool Supported=true;
     private CreatureIdleAnimation? held;
     internal static bool TryCreate(Item item,out EarlyWormAnimationCapture? capture)
     {capture=Enabled&&item.itemID==184?Last=new():null;return capture!=null;}
     internal bool TryObserve(double now,bool force,out CreatureIdleAnimation? animation,out bool changed)
     {
-        ClockChecks++;changed=held==null||force;
+        ClockChecks++;if(!Supported){animation=null;changed=held!=null;held=null;return false;}changed=held==null||force;
         if(changed){held=new();DescriptorChanges++;}else GeometrySkips++;
         animation=held;return true;
     }
