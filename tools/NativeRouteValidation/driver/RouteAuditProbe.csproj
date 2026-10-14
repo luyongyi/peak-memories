@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>netstandard2.1</TargetFramework><Version>0.0.1</Version><AssemblyName>PeakReplayLab.LocalRouteAudit.0827</AssemblyName><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <GameAssembly Include="$(ManagedDir)*.dll" Exclude="$(ManagedDir)Mono*.dll;$(ManagedDir)netstandard.dll;$(ManagedDir)System*.dll;$(ManagedDir)mscorlib.dll" />
+    <Reference Include="@(GameAssembly)" Private="false" />
+    <Reference Include="$(PEAKGameRootDir)BepInEx/core/BepInEx.dll" Private="false" />
+    <Reference Include="$(PEAKGameRootDir)BepInEx/core/0Harmony.dll" Private="false" />
+    <Reference Include="$(PEAKGameRootDir)BepInEx/plugins/PeakReplayLab.dll" Private="false" />
+  </ItemGroup>
+</Project>

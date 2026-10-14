@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using HarmonyLib;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using Object = UnityEngine.Object;
@@ -42,71 +43,6 @@ internal static class WebWrapReplayCapture
     private static bool Quat(float[] a, Quaternion p) => a[0] == p.x && a[1] == p.y && a[2] == p.z && a[3] == p.w;
 }
 
-internal static class CreatureReplayResources
-{
-    private static GameObject? spider, zombie;
-    private static readonly Dictionary<string, GameObject> traps = new(StringComparer.Ordinal);
-    private sealed class Signature { public bool Valid; }
-    private static readonly ConditionalWeakTable<Transform, Signature> signatures = new();
-    internal static bool Ours(Transform source)
-    { for (var t = source; t; t = t.parent) if (t.name.StartsWith("PEAK Replay Creature", StringComparison.Ordinal)) return true; return false; }
-    internal static bool IsTrapName(string value)
-    {
-        return CreatureDirectoryRules.TrapEffect(value).Length != 0;
-    }
-    internal static Transform? Trap(Transform source)
-    {
-        for (var t = source; t; t = t.parent) if (IsTrapName(t.name) && VerifiedTrap(t)) return t;
-        return null;
-    }
-    private static bool VerifiedTrap(Transform root) => signatures.GetValue(root, source =>
-    {
-        var trigger = source.GetComponent<TriggerEvent>();
-        var spawn = source.GetComponent<SpawnGameObject>();
-        bool invokesSpawn = false, deactivatesRoot = false;
-        if (trigger && trigger.triggerEvent != null)
-            for (int i = 0; i < trigger.triggerEvent.GetPersistentEventCount(); i++)
-            {
-                var target = trigger.triggerEvent.GetPersistentTarget(i);
-                string method = trigger.triggerEvent.GetPersistentMethodName(i);
-                invokesSpawn |= spawn && target == spawn && method == "Go";
-                deactivatesRoot |= target == source.gameObject && method == "SetActive";
-            }
-        return new Signature { Valid = CreatureDirectoryRules.TrapSignature(source.name,
-            spawn && spawn.toSpawn ? spawn.toSpawn.name : "", trigger && trigger.onlyOnce,
-            invokesSpawn, deactivatesRoot, source.GetComponentInChildren<MeshRenderer>(true)) };
-    }).Valid;
-    internal static void Register(GameObject source, string kind)
-    {
-        if (!source || Ours(source.transform)) return;
-        if (kind == "spider" && (!spider || spider!.scene.IsValid() && !source.scene.IsValid())) spider = source;
-        else if (kind == "mushroom-zombie" && (!zombie || zombie!.scene.IsValid() && !source.scene.IsValid())) zombie = source;
-        else if (kind == "spore-trap" && source.scene.handle == SceneManager.GetActiveScene().handle && VerifiedTrap(source.transform))
-        {
-            string path = WorldTrack.Path(source.transform);
-            if (traps.ContainsKey(path) || traps.Count < CreatureReplayRules.MaximumStaticTraps) traps[path] = source;
-        }
-    }
-    internal static GameObject? Find(string kind, string sourcePath)
-    {
-        if (kind == "spider") return spider;
-        if (kind == "mushroom-zombie") return zombie;
-        return kind == "spore-trap" && traps.TryGetValue(sourcePath, out var source) && source ? source : null;
-    }
-    internal static void Refresh()
-    {
-        // Scene trap templates are keyed by their hierarchy, so replace the
-        // directory when a new scene is ready instead of retaining old wrappers.
-        traps.Clear();
-        foreach (var value in Resources.FindObjectsOfTypeAll<Spider>()) if (value) Register(value.gameObject, "spider");
-        foreach (var value in Resources.FindObjectsOfTypeAll<MushroomZombieSpawner>())
-            if (value && value.mushroomZombiePrefab) Register(value.mushroomZombiePrefab.gameObject, "mushroom-zombie");
-        foreach (var value in Resources.FindObjectsOfTypeAll<MushroomZombie>()) if (value) Register(value.gameObject, "mushroom-zombie");
-        foreach (var value in Resources.FindObjectsOfTypeAll<TriggerEvent>())
-        { var trap = value ? Trap(value.transform) : null; if (trap) Register(trap!.gameObject, "spore-trap"); }
-    }
-}
-
 // Birth observations update a bounded directory. Sampling reads completed native
 // animation/physics results; it never calls Scan, Spawn, RPC, Trigger or damage.
 internal sealed class CreatureReplayCapture : IDisposable
@@ -114,98 +50,299 @@ internal sealed class CreatureReplayCapture : IDisposable
     private sealed class Entry
     {
         public GameObject Source = null!;
+        public Transform Root = null!;
         public Spider? Spider;
         public MushroomZombie? Zombie;
-        public string Key = "", Kind = "", Path = "";
+        public Condor? Condor;
+        public ScoutmasterCaptureActivity? ScoutmasterActivity;
+        public CreatureCaptureActivity Activity = null!;
+        public CreatureActionState ActionState = null!;
+        public readonly CreatureSamplingCadence Cadence = new();
+        public CreatureIdleAnimationRuntime.Capture? IdleCapture;
+        public RavenAnimationCapture? RavenCapture;
+        public Func<ObjectPose>? RavenRoot;
+        public FrogTongueCaptureActivity? TongueActivity;
+        public LineRenderer? Line;
+        public string Key = "", Kind = "", Resource = "", Path = "";
         public CreatureReplayFrame? Last;
-        public double NextSample, RetryAfter;
-        public StaticCreatureCapturePolicy StaticSchedule = null!;
+        public double RetryAfter, AppearanceRetryAfter, IdleRetryAfter;
+        public bool AppearanceDirty = true, InitialUrgent, InitialAppearanceObserved;
         public Vector3[] LineScratch = Array.Empty<Vector3>();
     }
     private readonly CreatureReplayObserver observer;
+    private readonly SegmentCaptureClient? segments;
     private readonly Dictionary<int, Entry> entries = new();
+    private readonly StaticCaptureDirectory<Entry, CreatureReplayFrame> staticEntries = new();
+    private readonly Func<Entry, CreatureReplayFrame?, CreatureReplayFrame?> readStatic;
+    private readonly Action<Entry, Exception> staticError;
     private readonly List<int> removed = new();
     private readonly List<CreatureReplayFrame> frames = new();
     private readonly HashSet<string> warned = new(StringComparer.Ordinal);
     private readonly Action<string>? warning;
     private readonly int scene = SceneManager.GetActiveScene().handle;
     private CreatureReplayFrame[] previous = Array.Empty<CreatureReplayFrame>();
+    private CreatureReplayFrame[] previousStatic = Array.Empty<CreatureReplayFrame>(), previousDynamic = Array.Empty<CreatureReplayFrame>();
     private long serial;
-    private int dynamicCount, staticCount;
+    private int dynamicCount;
     private bool disposed;
+    internal bool InitialBaselineReady
+    {
+        get
+        {
+            if (!staticEntries.InitialBaselineReady) return false;
+            foreach (var entry in entries.Values)
+                if (entry.Source && (entry.Last == null || !entry.InitialAppearanceObserved) &&
+                    (entry.ScoutmasterActivity == null || entry.ScoutmasterActivity.Active)) return false;
+            return true;
+        }
+    }
+    private readonly Func<bool> beginInitialRead = CaptureBootstrapWorkBudget.TryBeginRead;
+    private long geometryReads, nodeVisits, lineReads, linePointVisits, managedStateChecks, boundaryReads;
+    private long spiderIdleReads, spiderIdleSkips, spiderActionReads, beetleAwakeReads, beetleSleepingSkips;
+    private long ravenClockChecks, ravenGeometryReads, ravenGeometrySkips, ravenMouthFallbacks;
+    private long ravenPhaseCorrections, ravenPhaseRootReads;
+    private long frogTongueIdleSkips, frogTongueActiveReads;
+    private long lowRateSkips, lowRateReads, actionConfirmations;
+    internal object Diagnostics => new
+    {
+        GeometryReads = geometryReads, NodeVisits = nodeVisits, LineReads = lineReads, LinePointVisits = linePointVisits,
+        ManagedStateChecks = managedStateChecks, BoundaryReads = boundaryReads,
+        SpiderIdleReads = spiderIdleReads, SpiderIdleSkips = spiderIdleSkips, SpiderActionReads = spiderActionReads,
+        BeetleAwakeReads = beetleAwakeReads, BeetleSleepingSkips = beetleSleepingSkips,
+        RavenClockChecks = ravenClockChecks, RavenGeometryReads = ravenGeometryReads, RavenGeometrySkips = ravenGeometrySkips, RavenMouthFallbacks = ravenMouthFallbacks,
+        RavenPhaseCorrections = ravenPhaseCorrections, RavenPhaseRootReads = ravenPhaseRootReads,
+        FrogTongueIdleSkips = frogTongueIdleSkips, FrogTongueActiveReads = frogTongueActiveReads,
+        LowRateSkips = lowRateSkips, LowRateReads = lowRateReads, ActionConfirmations = actionConfirmations,
+        Measurement = "Active creature geometry and Raven Animator checks use a 5 Hz cadence; cached semantic state remains on the scene clock. Native events receive two bounded follow-up confirmations. Sleeping beetles, closed tongues and validated idle spiders retain their checkpoint; Raven perches/flights retain a native clip clock."
+    };
+    private static readonly AccessTools.FieldRef<Condor, Condor.CondorState> condorState =
+        AccessTools.FieldRefAccess<Condor, Condor.CondorState>("_state");
     public CreatureReplayCapture(Action<string>? warning = null)
     {
         this.warning = warning;
-        observer = new CreatureReplayObserver(Register, source => { if (source) Remove(source.GetInstanceID()); }, Changed);
+        readStatic = SampleStatic;
+        staticError = (entry, error) => Warn(entry.Kind, "静态陷阱事件采样暂不可用，已安排有限重试：" + error.Message);
+        segments = CaptureSegmentScope.Active?.CreateClient(source => Register(source), Retire);
+        // Awake/Start/OnEnable also run in bulk when a new biome is activated.
+        // Only completed native actions, handled by Changed, bypass the budget.
+        try { observer = new CreatureReplayObserver(source => Register(source), Destroyed, Changed, AppearanceChanged); }
+        catch { segments?.Dispose(); throw; }
         try
         {
             CreatureReplayResources.Refresh();
-            foreach (var value in Object.FindObjectsByType<Spider>(FindObjectsInactive.Include, FindObjectsSortMode.None)) Register(value.gameObject);
-            foreach (var value in Object.FindObjectsByType<MushroomZombie>(FindObjectsInactive.Include, FindObjectsSortMode.None)) Register(value.gameObject);
-            foreach (var value in Object.FindObjectsByType<TriggerEvent>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-            { var trap = CreatureReplayResources.Trap(value.transform); if (trap) Register(trap!.gameObject); }
+            CreatureReplayResources.VisitScene(source => Register(source));
         }
         catch { Dispose(); throw; }
     }
-    private void Register(GameObject source)
+    private void Register(GameObject source, bool urgent = false)
     {
         if (disposed || ReplaySafety.Active || !source || source.scene.handle != scene || CreatureReplayResources.Ours(source.transform)) return;
+        if (!(segments?.Admit(source, urgent) ?? true)) return;
+        if (entries.TryGetValue(source.GetInstanceID(), out var existing)) { existing.InitialUrgent |= urgent; return; }
+        if (staticEntries.Contains(source.GetInstanceID())) { if (urgent) staticEntries.Changed(source.GetInstanceID(), true); return; }
+        string kind = CreatureReplayResources.Kind(source);
+        if (kind.Length == 0) return;
         var spider = source.GetComponent<Spider>(); var zombie = source.GetComponent<MushroomZombie>();
-        string kind = spider ? "spider" : zombie ? "mushroom-zombie" : CreatureReplayResources.Trap(source.transform) == source.transform ? "spore-trap" : "";
-        if (kind.Length == 0 || entries.ContainsKey(source.GetInstanceID())) return;
+        var condor = source.GetComponent<Condor>(); var frog = source.GetComponent<FrogTongue>();
         bool isStatic = kind == "spore-trap";
-        if (isStatic ? staticCount >= CreatureReplayRules.MaximumStaticTraps : dynamicCount >= CreatureReplayRules.MaximumDynamicEntities)
+        if (isStatic ? staticEntries.Count >= CreatureReplayRules.MaximumStaticTraps : dynamicCount >= CreatureReplayRules.MaximumDynamicEntities)
         { Warn(isStatic ? "static-limit" : "dynamic-limit", isStatic ? "静态孢子陷阱超过8192个，超出部分未录制。" : "动态生物超过256个，超出部分未录制。"); return; }
-        CreatureReplayResources.Register(source, kind);
-        entries[source.GetInstanceID()] = new Entry { Source = source, Spider = spider, Zombie = zombie, Kind = kind,
-            Key = "creature:" + source.GetInstanceID() + ":" + ++serial, Path = isStatic ? WorldTrack.Path(source.transform) : "",
-            LineScratch = spider ? new Vector3[CreatureReplayRules.MaximumLinePoints] : Array.Empty<Vector3>() };
-        entries[source.GetInstanceID()].StaticSchedule = new StaticCreatureCapturePolicy(source.GetInstanceID());
-        if (isStatic) staticCount++; else dynamicCount++;
+        string resource = CreatureReplayResources.Resource(source, kind, zombie);
+        CreatureReplayResources.Register(source, kind, resource);
+        var entry = new Entry { Source = source, Root = source.transform, Spider = spider, Zombie = zombie, Condor = condor, Kind = kind, Resource = resource,
+            Key = "creature:" + source.GetInstanceID() + ":" + ++serial, Path = CreatureReplayResources.SourcePath(source, kind),
+            Line = spider ? spider!.line : frog ? source.GetComponentInChildren<LineRenderer>(true) : null,
+            LineScratch = spider ? new Vector3[CreatureReplayRules.MaximumLinePoints] : frog ? new Vector3[CreatureReplayRules.MaximumFrogLinePoints] : Array.Empty<Vector3>(),
+            InitialUrgent = urgent, InitialAppearanceObserved = kind == "frog-tongue" };
+        entry.Activity = new CreatureCaptureActivity(spider, kind == "beetle" ? source.GetComponent<Mob>() : null, followSceneClock: true);
+        entry.ActionState = new CreatureActionState(source, kind);
+        if (spider) entry.IdleCapture = new CreatureIdleAnimationRuntime.Capture(spider!, resource);
+        if (kind == "voice-thief")
+        {
+            entry.RavenCapture = new RavenAnimationCapture(source.GetComponent<Peak.Island.VoiceThief>());
+            entry.RavenRoot = () => ReadRavenRoot(entry);
+        }
+        if (frog) entry.TongueActivity = new FrogTongueCaptureActivity(frog!, entry.Line);
+        if (kind == "scoutmaster")
+            entry.ScoutmasterActivity = new ScoutmasterCaptureActivity(source.GetComponent<Scoutmaster>());
+        // Publish only the fully initialized entry: a failed birth observation
+        // must not leave a Scoutmaster that bypasses the activity gate forever.
+        if (isStatic) staticEntries.Register(source.GetInstanceID(), entry, urgent);
+        else entries[source.GetInstanceID()] = entry;
+        if (!isStatic) dynamicCount++;
     }
-    private void Remove(int id)
+    private void Retire(int id)
     {
-        if (!entries.TryGetValue(id, out var entry)) return;
-        entries.Remove(id); if (entry.Kind == "spore-trap") staticCount--; else dynamicCount--;
+        bool removedStatic = staticEntries.Remove(id);
+        if (entries.TryGetValue(id, out var entry))
+        {
+            entry.ScoutmasterActivity?.Dispose();
+            VisualReplica.ReleaseCapture(entry.Root);
+            entries.Remove(id); dynamicCount--;
+        }
+        else if (!removedStatic) return;
+        previous = previousStatic = previousDynamic = Array.Empty<CreatureReplayFrame>();
     }
+    private void Destroyed(GameObject source)
+    { if (source) { int id = source.GetInstanceID(); segments?.Forget(id); Retire(id); } }
     private void Changed(GameObject source)
     {
-        Register(source);
+        Register(source, true);
+        if (source && staticEntries.Changed(source.GetInstanceID(), true)) return;
         if (source && entries.TryGetValue(source.GetInstanceID(), out var entry))
-        { entry.StaticSchedule.Changed(); entry.RetryAfter = 0; }
+        {
+            entry.RetryAfter = entry.AppearanceRetryAfter = 0;
+            entry.IdleRetryAfter = 0;
+            entry.Activity.NotifyNativeEvent();
+            entry.Cadence.NotifyNativeEvent(Time.timeAsDouble, entry.TongueActivity != null ? .3 : 0);
+            entry.RavenCapture?.NotifyNativeEvent();
+            entry.TongueActivity?.NotifyNativeEvent();
+            // Arise converts a player zombie after Awake. Its canonical visual
+            // must follow the final native variant, not the temporary birth flag.
+            if (entry.Zombie)
+            {
+                string resource = CreatureReplayResources.Resource(source, entry.Kind, entry.Zombie);
+                if (entry.Resource != resource) { entry.Resource = resource; entry.AppearanceDirty = true; }
+            }
+        }
+    }
+    private void AppearanceChanged(GameObject source)
+    {
+        Changed(source);
+        if (source && entries.TryGetValue(source.GetInstanceID(), out var entry)) entry.AppearanceDirty = true;
     }
     public CreatureReplayFrame[] Capture(double now)
     {
         if (disposed) throw new ObjectDisposedException(nameof(CreatureReplayCapture));
+        var staticFrames = staticEntries.Capture(now, readStatic, staticError, beginInitialRead);
         frames.Clear(); removed.Clear();
         foreach (var pair in entries)
         {
             var entry = pair.Value;
             if (!entry.Source) { removed.Add(pair.Key); continue; }
-            if (now < entry.RetryAfter) { if (entry.Last != null) frames.Add(entry.Last); continue; }
             try
             {
-                if (entry.Kind == "spore-trap")
+                // Native Scoutmaster stays enabled at its spawn/parking location.
+                // Do not walk that idle rig or write it into every page. Check
+                // before retry suppression so retirement cannot leak stale
+                // frames. A later appearance starts with a complete snapshot.
+                if (entry.ScoutmasterActivity != null && !entry.ScoutmasterActivity.Active)
                 {
-                    SampleStatic(entry, now); frames.Add(entry.Last!); continue;
+                    entry.Last = null;
+                    entry.RetryAfter = entry.AppearanceRetryAfter = 0;
+                    entry.AppearanceDirty = true;
+                    entry.Activity.NotifyNativeEvent();
+                    continue;
                 }
-                // Dormant future-biome creatures retain their initial checkpoint.
-                // Activity is cheap to observe every tick; activation/deactivation
-                // bypasses the 30 Hz animation clock immediately.
+                if (now < entry.RetryAfter) { if (entry.Last != null) frames.Add(entry.Last); continue; }
+                if (CaptureBootstrapWorkBudget.InitialOnly && entry.Last != null && !entry.InitialUrgent &&
+                    (entry.InitialAppearanceObserved || now < entry.AppearanceRetryAfter))
+                { frames.Add(entry.Last); continue; }
+                if ((entry.Last == null || !entry.InitialAppearanceObserved) && !entry.InitialUrgent && !CaptureBootstrapWorkBudget.TryBeginRead()) continue;
+                entry.InitialUrgent = false;
+                if (!entry.InitialAppearanceObserved && now >= entry.AppearanceRetryAfter) entry.Activity.NotifyNativeEvent();
+                if (entry.RetryAfter != 0) { entry.Activity.NotifyNativeEvent(); entry.RetryAfter = 0; }
+                // Only admitted region entries reach this loop. Native activity
+                // edges bypass the shared animation clock within that region.
                 bool active = entry.Source.activeInHierarchy;
                 bool activeChanged = entry.Last != null && entry.Last.Pose.Active != active;
-                if (!StaticCreatureCapturePolicy.DynamicDue(entry.Last != null, active, entry.Last?.Pose.Active ?? false, now, entry.NextSample))
-                { frames.Add(entry.Last!); continue; }
+                managedStateChecks++;
+                if (entry.TongueActivity != null && !entry.TongueActivity.Due(now, active))
+                { frogTongueIdleSkips++; if (entry.Last != null) frames.Add(entry.Last); continue; }
+                if (!entry.Activity.Due(now, active))
+                {
+                    if (entry.Kind == "beetle" && entry.Activity.ClockMode == CreatureReplayRules.SleepingClock) beetleSleepingSkips++;
+                    if (entry.Kind == "spider" && entry.Activity.ClockMode == CreatureReplayRules.IdleClock) spiderIdleSkips++;
+                    frames.Add(entry.Last!); continue;
+                }
+                int nativeState = entry.Spider ? (int)entry.Spider!.spiderState : entry.Zombie ? (int)entry.Zombie!.currentState :
+                    entry.Condor ? (int)condorState(entry.Condor!) : entry.ActionState.State;
+                // The native frog can reveal its tongue after an attack delay.
+                // One visibility/pulling edge gets a fixed detail window; the
+                // continually changing 200 points cannot renew that window.
+                if (entry.TongueActivity?.LastWasBoundary == true && !entry.TongueActivity.Quiet)
+                    entry.Cadence.ConfirmShortAction(now);
+                bool scheduled = entry.Cadence.Due(now, active, nativeState,
+                    entry.Activity.LastWasBoundary || entry.TongueActivity?.LastWasBoundary == true);
+                if (entry.ActionState.Reliable && (entry.RavenCapture?.LowRateSafe ?? true) && !scheduled)
+                { lowRateSkips++; if (entry.Last != null) frames.Add(entry.Last); continue; }
+                lowRateReads++;
+                if (entry.Cadence.LastWasBoundary) actionConfirmations++;
+                CreatureIdleAnimation? ravenAnimation = null;
+                bool ravenReady = false;
+                if (entry.RavenCapture != null)
+                {
+                    long oldMouth = entry.RavenCapture.MouthFallbacks;
+                    ravenReady = entry.RavenCapture.TryObserve(now, active, out ravenAnimation, out bool ravenChanged);
+                    ravenClockChecks++; ravenMouthFallbacks += entry.RavenCapture.MouthFallbacks - oldMouth;
+                    if (ravenReady && !ravenChanged && entry.Last?.IdleAnimation == ravenAnimation &&
+                        !entry.AppearanceDirty && entry.InitialAppearanceObserved && !activeChanged)
+                    { ravenGeometrySkips++; frames.Add(entry.Last!); continue; }
+                    if (ravenReady && ravenChanged && RavenPhaseCheckpointCapture.TryCorrect(entry.Last, ravenAnimation!, entry.RavenCapture.State,
+                        entry.InitialAppearanceObserved, entry.AppearanceDirty, activeChanged, entry.Cadence.LastWasBoundary,
+                        entry.RavenRoot!, out var phaseCorrected))
+                    {
+                        entry.Last = phaseCorrected; ravenPhaseCorrections++; ravenGeometrySkips++;
+                        frames.Add(phaseCorrected); continue;
+                    }
+                    if (ravenReady)
+                    {
+                        if (!ravenChanged) ravenAnimation = entry.RavenCapture.Reanchor(now);
+                    }
+                }
                 using var timing = ReplayPerformance.Measure(ReplayStage.DynamicCreatures);
-                var pose = VisualReplica.Capture(entry.Source.transform, true, CreatureReplayRules.MaximumNodes);
-                var line = entry.Spider && entry.Spider!.line ? SampleLine(entry, entry.Spider.line) : null;
-                var visuals = NativeVisualAppearance.CaptureAtTime(entry.Source.transform, entry.Last?.Visuals, now, activeChanged, CreatureReplayRules.MaximumNodes, allowAnimated: active);
-                int state = entry.Spider ? (int)entry.Spider!.spiderState : entry.Zombie ? (int)entry.Zombie!.currentState : pose.Active ? 0 : 1;
-                var old = entry.Last;
-                if (old == null || !ReferenceEquals(old.Pose, pose) || !ReferenceEquals(old.Line, line) || !ReferenceEquals(old.Visuals, visuals) || old.State != state)
-                    entry.Last = new CreatureReplayFrame { Key = entry.Key, Kind = entry.Kind, Resource = entry.Kind,
-                        SourcePath = entry.Path, State = state, Pose = pose, Line = line, Visuals = visuals };
-                entry.NextSample = now + 1d / 30;
+                CreatureIdleAnimation? idleAnimation = ravenAnimation;
+                if (entry.IdleCapture != null && entry.Activity.IdleCandidate && now >= entry.IdleRetryAfter)
+                {
+                    bool ready;
+                    try { ready = entry.IdleCapture.TryCapture(now, out idleAnimation); }
+                    catch { ready = false; }
+                    entry.Activity.CompleteIdleVisual(now, ready);
+                    entry.IdleRetryAfter = ready ? 0 : now + .25;
+                }
+                else if (entry.Activity.ClockMode == CreatureReplayRules.IdleClock)
+                    entry.Activity.CompleteIdleVisual(now, false);
+                // ItemCapture owns the frog's body/rig; this track supplies only
+                // its native tongue line, without a duplicate creature mesh.
+                var pose = entry.Kind == "frog-tongue" ? FrogPose(entry) : VisualReplica.Capture(entry.Root, true, CreatureReplayRules.MaximumNodes);
+                geometryReads++; nodeVisits += pose.Nodes.Length;
+                if (entry.RavenCapture != null) ravenGeometryReads++;
+                if (entry.TongueActivity != null && !entry.TongueActivity.Quiet) frogTongueActiveReads++;
+                if (entry.TongueActivity?.LastWasBoundary ?? entry.Activity.LastWasBoundary) boundaryReads++;
+                if (entry.Kind == "spider")
+                {
+                    if (entry.Activity.ClockMode == CreatureReplayRules.IdleClock) spiderIdleReads++;
+                    else if (active) spiderActionReads++;
+                }
+                if (entry.Kind == "beetle" && entry.Activity.ClockMode == CreatureReplayRules.ActiveClock) beetleAwakeReads++;
+                var line = entry.Line ? SampleLine(entry, entry.Line!) : null;
+                if (line != null) { lineReads++; linePointVisits += line.Points.Length / 3; }
+                var visuals = entry.Last?.Visuals;
+                if (entry.Kind != "frog-tongue" && now >= entry.AppearanceRetryAfter)
+                    try
+                    {
+                        visuals = NativeVisualAppearance.CaptureAtTime(entry.Root, visuals, now, activeChanged || entry.AppearanceDirty, CreatureReplayRules.MaximumNodes, allowAnimated: active, animateMainTexture: entry.Kind == "ghost-ball", followSceneClock: true);
+                        entry.AppearanceDirty = false;
+                        entry.InitialAppearanceObserved = true;
+                    }
+                    catch (Exception e)
+                    {
+                        // Appearance metadata must not discard valid observed
+                        // bone motion (the native zombie has 295 renderers).
+                        Warn(entry.Kind + "-appearance", "生物外观采样暂不可用，继续记录骨骼动作：" + e.Message);
+                        entry.AppearanceRetryAfter = now + 1;
+                    }
+                int state = entry.Spider || entry.Zombie || entry.Condor ? nativeState :
+                    ravenReady ? entry.RavenCapture!.State : entry.Kind == "venus-flytrap" || entry.Kind == "antlion" ? nativeState : pose.Active ? 0 : 1;
+                // Record the actual observation even if the native pose did
+                // not change. It supplies the near-side bracket when motion
+                // starts after a quiet spell; geometry arrays remain shared.
+                // Sleeping/inactive entries never enter this read path.
+                entry.Last = new CreatureReplayFrame { Key = entry.Key, Kind = entry.Kind, Resource = entry.Resource,
+                    SourcePath = entry.Path, State = state, Pose = pose, Line = line, Visuals = visuals,
+                    SampleTimeKnown = true, SampleTime = now, SampleDiscontinuity = entry.Cadence.LastWasBoundary,
+                    ClockMode = ravenReady ? CreatureReplayRules.IdleClock :
+                        entry.TongueActivity?.ClockMode ?? entry.Activity.ClockMode, IdleAnimation = idleAnimation };
                 frames.Add(entry.Last!);
             }
             catch (Exception e)
@@ -214,47 +351,81 @@ internal sealed class CreatureReplayCapture : IDisposable
                 entry.RetryAfter = now + 1; Warn(entry.Kind, "生物视觉采样暂不可用：" + e.Message);
             }
         }
-        foreach (int id in removed) Remove(id);
-        bool same = frames.Count == previous.Length;
-        if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previous[i])) { same = false; break; }
-        return same ? previous : previous = frames.ToArray();
+        foreach (int id in removed) { segments?.Forget(id); Retire(id); }
+        bool same = frames.Count == previousDynamic.Length;
+        if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previousDynamic[i])) { same = false; break; }
+        if (same && ReferenceEquals(staticFrames, previousStatic)) return previous;
+        if (!same) previousDynamic = frames.ToArray();
+        previousStatic = staticFrames;
+        previous = new CreatureReplayFrame[staticFrames.Length + previousDynamic.Length];
+        Array.Copy(staticFrames, previous, staticFrames.Length);
+        Array.Copy(previousDynamic, 0, previous, staticFrames.Length, previousDynamic.Length);
+        return previous;
     }
-    private static void SampleStatic(Entry entry, double now)
+    private static CreatureReplayFrame? SampleStatic(Entry entry, CreatureReplayFrame? previous)
     {
-        // Native Trigger postfix dirties the already-registered entry after its
-        // spawn/deactivation completes. A staggered one-second integrity check
-        // covers scene edits that do not emit that event without polling every
-        // static transform/active bit on every recording frame.
-        if (!entry.StaticSchedule.Due(now, entry.Last != null)) return;
+        // Only initial registration and the completed native trigger enqueue a
+        // trap. Keep its own armed/consumed state; the world track already owns
+        // parent biome activation, including areas reached by a later seek.
+        if (!entry.Source) return null;
         using var timing = ReplayPerformance.Measure(ReplayStage.StaticTraps);
         bool active = entry.Source.activeSelf;
-        var root = entry.Source.transform;
+        var root = entry.Root;
         var p = root.position; var r = root.rotation; var s = root.lossyScale;
         Span<float> trs = stackalloc float[] { p.x, p.y, p.z, r.x, r.y, r.z, r.w, s.x, s.y, s.z };
-        var pose = CreatureDirectoryRules.StaticPose(entry.Last?.Pose, active, trs);
-        entry.StaticSchedule.Observed(now);
-        if (entry.Last != null && ReferenceEquals(pose, entry.Last.Pose)) return;
-        entry.Last = new CreatureReplayFrame { Key = entry.Key, Kind = entry.Kind, Resource = entry.Kind,
+        var pose = CreatureDirectoryRules.StaticPose(previous?.Pose, active, trs);
+        if (previous != null && ReferenceEquals(pose, previous.Pose)) return previous;
+        return new CreatureReplayFrame { Key = entry.Key, Kind = entry.Kind, Resource = entry.Kind,
             SourcePath = entry.Path, State = active ? 0 : 1, Pose = pose };
+    }
+    private ObjectPose ReadRavenRoot(Entry entry)
+    {
+        ravenPhaseRootReads++;
+        // Read only the root, without entering VisualReplica's hierarchy probe
+        // (an invalidated hierarchy is allowed to force children in that API).
+        var previous = entry.Last!.Pose;
+        entry.Root.GetPositionAndRotation(out var p, out var r); var s = entry.Root.lossyScale;
+        bool active = entry.Source.activeInHierarchy;
+        if (previous.Active == active && previous.Position[0] == p.x && previous.Position[1] == p.y && previous.Position[2] == p.z &&
+            previous.Rotation[0] == r.x && previous.Rotation[1] == r.y && previous.Rotation[2] == r.z && previous.Rotation[3] == r.w &&
+            previous.Scale[0] == s.x && previous.Scale[1] == s.y && previous.Scale[2] == s.z) return previous;
+        return new ObjectPose(new[] { p.x, p.y, p.z }, new[] { r.x, r.y, r.z, r.w }, new[] { s.x, s.y, s.z }, active, previous.Nodes);
     }
     private static CreatureReplayLine SampleLine(Entry entry, LineRenderer source)
     {
         int count = source.positionCount;
-        if (count > CreatureReplayRules.MaximumLinePoints) throw new InvalidOperationException("蜘蛛丝超过128个控制点");
+        if (count > entry.LineScratch.Length) throw new InvalidOperationException("生物线条超过控制点录制上限");
         source.GetPositions(entry.LineScratch);
+        bool worldSpace = source.useWorldSpace;
+        if (entry.Kind == "frog-tongue" && !worldSpace)
+        {
+            for (int i = 0; i < count; i++) entry.LineScratch[i] = source.transform.TransformPoint(entry.LineScratch[i]);
+            worldSpace = true;
+        }
         var old = entry.Last?.Line;
-        bool same = old != null && old.Enabled == source.enabled && old.WorldSpace == source.useWorldSpace && old.Width == source.widthMultiplier && old.Points.Length == count * 3;
+        bool enabled = source.enabled && source.gameObject.activeInHierarchy;
+        bool same = old != null && old.Enabled == enabled && old.WorldSpace == worldSpace && old.Width == source.widthMultiplier && old.Points.Length == count * 3;
         for (int i = 0; same && i < count; i++)
         { var p = entry.LineScratch[i]; same = old!.Points[i * 3] == p.x && old.Points[i * 3 + 1] == p.y && old.Points[i * 3 + 2] == p.z; }
         if (same) return old!;
         var points = new float[count * 3];
         for (int i = 0; i < count; i++) { var p = entry.LineScratch[i]; points[i * 3] = p.x; points[i * 3 + 1] = p.y; points[i * 3 + 2] = p.z; }
-        return new CreatureReplayLine { Enabled = source.enabled, WorldSpace = source.useWorldSpace, Width = source.widthMultiplier, Points = points };
+        return new CreatureReplayLine { Enabled = enabled, WorldSpace = worldSpace, Width = source.widthMultiplier, Points = points };
+    }
+    private static ObjectPose FrogPose(Entry entry)
+    {
+        // World-space line points need no body hierarchy or placement. Keeping
+        // this separate also avoids sharing ItemCapture's animated probe cache.
+        Span<float> identity = stackalloc float[] { 0, 0, 0, 0, 0, 0, 1, 1, 1, 1 };
+        return CreatureDirectoryRules.StaticPose(entry.Last?.Pose, entry.Source.activeInHierarchy, identity);
     }
     private void Warn(string key, string message) { if (warned.Count < 128 && warned.Add(key)) warning?.Invoke(message); }
     public void Dispose()
     {
-        if (disposed) return; disposed = true; observer.Dispose();
-        entries.Clear(); previous = Array.Empty<CreatureReplayFrame>();
+        if (disposed) return; disposed = true; observer.Dispose(); segments?.Dispose();
+        foreach (var entry in entries.Values) { entry.ScoutmasterActivity?.Dispose(); VisualReplica.ReleaseCapture(entry.Root); }
+        entries.Clear(); staticEntries.Clear();
+        frames.Clear(); removed.Clear();
+        previous = previousStatic = previousDynamic = Array.Empty<CreatureReplayFrame>();
     }
 }

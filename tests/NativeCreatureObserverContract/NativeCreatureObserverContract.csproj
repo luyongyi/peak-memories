@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="local/**/*.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureReplayObserver.cs" Link="CreatureReplayObserver.cs" />
+    <Compile Include="../../src/PeakReplayLab/ScoutmasterCaptureActivity.cs" Link="ScoutmasterCaptureActivity.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureCaptureLifecycle.cs" Link="CreatureCaptureLifecycle.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureCaptureActivity.cs" Link="CreatureCaptureActivity.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureSamplingCadence.cs" Link="CreatureSamplingCadence.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentReplayObserver.cs" Link="EnvironmentReplayObserver.cs" />
+    <Compile Include="../../src/PeakReplayLab/LuggageEventObserver.cs" Link="LuggageEventObserver.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>
+

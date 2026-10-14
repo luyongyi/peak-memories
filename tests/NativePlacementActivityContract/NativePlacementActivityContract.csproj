@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/NativePlacementResources.cs" Link="NativePlacementResources.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeCaptureAnimationActivity.cs" Link="NativeCaptureAnimationActivity.cs" />
+    <Compile Include="../../src/PeakReplayLab/ItemActivityPolicy.cs" Link="ItemActivityPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/SpawnedCaptureLifecycle.cs" Link="SpawnedCaptureLifecycle.cs" />
+    <Compile Include="../../src/PeakReplayLab/SampleClock.cs" Link="SampleClock.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>

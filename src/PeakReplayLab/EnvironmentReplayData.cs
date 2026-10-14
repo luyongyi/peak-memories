@@ -74,6 +74,7 @@ public sealed class EnvironmentFogFrame
 
 public static class EnvironmentReplayRules
 {
+    [ThreadStatic] private static HashSet<string>? validationKeys;
     public const int MaximumWinds = 16, MaximumLava = 32, MaximumStorms = 8;
     // OrbFogHandler evaluates its authored Hermite curve without Clamp01; its
     // installed fade has a 1.001134... peak. DisableFog also writes 1-c/t after
@@ -90,34 +91,38 @@ public static class EnvironmentReplayRules
         Check(frame.WeatherBlend, -10, 10, nameof(frame.WeatherBlend)); Check(frame.GlobalWind, -10, 10, nameof(frame.GlobalWind));
         Check(frame.RainFactor, 0, 10, nameof(frame.RainFactor)); Check(frame.SnowFactor, 0, 10, nameof(frame.SnowFactor));
         Check(frame.HeightFogAmount, -10, 10, nameof(frame.HeightFogAmount)); Check(frame.HeightFogSpirit, -10, 10, nameof(frame.HeightFogSpirit));
-        var keys = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var wind in frame.Winds)
+        var keys = validationKeys ??= new HashSet<string>(StringComparer.Ordinal);
+        try
         {
-            if (wind == null) throw Error(nameof(frame.Winds), null, "Null wind entry."); Key(wind.Key, keys); Vector(wind.Direction, nameof(wind.Direction), wind.Key);
-            Check(wind.Intensity, -10, 10, nameof(wind.Intensity), wind.Key);
-            // These two native fields really are clamped normalized progress,
-            // unlike the unclamped coroutine/AnimationCurve fog enable value.
-            Check(wind.StormProgress, 0, 1, nameof(wind.StormProgress), wind.Key); Check(wind.TimeUntilStorm, 0, 1, nameof(wind.TimeUntilStorm), wind.Key);
-            Check(wind.SecondsUntilSwitch, -3600, 14400, nameof(wind.SecondsUntilSwitch), wind.Key); Check(wind.Duration, 0, 14400, nameof(wind.Duration), wind.Key); Check(wind.ActiveFor, 0, 14400, nameof(wind.ActiveFor), wind.Key);
-            if (wind.Storms == null || wind.Storms.Length > MaximumStorms) throw Error(nameof(wind.Storms), wind.Key, "Storm directory is missing or exceeds its entity limit.");
-            foreach (var storm in wind.Storms)
+            foreach (var wind in frame.Winds)
             {
-                if (storm == null || storm.Kind < 0 || storm.Kind > 2) throw Error("Storm.Kind", wind.Key, "Null or unsupported storm kind.");
-                Key(storm.Key, keys); Check(storm.Factor, 0, 10, nameof(storm.Factor), storm.Key); Check(storm.Intensity, -10, 10, nameof(storm.Intensity), storm.Key);
+                if (wind == null) throw Error(nameof(frame.Winds), null, "Null wind entry."); Key(wind.Key, keys); Vector(wind.Direction, nameof(wind.Direction), wind.Key);
+                Check(wind.Intensity, -10, 10, nameof(wind.Intensity), wind.Key);
+                // These two native fields really are clamped normalized progress,
+                // unlike the unclamped coroutine/AnimationCurve fog enable value.
+                Check(wind.StormProgress, 0, 1, nameof(wind.StormProgress), wind.Key); Check(wind.TimeUntilStorm, 0, 1, nameof(wind.TimeUntilStorm), wind.Key);
+                Check(wind.SecondsUntilSwitch, -3600, 14400, nameof(wind.SecondsUntilSwitch), wind.Key); Check(wind.Duration, 0, 14400, nameof(wind.Duration), wind.Key); Check(wind.ActiveFor, 0, 14400, nameof(wind.ActiveFor), wind.Key);
+                if (wind.Storms == null || wind.Storms.Length > MaximumStorms) throw Error(nameof(wind.Storms), wind.Key, "Storm directory is missing or exceeds its entity limit.");
+                foreach (var storm in wind.Storms)
+                {
+                    if (storm == null || storm.Kind < 0 || storm.Kind > 2) throw Error("Storm.Kind", wind.Key, "Null or unsupported storm kind.");
+                    Key(storm.Key, keys); Check(storm.Factor, 0, 10, nameof(storm.Factor), storm.Key); Check(storm.Intensity, -10, 10, nameof(storm.Intensity), storm.Key);
+                }
+            }
+            foreach (var lava in frame.Lava)
+            {
+                if (lava == null || lava.Kind < 0 || lava.Kind > 1) throw Error("Lava.Kind", null, "Null or unsupported lava kind.");
+                Key(lava.Key, keys); Vector(lava.Position, nameof(lava.Position), lava.Key); Check(lava.ProgressTime, 0, 14400, nameof(lava.ProgressTime), lava.Key);
+            }
+            if (frame.Fog is { } fog)
+            {
+                Key(fog.Key, keys); Vector(fog.Point, nameof(fog.Point), fog.Key); Check(fog.Size, -1000, 10000000, nameof(fog.Size), fog.Key); Check(fog.Padding, 0, 100000, nameof(fog.Padding), fog.Key);
+                Check(fog.Enable, MinimumFogEnable, MaximumFogEnable, nameof(fog.Enable), fog.Key);
+                Check(fog.Reveal, 0, 1, nameof(fog.Reveal), fog.Key); Check(fog.CloseFog, 0, 10, nameof(fog.CloseFog), fog.Key);
+                if (fog.Origin < 0 || fog.Origin > 128) throw Error(nameof(fog.Origin), fog.Key, "Unsupported origin=" + fog.Origin.ToString(CultureInfo.InvariantCulture));
             }
         }
-        foreach (var lava in frame.Lava)
-        {
-            if (lava == null || lava.Kind < 0 || lava.Kind > 1) throw Error("Lava.Kind", null, "Null or unsupported lava kind.");
-            Key(lava.Key, keys); Vector(lava.Position, nameof(lava.Position), lava.Key); Check(lava.ProgressTime, 0, 14400, nameof(lava.ProgressTime), lava.Key);
-        }
-        if (frame.Fog is { } fog)
-        {
-            Key(fog.Key, keys); Vector(fog.Point, nameof(fog.Point), fog.Key); Check(fog.Size, -1000, 10000000, nameof(fog.Size), fog.Key); Check(fog.Padding, 0, 100000, nameof(fog.Padding), fog.Key);
-            Check(fog.Enable, MinimumFogEnable, MaximumFogEnable, nameof(fog.Enable), fog.Key);
-            Check(fog.Reveal, 0, 1, nameof(fog.Reveal), fog.Key); Check(fog.CloseFog, 0, 10, nameof(fog.CloseFog), fog.Key);
-            if (fog.Origin < 0 || fog.Origin > 128) throw Error(nameof(fog.Origin), fog.Key, "Unsupported origin=" + fog.Origin.ToString(CultureInfo.InvariantCulture));
-        }
+        finally { keys.Clear(); }
     }
     public static long Estimate(EnvironmentReplayFrame? frame)
     {

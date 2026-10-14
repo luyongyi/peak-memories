@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../NativeSegmentScopeContract/Stubs.cs" Link="ScopeStubs.cs" />
+    <Compile Include="../NativeSegmentScopeContract/LuggageScopeDoubles.cs" Link="UnityDoubles.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureSegmentScope.cs" Link="CaptureSegmentScope.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentReplayCapture.cs" Link="EnvironmentReplayCapture.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureBootstrapWorkBudget.cs" Link="CaptureBootstrapWorkBudget.cs" />
+    <Compile Include="../../src/PeakReplayLab/EnvironmentCapturePolicy.cs" Link="EnvironmentCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/CrateAnimationData.cs" Link="CrateAnimationData.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>

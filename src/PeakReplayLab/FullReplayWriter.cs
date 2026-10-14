@@ -38,6 +38,7 @@ public sealed class FullReplayWriter
     private readonly ReplayQueueBudget queueBudget = new();
     private readonly AutoResetEvent wake = new(false);
     private readonly List<FullReplayPage> pages = new();
+    private readonly FullReplaySharedWriter shared = new();
     private readonly HashSet<string> actors = new(StringComparer.Ordinal);
     private readonly ReplayHeader template;
     private readonly ReplayHeader sourceMetadata;
@@ -50,6 +51,7 @@ public sealed class FullReplayWriter
     private string? completionReason;
     private Stream? file;
     private Page? page;
+    private ContinuousReplayRebaser? runRebaser;
     private ReplayFrame? previous;
     private int accepting = 1, completing, finished, producerBusy, completedPages;
     private long acceptedFrames, writtenFrames, bytesWritten, gap100, gap500;
@@ -86,7 +88,9 @@ public sealed class FullReplayWriter
     {
         if (string.IsNullOrWhiteSpace(root)) throw new ArgumentException("Missing full recording directory.", nameof(root));
         this.options = (options ?? new ContinuousReplayOptions()).CopyChecked();
-        this.options.SegmentSeconds = Math.Min(10, this.options.SegmentSeconds);
+        // Each page has a complete baseline with direct immutable snapshot
+        // references. Short pages never require replaying intervening pages.
+        this.options.SegmentSeconds = Math.Min(1, this.options.SegmentSeconds);
         this.options.SegmentFrameLimit = Math.Min(601, this.options.SegmentFrameLimit);
         this.options.SegmentDecodedByteLimit = Math.Min(64L * 1024 * 1024, this.options.SegmentDecodedByteLimit);
         this.options.SegmentUncompressedByteLimit = Math.Min(128L * 1024 * 1024, this.options.SegmentUncompressedByteLimit);
@@ -209,7 +213,11 @@ public sealed class FullReplayWriter
     private void Process(ReplayFrame frame)
     {
         if (previous != null && frame.T <= previous.T) throw new InvalidDataException("Full recording capture time did not increase.");
-        if (previous == null) Volatile.Write(ref nativeStart, frame.T);
+        if (previous == null)
+        {
+            Volatile.Write(ref nativeStart, frame.T);
+            runRebaser = new ContinuousReplayRebaser(nativeStart);
+        }
         if (frame.T - nativeStart > options.MaxRunSeconds) throw new StopException("run-time-limit", "Full recording reached its duration limit.");
         foreach (var e in frame.Events)
         {
@@ -245,20 +253,22 @@ public sealed class FullReplayWriter
     }
     private void OpenPage(ReplayFrame first, bool overlap)
     {
-        if (pages.Count >= 8192) throw new StopException("page-limit", "Full recording reached its bounded seek index limit.");
+        if (pages.Count >= FullReplayArchive.MaximumPages) throw new StopException("page-limit", "Full recording reached its bounded seek index limit.");
         page = new Page(this, first.T, writtenFrames - (overlap ? 1 : 0), overlap);
         if (!page.TryWrite(first)) throw new StopException("page-size-limit", "One frame exceeds the full recording seek-page safety budget.");
     }
     private void FinishPage()
     {
         if (page == null) return;
-        var ending = page; ending.EndFile();
+        var ending = page; var history = ending.EndFile();
+        shared.FlushPending(file!);
         pages.Add(new FullReplayPage
         {
             Index = pages.Count, Start = ending.NativeStart - nativeStart, End = ending.NativeEnd - nativeStart,
-            Offset = ending.Offset, Length = file!.Position - ending.Offset,
+            Offset = ending.Offset, Length = history.Offset - ending.Offset,
             RawBytes = ending.RawBytes, DecodedBytes = ending.Budget.Bytes,
-            FrameCount = ending.Frames, FirstFrameIndex = ending.FirstFrameIndex, Overlap = ending.Overlap,
+            FrameCount = ending.Frames, FirstFrameIndex = ending.FirstFrameIndex, Overlap = ending.Overlap, EffectHistory = history,
+            SharedThrough = shared.Blocks.Count,
         });
         page = null; Interlocked.Increment(ref completedPages); file!.Flush(); flushClock.Restart();
     }
@@ -280,15 +290,16 @@ public sealed class FullReplayWriter
         regions.ObserveOutcome(Volatile.Read(ref finalOutcome), nativeStart, nativeEnd);
         var index = new FullReplayIndex
         {
+            Version = 4,
             RegionSummary = regions.Snapshot(),
             Header = CopyHeader(template), Duration = Math.Max(0, nativeEnd - nativeStart), FrameCount = writtenFrames,
-            ActorIds = actors.OrderBy(x => x, StringComparer.Ordinal).ToArray(), Pages = pages.ToArray(),
+            ActorIds = actors.OrderBy(x => x, StringComparer.Ordinal).ToArray(), Pages = pages.ToArray(), SharedBlocks = shared.Blocks.ToArray(),
             Complete = failed == null, Reason = completionReason ?? (failed == null ? "manual-stop" : "safety-stop"),
             FaultCode = failed?.Code, Fault = failed == null ? null : Short(failed.Error.Message, 2048),
             GapOver100ms = gap100, GapOver500ms = gap500, LargestGapSeconds = largestGap,
         };
         byte[] encoded = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(index, ReplayFiles.Json));
-        if (encoded.Length > 4 * 1024 * 1024) throw new StopException("index-limit", "Full recording seek index exceeds 4 MiB.");
+        if (encoded.Length > FullReplayArchive.MaximumIndexBytes) throw new StopException("index-limit", "Full recording seek index exceeds its safety limit.");
         ((CountedFile)file!).WritingIndex = true;
         using var binary = new BinaryWriter(file, Encoding.UTF8, true);
         binary.Write(encoded); binary.Write((long)encoded.Length); binary.Write(Encoding.ASCII.GetBytes("PEAKEND1")); binary.Flush();
@@ -311,6 +322,7 @@ public sealed class FullReplayWriter
         private readonly ReplayDeltaCodec.Writer codec;
         private readonly ReplayRules.ValidationMemo validation = new();
         private readonly ContinuousReplayRebaser rebaser;
+        private readonly List<ReplayFrame> effectHistory = new();
         private double previousTime = -1, previousEventTime = -1;
         private long previousEventSequence = -1;
         private bool disposed;
@@ -328,7 +340,10 @@ public sealed class FullReplayWriter
             // Internal pages keep the one whole-run clock. Rebasing to this
             // page's first sample would discard events observed between the
             // previous sample and this first sample on a non-overlap boundary.
-            Offset = owner.file!.Position; rebaser = new ContinuousReplayRebaser(owner.nativeStart);
+            // The origin is constant for the entire file. Its weak translation
+            // caches keep unchanged crate/rope/event clocks reusable across
+            // page boundaries without retaining historical capture frames.
+            Offset = owner.file!.Position; rebaser = owner.runRebaser!;
             gzip = new GZipStream(owner.file!, CompressionLevel.Fastest, true);
             writer = new StreamWriter(gzip, new UTF8Encoding(false), 65536, true);
             try { Write(JsonConvert.SerializeObject(owner.template, ReplayFiles.Json)); }
@@ -338,19 +353,28 @@ public sealed class FullReplayWriter
         {
             var frame = rebaser.Apply(native);
             ReplayRules.ValidateStored(frame, previousTime, validation, maximumStoredTime: FullReplayArchive.MaximumDuration);
-            ReplayRules.ValidateVersion(frame, owner.template.Schema);
+            ReplayRules.ValidateVersion(frame, owner.template.Schema, validation.Version);
             if (frame.World.ActiveMapObjects.Length != owner.template.MapObjects.Length) throw new InvalidDataException("Full recording map state changed shape.");
             foreach (var e in frame.Events)
                 if (e.Sequence <= previousEventSequence || e.T < previousEventTime) throw new InvalidDataException("Page item events are not ordered.");
             long increment = Budget.Additional(frame);
             if (Budget.Bytes + increment > owner.options.SegmentDecodedByteLimit) return false;
-            string line = JsonConvert.SerializeObject(codec.Encode(frame), ReplayFiles.Json);
+            object record = codec.Encode(frame);
+            // Publication/capture only queues immutable frames. All hashing,
+            // compression and snapshot catalogue work stays on this worker.
+            if (Frames == 0) owner.shared.EncodeBaseline(record, native);
+            string line = JsonConvert.SerializeObject(record, ReplayFiles.Json);
             long size = Encoding.UTF8.GetByteCount(line) + 1L;
+            // The line and each referenced block are separate bounded records.
+            // The shared writer enforces the reader's page-wide unique-block
+            // budget; adding that expansion to this JSON line rejects valid
+            // large scenes even when every independent record is well below 8 MiB.
             if (line.Length > ReplayRules.MaxLineCharacters || size > ReplayRules.MaxLineCharacters)
                 throw new StopException("record-size-limit", "One full recording record exceeds 8 MiB.");
             if (RawBytes + size + 128 > owner.options.SegmentUncompressedByteLimit) return false;
             Write(line); Budget.Commit(frame, increment);
             foreach (var e in frame.Events) { previousEventSequence = e.Sequence; previousEventTime = e.T; }
+            effectHistory.Add(FullReplayArchive.EffectsOnlyFrame(frame));
             previousTime = frame.T; NativeEnd = native.T; Frames++; return true;
         }
         private void Write(string text)
@@ -361,7 +385,11 @@ public sealed class FullReplayWriter
             writer.Write(text); writer.Write('\n'); RawBytes += bytes;
         }
         public void Flush() { writer.Flush(); gzip.Flush(); }
-        public void EndFile() { Write("{\"Type\":\"end\"}"); Dispose(); }
+        public FullReplayEffectHistory EndFile()
+        {
+            Write("{\"Type\":\"end\"}"); Dispose();
+            return FullReplayArchive.WriteEffectHistory(owner.file!, owner.template, effectHistory, CancellationToken.None);
+        }
         public void Dispose()
         {
             if (disposed) return; disposed = true; Exception? first = null;
@@ -379,7 +407,7 @@ public sealed class FullReplayWriter
         public CountedFile(Stream inner, FullReplayWriter owner) { this.inner = inner; this.owner = owner; }
         public override void Write(byte[] buffer, int offset, int count)
         {
-            long reserve = WritingIndex ? 0 : Math.Min(4L * 1024 * 1024, owner.options.MaxRunBytes / 4);
+            long reserve = WritingIndex ? 0 : Math.Min(FullReplayArchive.MaximumIndexBytes, owner.options.MaxRunBytes / 4);
             if (Interlocked.Read(ref owner.bytesWritten) + count > owner.options.MaxRunBytes - reserve)
                 throw new StopException("run-byte-limit", "Full recording reached its configured disk-byte limit.");
             inner.Write(buffer, offset, count); Interlocked.Add(ref owner.bytesWritten, count);

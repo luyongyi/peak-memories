@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/CaptureSegmentScope.cs" Link="CaptureSegmentScope.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureBootstrapWorkBudget.cs" Link="CaptureBootstrapWorkBudget.cs" />
+    <Compile Include="../../src/PeakReplayLab/LuggageTrack.cs" Link="LuggageTrack.cs" />
+    <Compile Include="../../src/PeakReplayLab/CrateAppearanceCapturePolicy.cs" Link="CrateAppearanceCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/CrateAnimationData.cs" Link="CrateAnimationData.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>

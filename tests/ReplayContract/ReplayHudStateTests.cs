@@ -51,6 +51,28 @@ internal static class ReplayHudStateTests
             Check(ReplayHudState.Interpolate(known, null, 1) == null);
             Check(ReferenceEquals(ReplayHudState.Interpolate(known, State(2), 0), known));
         });
+        test("presentation HUD interpolation reuses storage without mutating recorded endpoints", () =>
+        {
+            var left = State(1); var right = State(2); var buffer = new ReplayHudState();
+            string before = Json(left), after = Json(right);
+            var expected = ReplayHudState.Interpolate(left, right, .375f);
+            ReplayHudState.InterpolateForPresentation(left, right, .375f, buffer);
+            long allocated = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < 10000; i++) ReplayHudState.InterpolateForPresentation(left, right, .375f, buffer);
+            long bytes = GC.GetAllocatedBytesForCurrentThread() - allocated;
+            Check(bytes == 0, "Steady HUD interpolation allocated per-frame storage.");
+            EqualState(expected, buffer);
+            Check(Json(left) == before && Json(right) == after);
+            Check(ReplayHudState.InterpolateForPresentation(null, right, .5f, buffer) == null);
+            Check(ReferenceEquals(ReplayHudState.InterpolateForPresentation(right, null, .5f, buffer), right));
+            Check(ReferenceEquals(ReplayHudState.InterpolateForPresentation(left, right, 1, buffer), right));
+            var swapped = ReplayHudState.InterpolateForPresentation(right, left, .625f, buffer);
+            EqualState(ReplayHudState.Interpolate(right, left, .625f), swapped);
+            Check(Json(left) == before && Json(right) == after);
+            try { ReplayHudState.InterpolateForPresentation(left, right, .5f, left); }
+            catch (ArgumentException) { return; }
+            throw new Exception("Recorded storage was accepted as a mutable presentation buffer.");
+        });
         test("HUD validation rejects malformed arrays nonfinite and out-of-range values", () =>
         {
             foreach (Action<ReplayHudState> corrupt in new Action<ReplayHudState>[]
@@ -226,7 +248,8 @@ internal static class ReplayHudStateTests
                 EqualState(frames[rightIndex].Actors[0].HudState, right);
                 EqualState(ReplayHudState.Interpolate(frames[leftIndex].Actors[0].HudState, frames[rightIndex].Actors[0].HudState, sample.Mix),
                     ReplayHudState.Interpolate(left, right, sample.Mix));
-                Check(timeline.CachedPageCount <= 5, "A HUD seek grew the recording cache beyond its neighboring pages.");
+                Check(timeline.CachedPageCount <= 64 && timeline.CachedDecodedBytes <= PagedReplayTimeline.MaximumCachedDecodedBytes,
+                    "A HUD seek exceeded the bounded recording cache.");
             }
         }));
         test("HUD continuous segment rotation rebases only time and preserves known state", () => InRoot(root =>

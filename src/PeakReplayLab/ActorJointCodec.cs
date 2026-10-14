@@ -16,10 +16,12 @@ internal static class ActorJointCodec
     private const double QuaternionLimit = .7071067811865475244;
     private static readonly Encoding Utf8 = new UTF8Encoding(false, true);
 
-    public static string Encode(NodePose[] current, NodePose[]? previous)
+    public static string Encode(NodePose[] current, NodePose[]? previous, int schema = ReplayRules.CurrentSchema)
     {
         ActorJointReplayRules.Validate(current);
         bool full = previous == null || !ActorJointReplayRules.SameTopology(current, previous);
+        bool allowGrouped = !full && schema >= 17;
+        int timeOnlyCount = 0;
         var indices = new List<int>(); var masks = new List<byte>();
         var times = new List<double>(); var timeIds = new Dictionary<double, byte>();
         for (int i = 0; i < current.Length; i++)
@@ -30,6 +32,7 @@ internal static class ActorJointCodec
             if (!full && current[i].SampleTime <= previous![i].SampleTime)
                 throw Invalid("Changed joints require a newer sample time.");
             indices.Add(i); masks.Add(mask);
+            if (allowGrouped && mask == 32) timeOnlyCount++;
             if ((mask & 32) != 0 && !timeIds.ContainsKey(current[i].SampleTime))
             {
                 if (!Finite(current[i].SampleTime)) throw Invalid("Invalid sample time.");
@@ -37,17 +40,38 @@ internal static class ActorJointCodec
                 times.Add(current[i].SampleTime);
             }
         }
+        // Version 2 only groups observations whose transform is unchanged.
+        // It retains every observation clock, including low-rate stationary
+        // samples used by the seek/interpolation timeline. Pose records and
+        // full baselines use exactly the original quantization and layout.
+        int groupCount = 0, bitsetBytes = (current.Length + 7) / 8;
+        int[]? timeOnlyCounts = null;
+        if (timeOnlyCount != 0)
+        {
+            timeOnlyCounts = new int[times.Count];
+            for (int n = 0; n < indices.Count; n++)
+                if (masks[n] == 32)
+                {
+                    int timeId = timeIds[current[indices[n]].SampleTime];
+                    if (timeOnlyCounts[timeId]++ == 0) groupCount++;
+                }
+        }
+        // The header, time table and pose records have identical lengths.
+        // Compare the only differing bytes before serializing either format;
+        // sparse or independently timed updates therefore never grow.
+        bool grouped = timeOnlyCount * 3 > 2 + groupCount * (1 + bitsetBytes);
         using var stream = new MemoryStream();
         using (var writer = new BinaryWriter(stream, Utf8, true))
         {
-            writer.Write((byte)0x4a); writer.Write((byte)1); writer.Write((byte)(full ? 0 : 1));
+            writer.Write((byte)0x4a); writer.Write((byte)(grouped ? 2 : 1)); writer.Write((byte)(full ? 0 : 1));
             writer.Write((ushort)current.Length); writer.Write(Topology(current));
             writer.Write((ushort)times.Count);
             foreach (double time in times) writer.Write(time);
-            writer.Write((ushort)indices.Count);
+            writer.Write((ushort)(indices.Count - (grouped ? timeOnlyCount : 0)));
             for (int n = 0; n < indices.Count; n++)
             {
                 int index = indices[n]; var node = current[index]; byte mask = masks[n];
+                if (grouped && mask == 32) continue;
                 writer.Write((byte)index); writer.Write(mask);
                 if (full)
                 {
@@ -64,6 +88,22 @@ internal static class ActorJointCodec
                 if ((mask & 24) != 0) writer.Write((byte)((node.Active ? 1 : 0) | (node.Visible ? 2 : 0)));
                 if ((mask & 32) != 0) writer.Write(timeIds[node.SampleTime]);
             }
+            if (grouped)
+            {
+                writer.Write((ushort)groupCount);
+                var groups = new byte[times.Count][];
+                for (int timeId = 0; timeId < times.Count; timeId++)
+                    if (timeOnlyCounts![timeId] != 0) groups[timeId] = new byte[bitsetBytes];
+                for (int n = 0; n < indices.Count; n++)
+                    if (masks[n] == 32)
+                    {
+                        int index = indices[n], timeId = timeIds[current[index].SampleTime];
+                        groups[timeId][index / 8] |= (byte)(1 << (index % 8));
+                    }
+                for (int timeId = 0; timeId < groups.Length; timeId++)
+                    if (groups[timeId] != null)
+                    { writer.Write((byte)timeId); writer.Write(groups[timeId]); }
+            }
         }
         if (stream.Length > MaximumPayloadBytes) throw Invalid("Joint payload exceeds limit.");
         return Convert.ToBase64String(stream.GetBuffer(), 0, checked((int)stream.Length));
@@ -78,7 +118,7 @@ internal static class ActorJointCodec
         return true;
     }
 
-    public static NodePose[] Decode(string payload, NodePose[]? previous)
+    public static NodePose[] Decode(string payload, NodePose[]? previous, int schema = ReplayRules.CurrentSchema)
     {
         if (payload == null || payload.Length == 0 || payload.Length > ((MaximumPayloadBytes + 2) / 3) * 4)
             throw Invalid("Invalid joint payload size.");
@@ -90,9 +130,12 @@ internal static class ActorJointCodec
         {
             using var stream = new MemoryStream(bytes, false);
             using var reader = new BinaryReader(stream, Utf8);
-            if (reader.ReadByte() != 0x4a || reader.ReadByte() != 1) throw Invalid("Unknown joint encoding.");
+            if (reader.ReadByte() != 0x4a) throw Invalid("Unknown joint encoding.");
+            byte version = reader.ReadByte();
+            if (version != 1 && (version != 2 || schema < 17)) throw Invalid("Unknown joint encoding.");
             byte mode = reader.ReadByte(); if (mode > 1) throw Invalid("Invalid joint mode.");
             bool full = mode == 0;
+            if (version == 2 && full) throw Invalid("Grouped joint encoding requires a delta baseline.");
             int count = reader.ReadUInt16(); ulong topology = reader.ReadUInt64();
             if (count > ActorJointReplayRules.MaximumJoints) throw Invalid("Joint count exceeds limit.");
             if (!full && (previous == null || previous.Length != count || Topology(previous) != topology))
@@ -105,14 +148,16 @@ internal static class ActorJointCodec
                 if (!Finite(times[i]) || !uniqueTimes.Add(times[i])) throw Invalid("Invalid or duplicate sample time.");
             }
             int changes = reader.ReadUInt16();
-            if (changes > count || full && changes != count || timeCount > changes) throw Invalid("Invalid joint update count.");
+            if (changes > count || full && changes != count || version == 1 && timeCount > changes) throw Invalid("Invalid joint update count.");
             var result = full ? new NodePose[count] : (NodePose[])previous!.Clone();
+            var changed = version == 2 ? new bool[count] : null;
             int lastIndex = -1; var usedTimes = new bool[timeCount];
             for (int n = 0; n < changes; n++)
             {
                 int index = reader.ReadByte(); byte mask = reader.ReadByte();
                 if (index >= count || index <= lastIndex || full && index != n) throw Invalid("Invalid or duplicate joint index.");
                 if (mask == 0 || mask > 63 || full && mask != 63) throw Invalid("Invalid joint field mask.");
+                if (version == 2 && (mask == 32 || (mask & 32) == 0)) throw Invalid("Invalid grouped pose field mask.");
                 lastIndex = index;
                 var old = full ? null : previous![index]; string path;
                 if (full)
@@ -148,6 +193,37 @@ internal static class ActorJointCodec
                 if (old != null && sampleTime <= old.SampleTime)
                     throw Invalid("Changed joints require a newer sample time.");
                 result[index] = new NodePose(path, position, rotation, scale, active, visible, sampleTime);
+                if (changed != null) changed[index] = true;
+            }
+            if (version == 2)
+            {
+                int groups = reader.ReadUInt16(), lastTimeIndex = -1;
+                if (groups == 0 || groups > timeCount) throw Invalid("Invalid sample group count.");
+                int bitsetBytes = (count + 7) / 8;
+                for (int group = 0; group < groups; group++)
+                {
+                    int timeIndex = reader.ReadByte();
+                    if (timeIndex >= timeCount || timeIndex <= lastTimeIndex) throw Invalid("Invalid or duplicate sample group.");
+                    lastTimeIndex = timeIndex;
+                    int members = 0;
+                    for (int byteIndex = 0; byteIndex < bitsetBytes; byteIndex++)
+                    {
+                        int bits = reader.ReadByte();
+                        for (int bit = 0; bit < 8; bit++)
+                        {
+                            if ((bits & (1 << bit)) == 0) continue;
+                            int index = byteIndex * 8 + bit;
+                            if (index >= count || changed![index]) throw Invalid("Invalid or duplicate sampled joint.");
+                            var old = previous![index];
+                            if (times[timeIndex] <= old.SampleTime) throw Invalid("Changed joints require a newer sample time.");
+                            result[index] = new NodePose(old.Path, old.Position, old.Rotation, old.Scale,
+                                old.Active, old.Visible, times[timeIndex]);
+                            changed[index] = true; members++;
+                        }
+                    }
+                    if (members == 0) throw Invalid("Empty sample group.");
+                    usedTimes[timeIndex] = true; changes += members;
+                }
             }
             foreach (bool used in usedTimes) if (!used) throw Invalid("Unused sample time entry.");
             if (stream.Position != stream.Length) throw Invalid("Trailing joint payload bytes.");

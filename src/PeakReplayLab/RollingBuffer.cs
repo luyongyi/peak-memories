@@ -17,11 +17,12 @@ public sealed class RollingBuffer
     private readonly Dictionary<ItemFrame[], (int Count, long Bytes)> itemArrays = new();
     private readonly Dictionary<CrateFrame[], (int Count, long Bytes)> crateArrays = new();
     private readonly ReplayTrackBudget<RopeReplayFrame> ropes = new(RopeReplayRules.Estimate);
-    private readonly ReplayTrackBudget<EffectReplayFrame> effects = new(EffectReplayRules.Estimate);
+    private readonly ReplayTrackBudget<EffectReplayFrame> effects = new(EffectReplayRules.OwnEstimate, EffectReplayRules.VisitShared);
     private readonly ReplayTrackBudget<AudioReplayFrame> audio = new(AudioReplayRules.Estimate);
     private readonly ReplayTrackBudget<SpawnedReplayFrame> spawned = new(SpawnedReplayRules.Estimate);
     private readonly ReplayTrackBudget<BalloonReplayFrame> balloons = new(BalloonReplayRules.Estimate);
     private readonly ReplayTrackBudget<CreatureReplayFrame> creatures = new(CreatureReplayRules.Estimate);
+    private readonly ReplayTrackBudget<InteractionReplayFrame> interactions = new(InteractionReplayRules.Estimate);
     public const double WindowSeconds = 120;
     public const long DefaultBudget = 256L * 1024 * 1024;
     private readonly long budget;
@@ -56,7 +57,7 @@ public sealed class RollingBuffer
         long singleFrame = bytes;
         singleFrame += Acquire(frame.Items) + Acquire(frame.Crates);
         long presentationBefore = PresentationBytes;
-        singleFrame += ropes.Acquire(frame.Ropes) + effects.Acquire(frame.Effects) + audio.Acquire(frame.Audio) + spawned.Acquire(frame.Spawned) + balloons.Acquire(frame.Balloons) + creatures.Acquire(frame.Creatures);
+        singleFrame += ropes.Acquire(frame.Ropes) + effects.Acquire(frame.Effects) + audio.Acquire(frame.Audio) + spawned.Acquire(frame.Spawned) + balloons.Acquire(frame.Balloons) + creatures.Acquire(frame.Creatures) + interactions.Acquire(frame.Interactions);
         EstimatedBytes += PresentationBytes - presentationBefore;
         if (singleFrame > budget)
         {
@@ -78,14 +79,14 @@ public sealed class RollingBuffer
         }
     }
 
-    private long PresentationBytes => ropes.Bytes + effects.Bytes + audio.Bytes + spawned.Bytes + balloons.Bytes + creatures.Bytes;
+    private long PresentationBytes => ropes.Bytes + effects.Bytes + audio.Bytes + spawned.Bytes + balloons.Bytes + creatures.Bytes + interactions.Bytes;
     private void ReleasePresentation(ReplayFrame frame)
     {
         long before = PresentationBytes;
         ropes.Release(frame.Ropes); effects.Release(frame.Effects); audio.Release(frame.Audio);
         spawned.Release(frame.Spawned);
         balloons.Release(frame.Balloons);
-        creatures.Release(frame.Creatures);
+        creatures.Release(frame.Creatures); interactions.Release(frame.Interactions);
         EstimatedBytes += PresentationBytes - before;
     }
 
@@ -148,13 +149,13 @@ public sealed class RollingBuffer
     public static long Estimate(ReplayFrame frame)
     {
         return EstimateFrame(frame) + frame.Items.Sum(Estimate) + frame.Crates.Sum(Estimate) +
-            frame.Ropes.Sum(RopeReplayRules.Estimate) + frame.Effects.Sum(EffectReplayRules.Estimate) + frame.Audio.Sum(AudioReplayRules.Estimate) + frame.Spawned.Sum(SpawnedReplayRules.Estimate) + frame.Balloons.Sum(BalloonReplayRules.Estimate) + frame.Creatures.Sum(CreatureReplayRules.Estimate);
+            frame.Ropes.Sum(RopeReplayRules.Estimate) + frame.Effects.Sum(EffectReplayRules.Estimate) + frame.Audio.Sum(AudioReplayRules.Estimate) + frame.Spawned.Sum(SpawnedReplayRules.Estimate) + frame.Balloons.Sum(BalloonReplayRules.Estimate) + frame.Creatures.Sum(CreatureReplayRules.Estimate) + frame.Interactions.Sum(InteractionReplayRules.Estimate);
     }
 
     internal static long EstimateFrame(ReplayFrame frame)
     {
-        long size = 456 + frame.World.ActiveMapObjects.Length +
-            (frame.Actors.Length + frame.Items.Length + frame.Crates.Length + frame.Events.Length + frame.Ropes.Length + frame.Effects.Length + frame.Audio.Length + frame.Spawned.Length + frame.Balloons.Length + frame.Creatures.Length) * 8L;
+        long size = 456 + (frame.SceneSampleTimeKnown ? 16 : 0) + frame.World.ActiveMapObjects.Length +
+            (frame.Actors.Length + frame.Items.Length + frame.Crates.Length + frame.Events.Length + frame.Ropes.Length + frame.Effects.Length + frame.Audio.Length + frame.Spawned.Length + frame.Balloons.Length + frame.Creatures.Length + frame.Interactions.Length) * 8L;
         size += EnvironmentReplayRules.Estimate(frame.World.Environment);
         foreach (var a in frame.Actors)
         {
@@ -173,9 +174,12 @@ public sealed class RollingBuffer
         return size;
     }
 
-    public static long Estimate(ItemFrame item) => 312 + (item.Key.Length + item.Prefab.Length + item.Name.Length + item.HolderId.Length) * 2L + Estimate(item.Pose) + NativeVisualAppearanceRules.Estimate(item.Visuals) + NativeLightRules.Estimate(item.Lights);
+    public static long Estimate(ItemFrame item) => 312 + (item.Key.Length + item.Prefab.Length + item.Name.Length + item.HolderId.Length) * 2L + Estimate(item.Pose) + NativeVisualAppearanceRules.Estimate(item.Visuals) + NativeLightRules.Estimate(item.Lights) +
+        (item.SampleTimeKnown ? 24L : 0L) + (item.IdleAnimation == null ? 0 : 128L + item.IdleAnimation.Clip.Length * 2L +
+            (item.IdleAnimation.SpinRotation == null ? 0 : 64L));
     public static long Estimate(CrateFrame crate) => 160 + (crate.Key.Length + crate.Kind.Length) * 2L + Estimate(crate.Pose) +
-        (crate.Animation == null ? 0 : 96 + crate.Animation.Clip.Length * 2L);
+        (crate.Animation == null ? 0 : 96 + crate.Animation.Clip.Length * 2L) +
+        NativeVisualAppearanceRules.Estimate(crate.Visuals) + NativeLightRules.Estimate(crate.Lights);
     private static long Estimate(ObjectPose pose) => 232 + pose.Nodes.Length * 8L + pose.Nodes.Sum(Estimate);
     private static long Estimate(NodePose node) => 248 + node.Path.Length * 2L;
 
@@ -210,11 +214,15 @@ public sealed class RollingBuffer
         var result = new ReplayClip { Header = h };
         var crateStates = new Dictionary<CrateFrame, CrateFrame>();
         var crateSets = new Dictionary<CrateFrame[], CrateFrame[]>();
+        var itemRebaser = new ItemAnimationRebaser(start);
         var ropeRebaser = new ReplayTrackRebaser<RopeReplayFrame>(RopeReplayRules.Rebase, start);
-        var effectRebaser = new ReplayTrackRebaser<EffectReplayFrame>(EffectReplayRules.Rebase, start);
+        var effectInitialStates = new EffectReplayInitialStateRebaser(start);
+        var effectRebaser = new ReplayTrackRebaser<EffectReplayFrame>((effect, origin) =>
+            EffectReplayRules.Rebase(effect, origin, effectInitialStates.Apply(effect.InitialState), effectInitialStates.Particles(effect.Particles)), start);
         var audioRebaser = new ReplayTrackRebaser<AudioReplayFrame>(AudioReplayRules.Rebase, start);
         var spawnedRebaser = new ReplayTrackRebaser<SpawnedReplayFrame>(SpawnedReplayRules.Rebase, start);
         var balloonRebaser = new ReplayTrackRebaser<BalloonReplayFrame>(BalloonReplayRules.Rebase, start);
+        var creatureRebaser = new ReplayTrackRebaser<CreatureReplayFrame>(CreatureReplayRules.Rebase, start);
         var actorRebaser = new ActorJointRebaser(start);
         var environmentRebaser = new EnvironmentTimeRebaser(start);
         CrateFrame[] Rebase(CrateFrame[] source)
@@ -234,11 +242,14 @@ public sealed class RollingBuffer
         // not freeze capture or deep-copy 120 seconds of actor data. At most one save may run.
         foreach (var f in items) result.Frames.Add(new ReplayFrame
         {
-            T = f.T - start, Actors = actorRebaser.Apply(f.Actors), World = environmentRebaser.Apply(f.World), Items = f.Items, Crates = Rebase(f.Crates),
+            T = f.T - start, Actors = actorRebaser.Apply(f.Actors), World = environmentRebaser.Apply(f.World), Items = itemRebaser.Apply(f.Items), Crates = Rebase(f.Crates),
+            SceneSampleTimeKnown = f.SceneSampleTimeKnown,
+            SceneSampleTime = f.SceneSampleTimeKnown ? f.SceneSampleTime - start : 0,
             Ropes = ropeRebaser.Apply(f.Ropes), Effects = effectRebaser.Apply(f.Effects), Audio = audioRebaser.Apply(f.Audio),
             Spawned = spawnedRebaser.Apply(f.Spawned),
             Balloons = balloonRebaser.Apply(f.Balloons),
-            Creatures = f.Creatures,
+            Creatures = creatureRebaser.Apply(f.Creatures),
+            Interactions = f.Interactions,
             Events = f.Events.Where(e => e.T >= start).Select(e => new ItemEvent
             {
                 Sequence = e.Sequence, T = e.T - start, Kind = e.Kind, ActorId = e.ActorId,

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using HarmonyLib;
 using Photon.Pun;
 using UnityEngine;
@@ -16,6 +17,11 @@ internal sealed class ItemEventCapture : IDisposable
     private static long sequence;
     private static Action<string>? warn;
     private static bool overflowWarned;
+    private sealed class ItemOwner { public Item? Item; public readonly ItemMotionPacketPolicy Motion = new(); }
+    private static readonly ConditionalWeakTable<Component, ItemOwner> componentItems = new();
+    private sealed class MotionHint { public bool Force; public double Last = double.NegativeInfinity; }
+    private sealed class MotionHints { public readonly ConditionalWeakTable<Item, MotionHint> Items = new(); }
+    private static readonly ConditionalWeakTable<Component, MotionHints> motionHints = new();
     private readonly Harmony harmony = new("cn.mylus.peakreplaylab.items." + Guid.NewGuid().ToString("N"));
     private readonly Action<string>? warning;
     public int HookFailures { get; private set; }
@@ -44,17 +50,40 @@ internal sealed class ItemEventCapture : IDisposable
             Patch(typeof(Item), "Awake", nameof(Lifecycle), postfix: true);
             Patch(typeof(Item), nameof(Item.OnEnable), nameof(Lifecycle), postfix: true);
             Patch(typeof(Item), nameof(Item.OnDisable), nameof(Lifecycle), postfix: true);
-            Patch(typeof(Item), "OnDestroy", nameof(Lifecycle));
+            Patch(typeof(Item), "OnDestroy", nameof(Destroying));
+            // The native optimizer disables Item itself on kinematic ground
+            // objects. Its independent registration callbacks still observe a
+            // parent GameObject being hidden/re-enabled while Item is disabled.
+            Patch(typeof(Peak.ItemOptimizationManager), nameof(Peak.ItemOptimizationManager.RegisterItem), nameof(OptimizerLifecycle), postfix: true);
+            Patch(typeof(Peak.ItemOptimizationManager), nameof(Peak.ItemOptimizationManager.DeregisterItem), nameof(OptimizerLifecycle), postfix: true);
             Patch(typeof(Item), "SetState", nameof(Changed), postfix: true);
             Patch(typeof(Item), nameof(Item.SetItemInstanceDataRPC), nameof(StructureChanged), postfix: true);
             Patch(typeof(Item), nameof(Item.SetCookedAmountRPC), nameof(Changed), postfix: true);
             Patch(typeof(Item), nameof(Item.SetKinematicRPC), nameof(Motion), postfix: true);
+            Patch(typeof(Item), nameof(Item.SetKinematic), nameof(Motion), postfix: true);
+            Patch(typeof(Item), nameof(Item.SetKinematicAndResetSyncData), nameof(Motion), postfix: true);
+            Patch(typeof(Item), "Move", nameof(Motion), postfix: true);
             Patch(typeof(Item), nameof(Item.ApplyForceRPC), nameof(Motion), postfix: true);
-            Patch(typeof(ItemPhysicsSyncer), nameof(ItemPhysicsSyncer.OnDataReceived), nameof(PhysicsPacket), postfix: true);
+            Patch(typeof(ItemPhysicsSyncer), nameof(ItemPhysicsSyncer.OnDataReceived), nameof(PhysicsReceived), postfix: true);
+            Patch(typeof(ItemPhysicsSyncer), nameof(ItemPhysicsSyncer.GetDataToWrite), nameof(PhysicsWritten), postfix: true);
+            // Querying ShouldSendData, resetting interpolation, or requesting
+            // future packets is not an observed movement. The actual immutable
+            // incoming/outgoing packet below supplies the wake-up boundary.
+            Patch(typeof(WindChillZone), "AddWindForceToItem", nameof(WindMotion), postfix: true);
+            Patch(typeof(ItemMoveZone), "OnTriggerStay", nameof(ZoneMotion), postfix: true);
+            Patch(typeof(ItemImpactSFX), "OnCollisionEnter", nameof(ComponentMotion), postfix: true);
+            Patch(typeof(AOE), nameof(AOE.Explode), nameof(AreaMotion), postfix: true);
+            Patch(typeof(ItemCooking), "SyncCookingStateRPC", nameof(ComponentChanged), postfix: true);
+            Patch(typeof(ItemCooking), nameof(ItemCooking.UpdateCookedBehavior), nameof(ComponentChanged), postfix: true);
+            Patch(typeof(ItemParticles), nameof(ItemParticles.EnableSmoke), nameof(ComponentChanged), postfix: true);
+            Patch(typeof(EventOnItemCollision), "TriggerEvent", nameof(ComponentChanged), postfix: true);
+            Patch(typeof(Item), nameof(Item.PutInBackpackRPC), nameof(StructureChanged), postfix: true);
+            Patch(typeof(Item), nameof(Item.SetUseRemainingPercentage), nameof(MetadataChanged), postfix: true);
             Patch(typeof(Player), nameof(Player.AddItem), nameof(InventoryChanged), postfix: true);
             Patch(typeof(Player), nameof(Player.EmptySlot), nameof(InventoryChanged), postfix: true);
             Patch(typeof(Player), nameof(Player.RPCRemoveItemFromSlot), nameof(InventoryChanged), postfix: true);
             Patch(typeof(Player), nameof(Player.RPC_SetInventory), nameof(InventoryChanged), postfix: true);
+            ItemCapture.EventHooksHealthy = HookFailures == 0;
         }
         catch { harmony.UnpatchSelf(); throw; }
     }
@@ -113,22 +142,85 @@ internal sealed class ItemEventCapture : IDisposable
 
     private static void Lifecycle(Item __instance)
     { try { if (!ReplaySafety.Active) ItemCapture.RegistryChanged(__instance); } catch { } }
+    private static void Destroying(Item __instance)
+    { try { if (!ReplaySafety.Active) ItemCapture.Destroying(__instance); } catch { } }
+    private static void OptimizerLifecycle(Item item)
+    { try { if (!ReplaySafety.Active) ItemCapture.RegistryChanged(item); } catch { } }
     private static void Changed(Item __instance)
     { try { if (!ReplaySafety.Active) ItemCapture.MarkDirty(__instance); } catch { } }
+    private static void MetadataChanged(Item __instance)
+    { try { if (!ReplaySafety.Active) ItemCapture.MarkMetadataObservation(__instance); } catch { } }
     private static void StructureChanged(Item __instance)
     { try { if (!ReplaySafety.Active) ItemCapture.MarkDirty(__instance, true); } catch { } }
     private static void Motion(Item __instance)
     { try { if (!ReplaySafety.Active) ItemCapture.MarkMotion(__instance); } catch { } }
-    private static void PhysicsPacket(ItemPhysicsSyncer __instance)
-    { try { if (!ReplaySafety.Active) ItemCapture.MarkMotion(__instance.GetComponent<Item>()); } catch { } }
+    private static void PhysicsReceived(ItemPhysicsSyncer __instance, ItemPhysicsSyncData data) => PhysicsPacket(__instance, data);
+    private static void PhysicsWritten(ItemPhysicsSyncer __instance, ItemPhysicsSyncData __result) => PhysicsPacket(__instance, __result);
+    private static void PhysicsPacket(ItemPhysicsSyncer source, ItemPhysicsSyncData data)
+    {
+        try
+        {
+            if (ReplaySafety.Active) return;
+            var owner = componentItems.GetValue(source, static value => new ItemOwner { Item = value.GetComponent<Item>() });
+            if (owner.Item && owner.Motion.Observe(data.position.x, data.position.y, data.position.z,
+                data.rotation.x, data.rotation.y, data.rotation.z, data.rotation.w,
+                data.linearVelocity.x, data.linearVelocity.y, data.linearVelocity.z,
+                data.angularVelocity.x, data.angularVelocity.y, data.angularVelocity.z)) ItemCapture.MarkMotionObservation(owner.Item!, continuousObservation: true);
+        }
+        catch { }
+    }
+    private static Item? Owner(Component component) => componentItems.GetValue(component,
+        static value => new ItemOwner { Item = value.GetComponent<Item>() }).Item;
+    private static void WindMotion(WindChillZone __instance, Item item)
+    {
+        try
+        {
+            if (ReplaySafety.Active) return;
+            // Exact zeros from the native force formula are not motion. Read
+            // only existing managed fields, with no body/scene probes here.
+            bool force = !(__instance.windForce == 0 || __instance.windItemFactor == 0 ||
+                __instance.useIntensityCurve && __instance.windIntensity <= .5f);
+            SourceMotion(__instance, item, force);
+        }
+        catch { }
+    }
+    private static void SourceMotion(Component source, Item item, bool force)
+    {
+        var directory = motionHints.GetValue(source, static _ => new MotionHints());
+        var signal = directory.Items.GetValue(item, static _ => new MotionHint());
+        double now = Time.timeAsDouble;
+        bool start = force && (!signal.Force || now - signal.Last > .75);
+        signal.Force = force; signal.Last = now;
+        if (!force) return;
+        if (start) ItemCapture.MarkMotion(item);
+        else ItemCapture.MarkMotionObservation(item, continuousObservation: true);
+    }
+    private static void ZoneMotion(ItemMoveZone __instance, Collider other)
+    {
+        try
+        {
+            if (ReplaySafety.Active || !other) return;
+            bool force = __instance.forceMultiplier != 0;
+            if (Item.TryGetItemFromCollider(other, out var item)) SourceMotion(__instance, item, force);
+            else if (other.attachedRigidbody) { item = Owner(other.attachedRigidbody); if (item) SourceMotion(__instance, item!, force); }
+        }
+        catch { }
+    }
+    private static void ComponentMotion(Component __instance)
+    { try { if (!ReplaySafety.Active) { var item = Owner(__instance); if (item) ItemCapture.MarkMotion(item!); } } catch { } }
+    private static void ComponentChanged(Component __instance)
+    { try { if (!ReplaySafety.Active) { var item = Owner(__instance); if (item) ItemCapture.MarkDirty(item!); } } catch { } }
+    private static void AreaMotion(AOE __instance)
+    { try { if (!ReplaySafety.Active && __instance.canLaunchItems) ItemCapture.WakeArea(__instance.transform.position, __instance.range + 1); } catch { } }
     private static void InventoryChanged()
-    { if (!ReplaySafety.Active) ItemCapture.MarkInventoryDirty(); }
+    { try { if (!ReplaySafety.Active) ItemCapture.MarkInventoryDirty(); } catch { } }
 
     private static void Emit(string kind, Item? item, Character? actor = null)
     {
         try
         {
             if (!active || !Gameplay || item == null) return;
+            NativeSpawnOriginCapture.Detach(item.gameObject);
             ItemCapture.MarkDirty(item);
             actor = actor != null ? actor : item.trueHolderCharacter;
             var value = new ItemEvent
@@ -205,6 +297,6 @@ internal sealed class ItemEventCapture : IDisposable
 
     public void Dispose()
     {
-        Activate(false); pending.Clear(); syncedInventory.Clear(); warn = null; harmony.UnpatchSelf();
+        Activate(false); pending.Clear(); syncedInventory.Clear(); warn = null; ItemCapture.EventHooksHealthy = false; harmony.UnpatchSelf();
     }
 }

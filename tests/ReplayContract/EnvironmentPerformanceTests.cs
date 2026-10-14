@@ -7,28 +7,68 @@ internal static class EnvironmentPerformanceTests
 {
     public static void Run(Action<string, Action> test)
     {
-        test("environment discovers a scene once then staggers one family per fallback", () =>
+        test("storm rebuild slices an eight second native warmup into bounded operations", () =>
+        {
+            var cursor = new EnvironmentStormPresentationCursor(); cursor.Rebuild(false, 6, 2, false);
+            double warm = 0, coast = 0; int resets = 0, finished = 0, operations = 0;
+            while (cursor.Pending)
+            {
+                var step = cursor.Take(out float seconds); Check(++operations < 250);
+                Check(seconds >= 0 && seconds <= EnvironmentStormPresentationCursor.MaximumSliceSeconds + 1e-8);
+                if (step == EnvironmentStormPresentationStep.Reset) resets++;
+                if (step == EnvironmentStormPresentationStep.Warm) warm += seconds;
+                if (step == EnvironmentStormPresentationStep.Coast) coast += seconds;
+                if (step == EnvironmentStormPresentationStep.Finish) finished++;
+            }
+            Close(warm, 6); Close(coast, 2); Check(resets == 1 && finished == 1 && !cursor.Emitting);
+        });
+        test("storm latest seek replaces a partially built older target and its queued catchup", () =>
+        {
+            var cursor = new EnvironmentStormPresentationCursor(); cursor.Rebuild(false, 8, 0, true);
+            for (int i = 0; i < 12; i++) cursor.Take(out _);
+            cursor.Advance(3, true); cursor.Rebuild(false, .01, .02, false);
+            Check(cursor.Take(out _) == EnvironmentStormPresentationStep.Reset);
+            Check(cursor.Take(out float warm) == EnvironmentStormPresentationStep.Warm); Close(warm, .01);
+            Check(cursor.Take(out float coast) == EnvironmentStormPresentationStep.Coast); Close(coast, .02);
+            Check(cursor.Take(out _) == EnvironmentStormPresentationStep.Finish && !cursor.Pending);
+        });
+        test("paused storm presentation completes without advancing the replay clock", () =>
+        {
+            var cursor = new EnvironmentStormPresentationCursor(); cursor.Rebuild(false, .1, 0, true);
+            int operations = 0; while (cursor.Pending) { cursor.Take(out _); Check(++operations <= 6); }
+            Check(cursor.Emitting && cursor.Take(out _) == EnvironmentStormPresentationStep.None);
+            cursor.Advance(.075, false); double elapsed = 0;
+            while (cursor.Pending)
+                if (cursor.Take(out float slice) == EnvironmentStormPresentationStep.Advance) elapsed += slice;
+            Close(elapsed, .075); Check(!cursor.Emitting);
+            cursor.Rebuild(true, 8, 8, true);
+            Check(cursor.Take(out _) == EnvironmentStormPresentationStep.Clear && !cursor.Pending);
+            cursor.Rebuild(false, 8, 0, true); cursor.Cancel(); Check(!cursor.Pending);
+        });
+        test("environment discovers a scene once without periodic scans during a long recording", () =>
         {
             var schedule = new EnvironmentDiscoverySchedule();
             Check(schedule.Take(1, 0, EnvironmentDirectory.None) == EnvironmentDirectory.All);
             Check(schedule.Take(1, .1, EnvironmentDirectory.None) == EnvironmentDirectory.None);
-            foreach (var pair in new[] { (2.5, EnvironmentDirectory.Winds), (5d, EnvironmentDirectory.RisingLava), (7.5, EnvironmentDirectory.MovingLava), (10d, EnvironmentDirectory.Fog) })
-                Check(schedule.Take(1, pair.Item1, EnvironmentDirectory.None) == pair.Item2);
+            for (int frame = 1; frame <= 60 * 60 * 60; frame++)
+                Check(schedule.Take(1, frame / 60d, EnvironmentDirectory.None) == EnvironmentDirectory.None);
             Check(schedule.Take(2, 10.1, EnvironmentDirectory.None) == EnvironmentDirectory.All);
         });
-        test("environment source invalidation is immediate without restarting the directory scan cycle", () =>
+        test("environment lifecycle changes coalesce and destruction invalidation is immediate", () =>
         {
             var schedule = new EnvironmentDiscoverySchedule(); schedule.Take(1, 0, EnvironmentDirectory.None);
             Check(schedule.Take(1, .02, EnvironmentDirectory.Fog) == EnvironmentDirectory.Fog);
             Check(schedule.Take(1, .04, EnvironmentDirectory.None) == EnvironmentDirectory.None);
-            Check(schedule.Take(1, 2.5, EnvironmentDirectory.None) == EnvironmentDirectory.Winds);
+            schedule.Changed(EnvironmentDirectory.Winds); schedule.Changed(EnvironmentDirectory.Fog); schedule.Changed(EnvironmentDirectory.Winds);
+            Check(schedule.Take(1, .05, EnvironmentDirectory.None) == (EnvironmentDirectory.Winds | EnvironmentDirectory.Fog));
+            Check(schedule.Take(1, 2.5, EnvironmentDirectory.None) == EnvironmentDirectory.None);
         });
         test("environment directory clock rewind and stalls never trigger catch-up scan bursts", () =>
         {
             var schedule = new EnvironmentDiscoverySchedule(); schedule.Take(1, 100, EnvironmentDirectory.None);
             Check(schedule.Take(1, 1, EnvironmentDirectory.None) == EnvironmentDirectory.None);
-            Check(schedule.Take(1, 3.5, EnvironmentDirectory.None) == EnvironmentDirectory.Winds);
-            Check(schedule.Take(1, 1000, EnvironmentDirectory.None) == EnvironmentDirectory.RisingLava);
+            Check(schedule.Take(1, 3.5, EnvironmentDirectory.None) == EnvironmentDirectory.None);
+            Check(schedule.Take(1, 1000, EnvironmentDirectory.None) == EnvironmentDirectory.None);
             Check(schedule.Take(1, 1000.01, EnvironmentDirectory.None) == EnvironmentDirectory.None);
         });
         test("environment numeric capture stays twenty Hz while a discrete event captures immediately", () =>

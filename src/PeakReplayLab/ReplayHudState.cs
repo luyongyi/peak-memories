@@ -56,21 +56,31 @@ public sealed class ReplayHudState
     // during a paused seek. Native status values and stamina interpolate only
     // between two complete snapshots from the same continuous actor interval.
     public static ReplayHudState? Interpolate(ReplayHudState? left, ReplayHudState? right, float mix)
+        => InterpolateCore(left, right, mix, null);
+
+    // This buffer belongs to the live presentation, never to a recorded frame.
+    // Reusing it avoids allocating a state and its status array every render tick.
+    internal static ReplayHudState? InterpolateForPresentation(ReplayHudState? left, ReplayHudState? right, float mix, ReplayHudState buffer)
+        => InterpolateCore(left, right, mix, buffer);
+
+    private static ReplayHudState? InterpolateCore(ReplayHudState? left, ReplayHudState? right, float mix, ReplayHudState? buffer)
     {
         if (!ReplayRules.Finite(mix)) throw new ArgumentOutOfRangeException(nameof(mix));
         if (mix <= 0) return left;
         if (mix >= 1) return right;
         if (left == null || right == null || ReferenceEquals(left, right)) return left;
-        var statuses = new float[StatusCount];
-        for (int i = 0; i < statuses.Length; i++) statuses[i] = Lerp(left.Afflictions[i], right.Afflictions[i], mix);
-        return new ReplayHudState(statuses)
-        {
-            Stamina = Lerp(left.Stamina, right.Stamina, mix), MaxStamina = Lerp(left.MaxStamina, right.MaxStamina, mix),
-            ExtraStamina = Lerp(left.ExtraStamina, right.ExtraStamina, mix),
-            Petrify = Lerp(left.Petrify, right.Petrify, mix), Invincible = left.Invincible,
-            CanGetHungry = left.CanGetHungry, Rainbow = left.Rainbow,
-            MoraleKnown = left.MoraleKnown, MoraleBoost = left.MoraleBoost,
-        };
+        var result = buffer ?? new ReplayHudState();
+        if (ReferenceEquals(result, left) || ReferenceEquals(result, right) ||
+            ReferenceEquals(result.Afflictions, left.Afflictions) || ReferenceEquals(result.Afflictions, right.Afflictions) ||
+            result.Afflictions.Length != StatusCount)
+            throw new ArgumentException("Presentation HUD storage must be independent of recorded frames.", nameof(buffer));
+        for (int i = 0; i < StatusCount; i++) result.Afflictions[i] = Lerp(left.Afflictions[i], right.Afflictions[i], mix);
+        result.Stamina = Lerp(left.Stamina, right.Stamina, mix); result.MaxStamina = Lerp(left.MaxStamina, right.MaxStamina, mix);
+        result.ExtraStamina = Lerp(left.ExtraStamina, right.ExtraStamina, mix);
+        result.Petrify = Lerp(left.Petrify, right.Petrify, mix); result.Invincible = left.Invincible;
+        result.CanGetHungry = left.CanGetHungry; result.Rainbow = left.Rainbow;
+        result.MoraleKnown = left.MoraleKnown; result.MoraleBoost = left.MoraleBoost;
+        return result;
     }
 
     private static float Lerp(float left, float right, float mix) => left + (right - left) * mix;

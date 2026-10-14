@@ -8,9 +8,9 @@ using Newtonsoft.Json.Linq;
 
 namespace PeakReplayLab;
 
-// Schemas 10–14 are storage codecs, not simulation. All work
+// Schemas 10–25 are storage codecs, not simulation. All work
 // happens on the save/read worker. Expanded frames remain immutable seek points.
-internal static class ReplayDeltaCodec
+internal static partial class ReplayDeltaCodec
 {
     private static readonly Dictionary<Type, PropertyInfo[]> properties = new()
     {
@@ -31,6 +31,7 @@ internal static class ReplayDeltaCodec
         [typeof(EnvironmentLavaFrame)] = Fields<EnvironmentLavaFrame>(),
         [typeof(EnvironmentFogFrame)] = Fields<EnvironmentFogFrame>(),
         [typeof(CreatureReplayFrame)] = Fields<CreatureReplayFrame>(),
+        [typeof(CreatureIdleAnimation)] = Fields<CreatureIdleAnimation>(),
         [typeof(CreatureReplayLine)] = Fields<CreatureReplayLine>(),
         [typeof(WebWrapReplayFrame)] = Fields<WebWrapReplayFrame>(),
         [typeof(WebWrapReplayPart)] = Fields<WebWrapReplayPart>(),
@@ -38,10 +39,33 @@ internal static class ReplayDeltaCodec
         [typeof(NativeMaterialFrame)] = Fields<NativeMaterialFrame>(),
         [typeof(NativeShaderPropertyFrame)] = Fields<NativeShaderPropertyFrame>(),
         [typeof(NativeLightFrame)] = Fields<NativeLightFrame>(),
+        [typeof(EffectParticleFrame)] = Fields<EffectParticleFrame>(),
+        [typeof(EffectParticleCheckpoint)] = Fields<EffectParticleCheckpoint>(),
+        [typeof(EffectForceFieldFrame)] = Fields<EffectForceFieldFrame>(),
+        [typeof(EffectReplayInitialState)] = Fields<EffectReplayInitialState>(),
+        [typeof(InteractionReplayFrame)] = Fields<InteractionReplayFrame>(),
+        [typeof(InteractionLineFrame)] = Fields<InteractionLineFrame>(),
+        [typeof(InteractionTextFrame)] = Fields<InteractionTextFrame>(),
     };
+    private static readonly Dictionary<Type, HashSet<string>> propertyNames = properties.ToDictionary(
+        pair => pair.Key, pair => new HashSet<string>(pair.Value.Select(p => p.Name), StringComparer.Ordinal));
     private static PropertyInfo[] Fields<T>() => typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
         .Where(p => p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0).ToArray();
     private static bool SchemaField(Type type, string field, int schema) =>
+        (schema >= 25 || !((type == typeof(CreatureReplayFrame) || type == typeof(ItemFrame)) && field == nameof(CreatureReplayFrame.SampleDiscontinuity))) &&
+        (schema >= 25 || !(type == typeof(CreatureIdleAnimation) && (field == nameof(CreatureIdleAnimation.SpinRotation) || field == nameof(CreatureIdleAnimation.SpinSpeed)))) &&
+        (schema >= 25 || !(type == typeof(ItemFrame) && (field == nameof(ItemFrame.SampleTimeKnown) || field == nameof(ItemFrame.SampleTime) || field == nameof(ItemFrame.ClockMode)))) &&
+        (schema >= 24 || !(type == typeof(ItemFrame) && field == nameof(ItemFrame.IdleAnimation))) &&
+        (schema >= 23 || !(type == typeof(EffectParticleFrame) && field == nameof(EffectParticleFrame.Checkpoint))) &&
+        (schema >= 22 || !(type == typeof(EffectReplayFrame) && field == nameof(EffectReplayFrame.InitialState))) &&
+        (schema >= 21 || !(type == typeof(CreatureReplayFrame) && field == nameof(CreatureReplayFrame.IdleAnimation))) &&
+        (schema >= 20 || !(type == typeof(CreatureReplayFrame) && (field == nameof(CreatureReplayFrame.SampleTimeKnown) || field == nameof(CreatureReplayFrame.SampleTime) || field == nameof(CreatureReplayFrame.ClockMode)))) &&
+        (schema >= 19 || !(type == typeof(RopeReplayFrame) && (field == nameof(RopeReplayFrame.SampleTimeKnown) || field == nameof(RopeReplayFrame.SampleTime)))) &&
+        (schema >= 18 || !(type == typeof(NativeShaderPropertyFrame) && field == nameof(NativeShaderPropertyFrame.ColorEncoding))) &&
+        (schema >= 15 || !(type == typeof(NativeRendererFrame) && field == nameof(NativeRendererFrame.BlendShapes) ||
+          type == typeof(CrateFrame) && (field == nameof(CrateFrame.Visuals) || field == nameof(CrateFrame.Lights)) ||
+          type == typeof(EffectReplayFrame) && (field == nameof(EffectReplayFrame.Particles) || field == nameof(EffectReplayFrame.ForceField)) ||
+          type == typeof(RopeReplayFrame) && (field == nameof(RopeReplayFrame.SceneVine) || field == nameof(RopeReplayFrame.BreakAmount)))) &&
         (schema >= 14 || !(type == typeof(ActorFrame) && field == nameof(ActorFrame.RouteState))) &&
         (schema >= 13 || !(type == typeof(EnvironmentReplayFrame) && (field == nameof(EnvironmentReplayFrame.SampleTimeKnown) || field == nameof(EnvironmentReplayFrame.SampleTime)))) &&
         (schema != 10 || !(type == typeof(ActorFrame) && field == nameof(ActorFrame.HudState) ||
@@ -49,9 +73,71 @@ internal static class ReplayDeltaCodec
         (schema >= 12 || !(type == typeof(WorldFrame) && field == nameof(WorldFrame.Environment) ||
           type == typeof(ActorFrame) && field == nameof(ActorFrame.WebWrap) || (type == typeof(ItemFrame) || type == typeof(SpawnedReplayFrame)) && (field == "Visuals" || field == "Lights")));
 
+    // Zero retains the older color representation and is deliberately omitted
+    // from JSON. Every other admitted baseline field remains mandatory.
+    private static bool OptionalBaselineField(Type type, string field) =>
+        (type == typeof(CreatureReplayFrame) || type == typeof(ItemFrame)) && field == nameof(CreatureReplayFrame.SampleDiscontinuity) ||
+        type == typeof(CreatureIdleAnimation) && (field == nameof(CreatureIdleAnimation.SpinRotation) || field == nameof(CreatureIdleAnimation.SpinSpeed)) ||
+        type == typeof(ItemFrame) && (field == nameof(ItemFrame.SampleTimeKnown) || field == nameof(ItemFrame.SampleTime) || field == nameof(ItemFrame.ClockMode)) ||
+        type == typeof(ItemFrame) && field == nameof(ItemFrame.IdleAnimation) ||
+        type == typeof(EffectParticleFrame) && field == nameof(EffectParticleFrame.Checkpoint) ||
+        type == typeof(EffectReplayFrame) && field == nameof(EffectReplayFrame.InitialState) ||
+        type == typeof(EffectReplayInitialState) && (field == nameof(EffectReplayInitialState.Ended) || field == nameof(EffectReplayInitialState.EndTime)) ||
+        type == typeof(CreatureReplayFrame) && field == nameof(CreatureReplayFrame.IdleAnimation) ||
+        type == typeof(CreatureReplayFrame) && (field == nameof(CreatureReplayFrame.ClockMode) ||
+            field == nameof(CreatureReplayFrame.SampleTimeKnown) || field == nameof(CreatureReplayFrame.SampleTime)) ||
+        type == typeof(NativeShaderPropertyFrame) && field == nameof(NativeShaderPropertyFrame.ColorEncoding);
+
+    private static void ValidateCreatureClockBaseline(bool knownSeen, bool timeSeen, bool modeSeen, bool discontinuitySeen = false)
+    {
+        // A completely absent clock is the legacy/static default. If supplied,
+        // its knowledge and time must be complete even when the time is zero.
+        if ((knownSeen || timeSeen || modeSeen || discontinuitySeen) && (!knownSeen || !timeSeen))
+            throw Error("Incomplete creature observation clock.");
+    }
+
+    private static void ValidateColorEncoding(object value)
+    {
+        if (value is NativeShaderPropertyFrame property && property.ColorEncoding != 0 &&
+            (property.ColorEncoding != 1 || property.Kind != 1))
+            throw Error("Invalid native color encoding.");
+    }
+
     private static bool NullableSnapshot(Type type) => type == typeof(ReplayHudState) ||
+        type == typeof(EffectParticleCheckpoint) ||
+        type == typeof(EffectReplayInitialState) ||
+        type == typeof(CreatureIdleAnimation) ||
+        type == typeof(EffectForceFieldFrame) || type == typeof(InteractionLineFrame) || type == typeof(InteractionTextFrame) ||
         type == typeof(ActorRouteState) ||
         type == typeof(EnvironmentReplayFrame) || type == typeof(EnvironmentFogFrame) || type == typeof(WebWrapReplayFrame) || type == typeof(CreatureReplayLine);
+
+    private static bool NullableField(Type owner, string field) =>
+        owner == typeof(CreatureIdleAnimation) && field == nameof(CreatureIdleAnimation.SpinRotation) ||
+        owner == typeof(InteractionReplayFrame) && (field == nameof(InteractionReplayFrame.PostWeights) || field == nameof(InteractionReplayFrame.PostEnabled)) ||
+        owner == typeof(EffectParticleFrame) && (field == nameof(EffectParticleFrame.SimulationSpace) || field == nameof(EffectParticleFrame.MeshShapeSpace)) ||
+        (owner == typeof(EffectReplayFrame) || owner == typeof(EffectReplayInitialState)) && field == nameof(EffectReplayFrame.Particles) ||
+        owner == typeof(NativeRendererFrame) && field == nameof(NativeRendererFrame.BlendShapes) ||
+        (owner == typeof(ItemFrame) || owner == typeof(CrateFrame) || owner == typeof(CreatureReplayFrame) || owner == typeof(SpawnedReplayFrame) || owner == typeof(InteractionReplayFrame)) &&
+        (field == "Visuals" || field == "Lights");
+
+    private static int FloatArrayLimit(Type owner, string field) =>
+        owner == typeof(InteractionReplayFrame) && field == nameof(InteractionReplayFrame.PostWeights) ? 2 :
+        owner == typeof(NativeRendererFrame) && field == nameof(NativeRendererFrame.BlendShapes) ? NativeVisualAppearanceRules.MaximumBlendShapes :
+        owner == typeof(EffectParticleFrame) && field == nameof(EffectParticleFrame.Colors) ? 8 :
+        owner == typeof(EffectParticleFrame) && field == nameof(EffectParticleFrame.Parameters) ? EffectReplayRules.ParticleParameterCount :
+        owner == typeof(InteractionLineFrame) && field == nameof(InteractionLineFrame.Points) ? InteractionReplayRules.MaximumLinePoints * 3 :
+        owner == typeof(InteractionLineFrame) && field == nameof(InteractionLineFrame.Widths) ? InteractionReplayRules.MaximumLinePoints : 0;
+
+    private static int ByteArrayLimit(Type owner, string field) =>
+        owner == typeof(EffectParticleCheckpoint) && field == nameof(EffectParticleCheckpoint.State) ? EffectParticleCheckpointRules.MaximumStateBytes :
+        owner == typeof(EffectParticleCheckpoint) && field == nameof(EffectParticleCheckpoint.Data) ? EffectParticleCheckpointRules.MaximumDataBytes : 0;
+    private static byte[] Binary(string value, int maximum, bool particleData = false)
+    {
+        if (particleData) return EffectParticleCheckpointCodec.Decode(value);
+        if (maximum <= 0 || value.Length > ((maximum + 2L) / 3) * 4) throw Error("Oversized particle checkpoint bytes.");
+        try { var bytes = Convert.FromBase64String(value); return bytes.Length <= maximum ? bytes : throw Error("Oversized particle checkpoint bytes."); }
+        catch (FormatException e) { throw new InvalidDataException("Invalid particle checkpoint encoding.", e); }
+    }
 
     // Values are compared directly, never by serializing JSON. Shared capture
     // arrays exit immediately; non-joint world tracks keep lossless deltas.
@@ -59,6 +145,8 @@ internal static class ReplayDeltaCodec
     {
         if (ReferenceEquals(a, b)) return true;
         if (a == null || b == null || a.GetType() != b.GetType()) return false;
+        // Object-node deltas preserve recorded float bits, including signed zero.
+        if (a is float af && b is float bf) return BitConverter.SingleToInt32Bits(af) == BitConverter.SingleToInt32Bits(bf);
         if (a is Array aa && b is Array bb)
         {
             if (aa.Length != bb.Length) return false;
@@ -73,6 +161,15 @@ internal static class ReplayDeltaCodec
         return a.Equals(b);
     }
 
+    // Page boundaries decode a fresh full baseline, so equal observations can
+    // have different array references. Held capture frames take only the fast
+    // reference exits; the worker compares values only for independent copies.
+    internal static bool SameScene(ReplayFrame a, ReplayFrame b) =>
+        Same(a.World, b.World) && Same(a.Items, b.Items) && Same(a.Crates, b.Crates) &&
+        Same(a.Ropes, b.Ropes) && Same(a.Effects, b.Effects) && Same(a.Audio, b.Audio) &&
+        Same(a.Spawned, b.Spawned) && Same(a.Balloons, b.Balloons) &&
+        Same(a.Creatures, b.Creatures) && Same(a.Interactions, b.Interactions);
+
     private static Dictionary<string, object?> Patch(object current, object? previous, string? identity = null, int schema = ReplayRules.CurrentSchema)
     {
         var result = new Dictionary<string, object?>(StringComparer.Ordinal);
@@ -85,6 +182,25 @@ internal static class ReplayDeltaCodec
         {
             if (field.Name == identity) continue;
             if (!SchemaField(current.GetType(), field.Name, schema)) continue;
+            if (previous == null && field.Name == nameof(CreatureReplayFrame.SampleDiscontinuity) &&
+                (current is CreatureReplayFrame boundaryCreature && !boundaryCreature.SampleDiscontinuity ||
+                 current is ItemFrame boundaryItem && !boundaryItem.SampleDiscontinuity)) continue;
+            if (previous == null && current is CreatureIdleAnimation animation &&
+                (field.Name == nameof(CreatureIdleAnimation.SpinRotation) && animation.SpinRotation == null ||
+                 field.Name == nameof(CreatureIdleAnimation.SpinSpeed) && animation.SpinSpeed == 0)) continue;
+            if (previous == null && current is ItemFrame observedItem &&
+                (field.Name == nameof(ItemFrame.SampleTimeKnown) || field.Name == nameof(ItemFrame.SampleTime) || field.Name == nameof(ItemFrame.ClockMode)) &&
+                !observedItem.SampleTimeKnown && observedItem.SampleTime == 0 && observedItem.ClockMode == CreatureReplayRules.ActiveClock) continue;
+            if (previous == null && current is ItemFrame && field.Name == nameof(ItemFrame.ClockMode) &&
+                ((ItemFrame)current).ClockMode == CreatureReplayRules.ActiveClock) continue;
+            if (previous == null && current is ItemFrame idleItem && field.Name == nameof(ItemFrame.IdleAnimation) && idleItem.IdleAnimation == null) continue;
+            if (previous == null && current is CreatureReplayFrame idleCreature && field.Name == nameof(CreatureReplayFrame.IdleAnimation) && idleCreature.IdleAnimation == null) continue;
+            if (previous == null && current is EffectReplayFrame initialEffect && field.Name == nameof(EffectReplayFrame.InitialState) && initialEffect.InitialState == null) continue;
+            if (previous == null && current is CreatureReplayFrame creature &&
+                (field.Name == nameof(CreatureReplayFrame.SampleTimeKnown) || field.Name == nameof(CreatureReplayFrame.SampleTime) || field.Name == nameof(CreatureReplayFrame.ClockMode)) &&
+                !creature.SampleTimeKnown && creature.SampleTime == 0 && creature.ClockMode == CreatureReplayRules.ActiveClock) continue;
+            if (previous == null && current is CreatureReplayFrame && field.Name == nameof(CreatureReplayFrame.ClockMode) &&
+                ((CreatureReplayFrame)current).ClockMode == CreatureReplayRules.ActiveClock) continue;
             object? value = field.GetValue(current), old = previous == null ? null : field.GetValue(previous);
             // SampleTime is deliberately a non-JSON field. Handle joints before
             // the reflection comparator so stationary resamples remain visible.
@@ -92,13 +208,26 @@ internal static class ReplayDeltaCodec
             {
                 var joints = (NodePose[])value!; var priorJoints = old as NodePose[];
                 if (priorJoints == null || !ActorJointCodec.Same(joints, priorJoints))
-                    result.Add(field.Name, ActorJointCodec.Encode(joints, priorJoints));
+                    result.Add(field.Name, ActorJointCodec.Encode(joints, priorJoints, schema));
                 continue;
             }
             if (previous != null && Same(value, old)) continue;
+            if (current is EffectParticleCheckpoint checkpoint && field.Name == nameof(EffectParticleCheckpoint.Data))
+            { result.Add(field.Name, EffectParticleCheckpointCodec.Encode(checkpoint.Data, checkpoint.Count)); continue; }
+            if (schema >= 16 && current is ObjectPose && field.Name == nameof(ObjectPose.Nodes) &&
+                value is NodePose[] nodes && old is NodePose[] previousNodes)
+            {
+                result.Add(field.Name, NodeDelta(nodes, previousNodes));
+                continue;
+            }
             if (schema == 10 && value is InventoryFrame[] inventory)
             {
                 result.Add(field.Name, inventory.Select(item => Patch(item, null, schema: schema)).ToArray());
+                continue;
+            }
+            if (schema < 15 && value is NativeRendererFrame[] renderers)
+            {
+                result.Add(field.Name, renderers.Select(renderer => Patch(renderer, null, schema: schema)).ToArray());
                 continue;
             }
             result.Add(field.Name, (field.PropertyType == typeof(ObjectPose) || NullableSnapshot(field.PropertyType)) && value != null
@@ -189,6 +318,7 @@ internal static class ReplayDeltaCodec
     internal sealed class Writer
     {
         private readonly int schema;
+        private readonly ReplayRules.VersionValidationMemo versionMemo = new();
         public Writer(int schema = ReplayRules.CurrentSchema)
         { if (!ReplayRules.SupportedSchema(schema)) throw new ArgumentOutOfRangeException(nameof(schema)); this.schema = schema; }
         private readonly WriteSet<ActorFrame> actors = new(a => a.Id, nameof(ActorFrame.Id));
@@ -199,11 +329,12 @@ internal static class ReplayDeltaCodec
         private readonly WriteSet<AudioReplayFrame> audio = new(a => a.Key, nameof(AudioReplayFrame.Key));
         private readonly WriteSet<SpawnedReplayFrame> spawned = new(a => a.Key, nameof(SpawnedReplayFrame.Key));
         private readonly WriteSet<CreatureReplayFrame> creatures = new(a => a.Key, nameof(CreatureReplayFrame.Key));
+        private readonly WriteSet<InteractionReplayFrame> interactions = new(a => a.Key, nameof(InteractionReplayFrame.Key));
         private readonly WriteSet<BalloonReplayFrame> balloons = new(a => a.Key, nameof(BalloonReplayFrame.Key));
         private WorldFrame? world;
         public object Encode(ReplayFrame frame)
         {
-            ReplayRules.ValidateVersion(frame, schema);
+            ReplayRules.ValidateVersion(frame, schema, versionMemo);
             var a = actors.Encode(frame.Actors, schema); var i = items.Encode(frame.Items, schema); var c = crates.Encode(frame.Crates, schema);
             var record = new Dictionary<string, object?>(StringComparer.Ordinal)
             {
@@ -212,6 +343,11 @@ internal static class ReplayDeltaCodec
                 ["Crates"] = c.Updates, ["RemovedActors"] = a.Removed, ["RemovedItems"] = i.Removed,
                 ["RemovedCrates"] = c.Removed, ["Events"] = frame.Events,
             };
+            if (schema >= 22)
+            {
+                record.Add(nameof(ReplayFrame.SceneSampleTimeKnown), frame.SceneSampleTimeKnown);
+                record.Add(nameof(ReplayFrame.SceneSampleTime), frame.SceneSampleTime);
+            }
             if (a.Order != null) record.Add("ActorOrder", a.Order);
             if (i.Order != null) record.Add("ItemOrder", i.Order);
             if (c.Order != null) record.Add("CrateOrder", c.Order);
@@ -239,6 +375,12 @@ internal static class ReplayDeltaCodec
                 var n = creatures.Encode(frame.Creatures, schema);
                 record.Add("Creatures", n.Updates); record.Add("RemovedCreatures", n.Removed);
                 if (n.Order != null) record.Add("CreatureOrder", n.Order);
+            }
+            if (schema >= 15)
+            {
+                var n = interactions.Encode(frame.Interactions, schema);
+                record.Add("Interactions", n.Updates); record.Add("RemovedInteractions", n.Removed);
+                if (n.Order != null) record.Add("InteractionOrder", n.Order);
             }
             world = frame.World; return record;
         }
@@ -305,6 +447,7 @@ internal static class ReplayDeltaCodec
     internal sealed class Reader
     {
         private readonly int schema;
+        private readonly ReplayRules.VersionValidationMemo versionMemo = new();
         public Reader(int schema = ReplayRules.CurrentSchema)
         { if (!ReplayRules.SupportedSchema(schema)) throw new ArgumentOutOfRangeException(nameof(schema)); this.schema = schema; }
         private readonly ReadSet<ActorFrame> actors = new(a => a.Id, nameof(ActorFrame.Id), null, 256);
@@ -316,6 +459,7 @@ internal static class ReplayDeltaCodec
         private readonly ReadSet<SpawnedReplayFrame> spawned = new(a => a.Key, nameof(SpawnedReplayFrame.Key), ReplayRules.MaxSpawned, 256);
         private readonly ReadSet<BalloonReplayFrame> balloons = new(a => a.Key, nameof(BalloonReplayFrame.Key), ReplayRules.MaxBalloons, 256);
         private readonly ReadSet<CreatureReplayFrame> creatures = new(a => a.Key, nameof(CreatureReplayFrame.Key), ReplayRules.MaxCreatures, 256);
+        private readonly ReadSet<InteractionReplayFrame> interactions = new(a => a.Key, nameof(InteractionReplayFrame.Key), ReplayRules.MaxInteractions, 256);
         private WorldFrame? world;
         private static readonly HashSet<string> recordFields = new(StringComparer.Ordinal)
         { "Type", "T", "ObjectsFull", "World", "Actors", "Items", "Crates", "RemovedActors", "RemovedItems", "RemovedCrates", "Events", "ActorOrder", "ItemOrder", "CrateOrder" };
@@ -327,12 +471,14 @@ internal static class ReplayDeltaCodec
         { "Balloons", "RemovedBalloons", "BalloonOrder" };
         private static readonly HashSet<string> creatureFields = new(StringComparer.Ordinal)
         { "Creatures", "RemovedCreatures", "CreatureOrder" };
+        private static readonly HashSet<string> interactionFields = new(StringComparer.Ordinal) { "Interactions", "RemovedInteractions", "InteractionOrder" };
+        internal static bool AllowsField(string name, int schema) => recordFields.Contains(name) || presentationFields.Contains(name) ||
+            spawnedFields.Contains(name) || attachmentFields.Contains(name) || schema >= 12 && creatureFields.Contains(name) || schema >= 15 && interactionFields.Contains(name) ||
+            schema >= 22 && (name == nameof(ReplayFrame.SceneSampleTimeKnown) || name == nameof(ReplayFrame.SceneSampleTime));
         public ReplayFrame Decode(JObject token)
         {
             foreach (var field in token.Properties())
-                if (!recordFields.Contains(field.Name) && !presentationFields.Contains(field.Name) &&
-                    !spawnedFields.Contains(field.Name) && !attachmentFields.Contains(field.Name) &&
-                    !(schema >= 12 && creatureFields.Contains(field.Name))) throw Error("Unknown frame field.");
+                if (!AllowsField(field.Name, schema)) throw Error("Unknown frame field.");
             if (token["Type"]?.Type != JTokenType.String || (string?)token["Type"] != "frame") throw Error("Invalid frame type.");
             bool full = Bool(token["ObjectsFull"]);
             if (world == null && !full) throw Error("First frame requires a complete baseline.");
@@ -341,6 +487,8 @@ internal static class ReplayDeltaCodec
             var frame = new ReplayFrame
             {
                 T = (double)Value(token["T"], typeof(double))!, World = world,
+                SceneSampleTimeKnown = schema >= 22 && Bool(token[nameof(ReplayFrame.SceneSampleTimeKnown)]),
+                SceneSampleTime = schema >= 22 ? (double)Value(token[nameof(ReplayFrame.SceneSampleTime)], typeof(double))! : 0,
                 Actors = actors.Decode(token["Actors"], token["RemovedActors"], token["ActorOrder"], full, schema),
                 Items = items.Decode(token["Items"], token["RemovedItems"], token["ItemOrder"], full, schema),
                 Crates = crates.Decode(token["Crates"], token["RemovedCrates"], token["CrateOrder"], full, schema),
@@ -351,20 +499,63 @@ internal static class ReplayDeltaCodec
                 Spawned = spawned.Decode(token["Spawned"], token["RemovedSpawned"], token["SpawnedOrder"], full, schema),
                 Balloons = balloons.Decode(token["Balloons"], token["RemovedBalloons"], token["BalloonOrder"], full, schema),
                 Creatures = schema >= 12 ? creatures.Decode(token["Creatures"], token["RemovedCreatures"], token["CreatureOrder"], full, schema) : Array.Empty<CreatureReplayFrame>(),
+                Interactions = schema >= 15 ? interactions.Decode(token["Interactions"], token["RemovedInteractions"], token["InteractionOrder"], full, schema) : Array.Empty<InteractionReplayFrame>(),
             };
-            ReplayRules.ValidateVersion(frame, schema);
+            ReplayRules.ValidateVersion(frame, schema, versionMemo);
             return frame;
         }
     }
 
-    private static object Apply(JObject patch, object? old, Type type, string? identity = null, int schema = ReplayRules.CurrentSchema)
+    // Optional particle-history reads keep the exact same delta identity/order
+    // rules while never expanding unrelated scene state from a legacy page.
+    internal sealed class EffectReader
+    {
+        private readonly int schema;
+        private readonly ReadSet<EffectReplayFrame> effects = new(a => a.Key, nameof(EffectReplayFrame.Key), ReplayRules.MaxEffects, 256);
+        private bool[]? mapObjects;
+        private int segment;
+        public EffectReader(int schema) { this.schema = schema; }
+        internal static bool AllowsWorldField(string name, int schema) =>
+            SchemaField(typeof(WorldFrame), name, schema) && propertyNames[typeof(WorldFrame)].Contains(name);
+        public ReplayFrame Decode(JObject token)
+        {
+            foreach (var field in token.Properties()) if (!Reader.AllowsField(field.Name, schema)) throw Error("Unknown frame field.");
+            if (token["Type"]?.Type != JTokenType.String || (string?)token["Type"] != "frame") throw Error("Invalid frame type.");
+            bool full = Bool(token["ObjectsFull"]);
+            if (mapObjects == null && !full) throw Error("First frame requires a complete baseline.");
+            var world = token["World"] as JObject ?? throw Error("Missing world patch.");
+            if (world.TryGetValue(nameof(WorldFrame.ActiveMapObjects), out var objects)) mapObjects = (bool[])Value(objects, typeof(bool[]))!;
+            else if (full || mapObjects == null) throw Error("Incomplete baseline: WorldFrame.ActiveMapObjects");
+            if (world.TryGetValue(nameof(WorldFrame.Segment), out var nextSegment)) segment = (int)Value(nextSegment, typeof(int))!;
+            else if (full) segment = 0;
+            return new ReplayFrame
+            {
+                T = (double)Value(token["T"], typeof(double))!, World = new WorldFrame { Segment = segment, ActiveMapObjects = mapObjects! },
+                SceneSampleTimeKnown = schema >= 22 && Bool(token[nameof(ReplayFrame.SceneSampleTimeKnown)]),
+                SceneSampleTime = schema >= 22 ? (double)Value(token[nameof(ReplayFrame.SceneSampleTime)], typeof(double))! : 0,
+                Effects = effects.Decode(token["Effects"], token["RemovedEffects"], token["EffectOrder"], full, schema),
+            };
+        }
+    }
+
+    private static object Apply(JObject patch, object? old, Type type, string? identity = null, int schema = ReplayRules.CurrentSchema,
+        int maximumLinePoints = CreatureReplayRules.MaximumLinePoints)
     {
         PropertyInfo[] fields = properties[type];
+        var names = propertyNames[type];
         foreach (var field in patch.Properties())
             if (!SchemaField(type, field.Name, schema) ||
-                (!(identity != null && field.Name == "Full") && !fields.Any(p => p.Name == field.Name)))
+                (!(identity != null && field.Name == "Full") && !names.Contains(field.Name)))
                 throw Error("Unknown delta field: " + field.Name);
         if (old != null && patch.Count == 0) return old;
+        if (old == null && schema >= 20 && type == typeof(CreatureReplayFrame))
+            ValidateCreatureClockBaseline(patch.Property(nameof(CreatureReplayFrame.SampleTimeKnown)) != null,
+                patch.Property(nameof(CreatureReplayFrame.SampleTime)) != null, patch.Property(nameof(CreatureReplayFrame.ClockMode)) != null,
+                patch.Property(nameof(CreatureReplayFrame.SampleDiscontinuity)) != null);
+        if (old == null && schema >= 25 && type == typeof(ItemFrame))
+            ValidateCreatureClockBaseline(patch.Property(nameof(ItemFrame.SampleTimeKnown)) != null,
+                patch.Property(nameof(ItemFrame.SampleTime)) != null, patch.Property(nameof(ItemFrame.ClockMode)) != null,
+                patch.Property(nameof(ItemFrame.SampleDiscontinuity)) != null);
         object result = Activator.CreateInstance(type)!;
         foreach (var field in fields)
         {
@@ -374,15 +565,46 @@ internal static class ReplayDeltaCodec
             bool present = patch.TryGetValue(field.Name, out var token);
             if (!present)
             {
+                if (old == null && OptionalBaselineField(type, field.Name)) continue;
                 if (old == null) throw Error("Incomplete baseline: " + type.Name + "." + field.Name);
                 field.SetValue(result, field.GetValue(old)); continue;
             }
             object? value;
-            if (field.PropertyType == typeof(ObjectPose))
+            if (NullableField(type, field.Name) && token?.Type == JTokenType.Null) value = null;
+            else if (type == typeof(InteractionReplayFrame) && field.Name == nameof(InteractionReplayFrame.PostEnabled))
+            {
+                var array = ArrayToken(token, 2); var values = new bool[array.Count];
+                for (int i = 0; i < values.Length; i++) values[i] = Bool(array[i]);
+                value = values;
+            }
+            else if (ByteArrayLimit(type, field.Name) is int byteLimit && byteLimit > 0)
+                value = token?.Type == JTokenType.Bytes
+                    ? token.Value<byte[]>() is byte[] bytes && bytes.Length <= byteLimit ? (byte[])bytes.Clone() : throw Error("Oversized particle checkpoint bytes.")
+                    : Binary((string)Value(token, typeof(string))!, byteLimit,
+                        type == typeof(EffectParticleCheckpoint) && field.Name == nameof(EffectParticleCheckpoint.Data));
+            else if (FloatArrayLimit(type, field.Name) is int arrayLimit && arrayLimit > 0)
+            {
+                var array = ArrayToken(token, arrayLimit); var values = new float[array.Count];
+                for (int i = 0; i < values.Length; i++) values[i] = (float)Value(array[i], typeof(float))!;
+                value = values;
+            }
+            else if (field.PropertyType == typeof(ObjectPose))
                 value = Apply(token as JObject ?? throw Error("Invalid object pose patch."), old == null ? null : field.GetValue(old), typeof(ObjectPose), schema: schema);
             else if (NullableSnapshot(field.PropertyType))
+            {
+                // Kind can be inherited from the prior creature delta. Admit
+                // the frog's native 200 points without widening spider silk.
+                int lineLimit = maximumLinePoints;
+                if (type == typeof(CreatureReplayFrame) && field.PropertyType == typeof(CreatureReplayLine))
+                {
+                    string kind = patch.TryGetValue(nameof(CreatureReplayFrame.Kind), out var kindToken)
+                        ? (string)Value(kindToken, typeof(string))! : (old as CreatureReplayFrame)?.Kind ?? "";
+                    lineLimit = kind == "frog-tongue" ? CreatureReplayRules.MaximumFrogLinePoints : CreatureReplayRules.MaximumLinePoints;
+                }
                 value = token?.Type == JTokenType.Null ? null :
-                    Apply(token as JObject ?? throw Error("Invalid nullable snapshot patch."), old == null ? null : field.GetValue(old), field.PropertyType, schema: schema);
+                    Apply(token as JObject ?? throw Error("Invalid nullable snapshot patch."), old == null ? null : field.GetValue(old), field.PropertyType,
+                        schema: schema, maximumLinePoints: lineLimit);
+            }
             else if (type == typeof(ReplayHudState) && field.Name == nameof(ReplayHudState.Afflictions))
             {
                 JArray statuses = ArrayToken(token, ReplayHudState.StatusCount);
@@ -393,10 +615,10 @@ internal static class ReplayDeltaCodec
             }
             else if (type == typeof(ActorFrame) && field.Name == nameof(ActorFrame.JointPose))
                 value = ActorJointCodec.Decode(token?.Type == JTokenType.String ? token.Value<string>()! : throw Error("Expected binary joint payload."),
-                    old == null ? null : (NodePose[])field.GetValue(old)!);
+                    old == null ? null : (NodePose[])field.GetValue(old)!, schema);
             else if (type == typeof(CreatureReplayLine) && field.Name == nameof(CreatureReplayLine.Points))
             {
-                var points = ArrayToken(token, CreatureReplayRules.MaximumLinePoints * 3);
+                var points = ArrayToken(token, maximumLinePoints * 3);
                 var values = new float[points.Count];
                 for (int i = 0; i < values.Length; i++) values[i] = (float)Value(points[i], typeof(float))!;
                 value = values;
@@ -410,9 +632,18 @@ internal static class ReplayDeltaCodec
             else if ((type == typeof(ItemFrame) || type == typeof(CreatureReplayFrame) || type == typeof(SpawnedReplayFrame)) && (field.Name == "Visuals" || field.Name == "Lights") && token?.Type == JTokenType.Null) value = null;
             else if (field.PropertyType == typeof(RopeReplayPoint[]) && token is JObject pointPatch)
                 value = ApplyPoints(pointPatch, old == null ? null : (RopeReplayPoint[])field.GetValue(old)!, schema);
+            else if (schema >= 16 && type == typeof(ObjectPose) && field.Name == nameof(ObjectPose.Nodes) && token is JObject nodePatch)
+                value = ApplyNodes(nodePatch, old == null ? null : (NodePose[])field.GetValue(old)!);
             else value = Value(token, field.PropertyType,
                 (type == typeof(CrateFrame) || type == typeof(SpawnedReplayFrame)) && field.Name == "Animation", schema);
             field.SetValue(result, value);
+        }
+        ValidateColorEncoding(result);
+        if (result is CreatureReplayFrame creature && creature.Line != null)
+        {
+            // A delta may change Kind while inheriting the previous Line.
+            int maximum = creature.Kind == "frog-tongue" ? CreatureReplayRules.MaximumFrogLinePoints : CreatureReplayRules.MaximumLinePoints;
+            if (creature.Line.Points.Length > maximum * 3) throw Error("Native creature line exceeds its kind limit.");
         }
         return result;
     }
@@ -421,6 +652,8 @@ internal static class ReplayDeltaCodec
     // or incomplete nested objects silently acquiring CLR defaults. No $type/$ref.
     private static object? Value(JToken? token, Type type, bool nullable = false, int schema = ReplayRules.CurrentSchema)
     {
+        if (type == typeof(float?)) return Value(token, typeof(float), true, schema);
+        if (type == typeof(double?)) return Value(token, typeof(double), true, schema);
         if (token == null) throw Error("Missing required delta value.");
         if (token.Type == JTokenType.Null)
         { if (nullable) return null; throw Error("Null delta value is not allowed."); }
@@ -451,6 +684,7 @@ internal static class ReplayDeltaCodec
                 element == typeof(NativeMaterialFrame) ? NativeVisualAppearanceRules.MaximumMaterials :
                 element == typeof(NativeShaderPropertyFrame) ? NativeVisualAppearanceRules.MaximumProperties :
                 element == typeof(NativeLightFrame) ? NativeLightRules.MaximumLights :
+                element == typeof(EffectParticleFrame) ? 64 :
                 element == typeof(RopeReplayPoint) ? RopeReplayRules.MaximumPoints :
                 element == typeof(ItemEvent) ? ReplayRules.MaxEvents : throw Error("Unsupported array type.");
             JArray array = ArrayToken(token, maximum); var result = Array.CreateInstance(element, array.Count);

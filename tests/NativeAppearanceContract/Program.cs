@@ -21,6 +21,61 @@ NativeRendererFrame[] Copy(NativeRendererFrame[] source) => JsonSerializer.Deser
 Test("old recording has unknown appearance", () => { Check(NativeVisualAppearanceRules.Validate(null)); Check(!NativeVisualAppearanceRules.Same(null, Array.Empty<NativeRendererFrame>())); });
 Test("native yellow tint keeps exact channels", () => { var a = Sample(); Check(NativeVisualAppearanceRules.Validate(a)); var b = Copy(a); Check(NativeVisualAppearanceRules.Same(a, b)); Check(b[0].Materials[0].Properties[0].Values[2] == 0); });
 Test("HDR and signed hue controls survive", () => { var a = Sample(); a[0].Materials[0].Properties[0].Values = new[] { 4f, 2.19f, -.1f, 1f }; Check(NativeVisualAppearanceRules.Validate(a)); Check(NativeVisualAppearanceRules.Same(a, Copy(a))); });
+Test("native local top lighting direction retains signed vectors and rejects scalar data", () =>
+{
+    var a = Sample();
+    a[0].Materials[0].Properties = new[] { new NativeShaderPropertyFrame { Name = "_LocalTopDirection", Kind = 2, Values = new[] { -.5f, .75f, .25f, 0f } } };
+    Check(NativeVisualAppearanceRules.Validate(a)); Check(NativeVisualAppearanceRules.Same(a, Copy(a)));
+    var b = Copy(a); b[0].Materials[0].Properties[0].Values[0] = .5f;
+    Check(!NativeVisualAppearanceRules.Same(a, b));
+    a[0].Materials[0].Properties[0].Kind = 0; Check(!NativeVisualAppearanceRules.Validate(a));
+});
+Test("HDR shader encoding survives roundtrip and changes snapshot identity", () =>
+{
+    var a = Sample(); var b = Copy(a); b[0].Materials[0].Properties[0].ColorEncoding = 1;
+    Check(NativeVisualAppearanceRules.Validate(b)); Check(!NativeVisualAppearanceRules.Same(a, b));
+    Check(NativeVisualAppearanceRules.Same(b, Copy(b)));
+});
+Test("unknown or noncolor raw encodings are rejected", () =>
+{
+    foreach (int encoding in new[] { -1, 2, int.MaxValue })
+    { var a = Sample(); a[0].Materials[0].Properties[0].ColorEncoding = encoding; Check(!NativeVisualAppearanceRules.Validate(a)); }
+    var vector = Sample(); vector[0].Materials[0].Properties[1].ColorEncoding = 1; Check(!NativeVisualAppearanceRules.Validate(vector));
+    var texture = Sample(); texture[0].Materials[0].Properties[2].ColorEncoding = 1; Check(!NativeVisualAppearanceRules.Validate(texture));
+});
+Test("legacy native HDR material colors use raw shader values", () =>
+{
+    Check(NativeShaderColorPolicy.UsesRawVector(0, true, "M_Luggage_large", "W/Character", "_BaseColor"));
+    Check(NativeShaderColorPolicy.UsesRawVector(0, true, "M_AppleYellow", "W/Item", "_Tint"));
+    Check(!NativeShaderColorPolicy.UsesRawVector(0, false, "M_Player", "W/Character", "_SkinColor"));
+});
+Test("legacy checkpoint flag retains native color-block conversion", () =>
+{
+    Check(!NativeShaderColorPolicy.UsesRawVector(0, true, "Flag Checkpoint", "WavingFabric", "_BaseColor"));
+    Check(NativeShaderColorPolicy.UsesRawVector(0, true, "Flag Checkpoint", "WavingFabric", "_Tint"));
+    Check(NativeShaderColorPolicy.UsesRawVector(0, true, "Flag Checkpoint", "W/Character", "_BaseColor"));
+    Check(NativeShaderColorPolicy.UsesRawVector(0, true, "Other Flag", "WavingFabric", "_BaseColor"));
+});
+Test("new flag and HDR overrides use recorded raw shader vector", () =>
+{
+    Check(NativeShaderColorPolicy.UsesRawVector(1, true, "Flag Checkpoint", "WavingFabric", "_BaseColor"));
+    Check(NativeShaderColorPolicy.UsesRawVector(1, true, "M_Luggage_large", "W/Character", "_BaseColor"));
+});
+Test("explicit empty textures suppress native block textures on reverse seek", () =>
+{
+    var texture = new NativeShaderPropertyFrame { Name = "_MainTex", Kind = 3, Texture = "NativeTexture" };
+    Check(NativePropertyBlockPolicy.RecordedOverrides("_MainTex", 3, new[] { texture }));
+    texture.Texture = "";
+    Check(NativePropertyBlockPolicy.RecordedOverrides("_MainTex", 3, new[] { texture }));
+    Check(!NativePropertyBlockPolicy.RecordedOverrides("_MainTex", 3, Array.Empty<NativeShaderPropertyFrame>()));
+});
+Test("native lighting baseline remains when older recording omits its control", () =>
+{
+    var properties = Sample()[0].Materials[0].Properties;
+    Check(!NativePropertyBlockPolicy.RecordedOverrides("_LocalTopDirection", 2, properties));
+    Check(NativePropertyBlockPolicy.RecordedOverrides("_Tint", 1, properties));
+    Check(!NativePropertyBlockPolicy.RecordedOverrides("_Tint", 2, properties));
+});
 Test("material switches are snapshot boundaries", () => { var a = Sample(); var b = Copy(a); b[0].Materials[0].Name = "M_AppleYellow_Colorblind"; Check(!NativeVisualAppearanceRules.Same(a, b)); Check(NativeVisualAppearanceRules.Same(a, Copy(a))); });
 Test("texture switches are snapshot boundaries", () => { var a = Sample(); var b = Copy(a); b[0].Materials[0].Properties[2].Texture = "ZombieEyes"; Check(!NativeVisualAppearanceRules.Same(a, b)); });
 Test("mesh switch survives arbitrary seek", () => { var a = Sample(); var b = Copy(a); b[0].Mesh = "MushroomMan\n438:2"; Check(!NativeVisualAppearanceRules.Same(a, b)); Check(NativeVisualAppearanceRules.Same(a, Copy(a))); });
@@ -34,7 +89,7 @@ Test("reject texture numeric payload", () => { var a = Sample(); a[0].Materials[
 Test("reject NaN, infinity and extreme HDR", () => { foreach (float value in new[] { float.NaN, float.PositiveInfinity, 65537f }) { var a = Sample(); a[0].Materials[0].Properties[0].Values[0] = value; Check(!NativeVisualAppearanceRules.Validate(a)); } });
 Test("reject duplicate renderer identities", () => { var a = Sample(); Check(!NativeVisualAppearanceRules.Validate(new[] { a[0], Copy(a)[0] })); });
 Test("reject duplicate shader controls", () => { var a = Sample(); a[0].Materials[0].Properties = new[] { a[0].Materials[0].Properties[0], a[0].Materials[0].Properties[0] }; Check(!NativeVisualAppearanceRules.Validate(a)); });
-Test("reject renderer/material limits", () => { Check(!NativeVisualAppearanceRules.Validate(new NativeRendererFrame[257])); var a = Sample(); a[0].Materials = new NativeMaterialFrame[17]; Check(!NativeVisualAppearanceRules.Validate(a)); });
+Test("reject renderer/material limits", () => { Check(!NativeVisualAppearanceRules.Validate(new NativeRendererFrame[NativeVisualAppearanceRules.MaximumRenderers + 1])); var a = Sample(); a[0].Materials = new NativeMaterialFrame[17]; Check(!NativeVisualAppearanceRules.Validate(a)); });
 Test("reject excessive texture identity", () => { var a = Sample(); a[0].Materials[0].Properties[2].Texture = new string('x', 257); Check(!NativeVisualAppearanceRules.Validate(a)); });
 Test("reject invalid lighting enum", () => { var a = Sample(); a[0].LightProbeUsage = 4; Check(!NativeVisualAppearanceRules.Validate(a)); });
 Test("budget includes backing arrays and nested headers", () => { var a = Sample(); long minimum = 32 + 8 + 216 + a[0].Path.Length * 2L + a[0].Mesh.Length * 2L + a[0].ProbeAnchor.Length * 2L + 8 + 128 + 3 * 8 + 3 * 128; Check(NativeVisualAppearanceRules.Estimate(a) >= minimum); Check(NativeVisualAppearanceRules.Estimate(null) == 0); });
@@ -51,4 +106,8 @@ Test("light snapshot rejects invalid numeric shader input", () => { foreach (flo
 Test("light snapshot rejects invalid shape and cookie dimensions", () => { var a = LightSample(); a[0].Type = 5; Check(!NativeLightRules.Validate(a)); a = LightSample(); a[0].CookieSize2D = new[] { 1f }; Check(!NativeLightRules.Validate(a)); });
 Test("spot cone cannot have inner angle outside outer angle", () => { var a = LightSample(); a[0].InnerSpotAngle = 31; Check(!NativeLightRules.Validate(a)); });
 Test("native light memory accounts for backing arrays", () => { var a = LightSample(); Check(NativeLightRules.Estimate(a) >= 360); Check(NativeLightRules.Estimate(null) == 0); });
+NativeResourceCatalogTests.Run(Test, Check);
+NativeRendererVisibilityTests.Run(Test, Check);
+GhostAppearanceTests.Run(Test, Check);
+CaptureDescriptorTests.Run(Test, Check);
 Console.WriteLine($"Native appearance contracts passed: {passed}");

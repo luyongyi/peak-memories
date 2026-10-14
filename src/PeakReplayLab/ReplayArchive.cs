@@ -59,7 +59,7 @@ public static class ReplayArchive
                 foreach (var frame in clip.Frames)
                 {
                     ReplayRules.ValidateStored(frame, previous, validation);
-                    ReplayRules.ValidateVersion(frame, clip.Header.Schema);
+                    ReplayRules.ValidateVersion(frame, clip.Header.Schema, validation.Version);
                     if (frame.World.ActiveMapObjects.Length != clip.Header.MapObjects.Length) throw new InvalidDataException("Invalid map state size.");
                     foreach (var e in frame.Events)
                     {

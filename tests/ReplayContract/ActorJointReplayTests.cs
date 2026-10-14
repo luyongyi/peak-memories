@@ -54,6 +54,15 @@ internal static class ActorJointReplayTests
                 Reject(() => ReplayRules.Validate(frame, -1));
             }
         });
+        test("joint validation identifies the failed node and field without relaxing limits", () =>
+        {
+            var nodes = Joints(3); nodes[2].Scale[1] = float.NaN;
+            try { ActorJointReplayRules.Validate(nodes); throw new Exception("Expected invalid joint."); }
+            catch (InvalidDataException error) { Check(error.Message.Contains("joint 2, scale")); }
+            nodes = Joints(3); nodes[1].Rotation = new float[4];
+            try { ActorJointReplayRules.Validate(nodes); throw new Exception("Expected invalid joint."); }
+            catch (InvalidDataException error) { Check(error.Message.Contains("joint 1, rotation norm")); }
+        });
         test("schema 10 requires joints in every new actor baseline even when the pose is empty", () =>
         {
             var token = Token(new ReplayDeltaCodec.Writer(10).Encode(Frame(0, 0)));

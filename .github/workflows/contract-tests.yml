@@ -22,12 +22,61 @@ jobs:
         project:
           - ReplayContract
           - NativeAppearanceContract
+          - CratePlaybackContract
+          - ItemPlaybackContract
           - NativeLoadingContract
           - ReplayViewContract
           - ReplayNameplateContract
           - ReplayAudioSpatialContract
           - TrajectoryContract
           - TrajectoryUploadContract
+          - StaticPlaybackContract
+          - NativeSpiderIdleLineContract
+          - ActorNetworkContract
+          - AudioSceneEventContract
+          - AudioClipMetadataContract
+          - EffectEventCaptureContract
+          - SceneItemCadenceContract
+          - FrogTongueSamplingContract
+          - CreatureSamplingCadenceContract
+          - NativeParameterCadenceContract
+          - ReplaySceneBudgetContract
+          - AutomaticFullRunStartContract
+        include:
+          - os: windows-latest
+            project: NativeCreatureObserverContract
+          - os: windows-latest
+            project: NativeItemObserverContract
+          - os: windows-latest
+            project: CreatureIdleAnimationContract
+          - os: windows-latest
+            project: RavenAnimationContract
+          - os: windows-latest
+            project: EarlyWormAnimationContract
+          - os: windows-latest
+            project: FrogCaptureContract
+          - os: windows-latest
+            project: NativePlacementActivityContract
+          - os: windows-latest
+            project: NativeSegmentScopeContract
+          - os: windows-latest
+            project: EnvironmentSegmentScopeContract
+          - os: windows-latest
+            project: NativeSpawnOriginContract
+          - os: windows-latest
+            project: NativeItemCaptureContract
+          - os: windows-latest
+            project: NativeCaptureBootstrapContract
+          - os: windows-latest
+            project: NativeEffectForcesContract
+          - os: windows-latest
+            project: EffectCheckpointContract
+          - os: windows-latest
+            project: NativeAudioPoolContract
+          - os: windows-latest
+            project: AudioSeekPreparationContract
+          - os: windows-latest
+            project: NativeStaticEventContract
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
       DOTNET_NOLOGO: "true"

@@ -17,6 +17,7 @@ internal sealed class VisualActor : IDisposable
     private readonly Dictionary<Material, Material> materials = new();
     private readonly Dictionary<Renderer, Renderer> renderers = new();
     private readonly Dictionary<string, MeshRenderer> webWraps = new(StringComparer.Ordinal);
+    private readonly HashSet<MeshRenderer> webWrapsInFrame = new();
     private readonly List<Material> webMaterials = new();
     private CharacterCustomization customization = null!;
     private Appearance? appearance;
@@ -73,7 +74,7 @@ internal sealed class VisualActor : IDisposable
                     // Native tweening creates a material per wrap. The replay
                     // needs the same independence for unequal recorded phases.
                     if (copied.sharedMaterial)
-                    { var material = new Material(copied.sharedMaterial); copied.sharedMaterial = material; webMaterials.Add(material); }
+                    { var material = new Material(copied.sharedMaterial); NativeVisualAppearance.MarkReplayMaterial(material); copied.sharedMaterial = material; webMaterials.Add(material); }
                     webWraps[ActorJointPaths.Path(original.transform, source.transform)] = copied;
                     copied.gameObject.SetActive(false);
                 }
@@ -144,6 +145,7 @@ internal sealed class VisualActor : IDisposable
         if (!source) return null!;
         if (materials.TryGetValue(source, out var cached)) return cached;
         var copy = new Material(source);
+        NativeVisualAppearance.MarkReplayMaterial(copy);
         if (copy.HasProperty("_VertexGhost")) copy.SetFloat("_VertexGhost", 0);
         materials.Add(source, copy);
         return copy;
@@ -238,12 +240,15 @@ internal sealed class VisualActor : IDisposable
 
     private void ApplyWebWrap(WebWrapReplayFrame? frame)
     {
-        foreach (var wrap in webWraps.Values) if (wrap && wrap.gameObject.activeSelf) wrap.gameObject.SetActive(false);
-        if (frame == null) return;
-        foreach (var part in frame.Parts)
+        webWrapsInFrame.Clear();
+        if (frame != null) foreach (var part in frame.Parts)
         {
             if (!webWraps.TryGetValue(part.Path, out var wrap) || !wrap) continue;
-            wrap.gameObject.SetActive(part.Active); wrap.enabled = part.Active;
+            webWrapsInFrame.Add(wrap);
+            // SetActive invokes the native enable/disable path. Most wrap poses
+            // keep the same state for many frames, so only apply a transition.
+            if (wrap.gameObject.activeSelf != part.Active) wrap.gameObject.SetActive(part.Active);
+            if (wrap.enabled != part.Active) wrap.enabled = part.Active;
             wrap.transform.localRotation = Quat(part.Rotation);
             // Scale only the audited VFX parent, never a body bone if a future
             // game places this renderer elsewhere in its character hierarchy.
@@ -251,6 +256,10 @@ internal sealed class VisualActor : IDisposable
             if (parent && parent.name.StartsWith("VFX_WebWrap", StringComparison.Ordinal)) parent.localScale = Point(part.ParentScale);
             if (wrap.sharedMaterial && wrap.sharedMaterial.HasProperty("_Clip")) wrap.sharedMaterial.SetFloat("_Clip", part.Clip);
         }
+        // Old recordings may omit a wrap that was present in the previous
+        // snapshot. Those omitted parts still need to become hidden.
+        foreach (var wrap in webWraps.Values)
+            if (wrap && !webWrapsInFrame.Contains(wrap) && wrap.gameObject.activeSelf) wrap.gameObject.SetActive(false);
     }
 
     private static Vector3 Point(float[] a) => new(a[0], a[1], a[2]);
@@ -340,7 +349,7 @@ internal sealed class VisualActor : IDisposable
         if (root) { root.SetActive(false); Object.Destroy(root); }
         foreach (var material in materials.Values) if (material) Object.Destroy(material);
         foreach (var material in webMaterials) if (material) Object.Destroy(material);
-        webMaterials.Clear(); webWraps.Clear();
+        webMaterials.Clear(); webWraps.Clear(); webWrapsInFrame.Clear();
         materials.Clear();
     }
 }

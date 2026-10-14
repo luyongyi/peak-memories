@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/AudioReplayData.cs" Link="AudioReplayData.cs" />
+    <Compile Include="../../src/PeakReplayLab/AudioSceneEventPolicy.cs" Link="AudioSceneEventPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/AudioSeekPreparationPolicy.cs" Link="AudioSeekPreparationPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ReplayDrawerMotion.cs" Link="ReplayDrawerMotion.cs" />
+  </ItemGroup>
+</Project>

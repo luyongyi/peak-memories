@@ -1,4 +1,6 @@
 using PeakReplayLab;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 internal static class AudioReplayTests
 {
@@ -17,6 +19,56 @@ internal static class AudioReplayTests
             check(rejected);
         }
         test("audio native resource metadata validates without audio bytes", () => AudioReplayRules.Validate(Sound()));
+        test("schema 15 preserves observed metal footstep pitch above three through both readers and playback clock", () =>
+        {
+            var audio = Sound(false); audio.Clip = "Au_Step_Metal_Plate5|31388|44100|2";
+            audio.Pitch = 3.021165f; audio.Offset = 0; audio.Duration = .711746f;
+            AudioReplayRules.Validate(audio); AudioReplayRules.ValidateVersion(audio, 15);
+            var frame = new ReplayFrame { T = 100, Actors = new[] { new ActorFrame { Id = "actor" } }, Audio = new[] { audio } };
+            string json = JsonConvert.SerializeObject(new ReplayDeltaCodec.Writer(15).Encode(frame), ReplayFiles.Json);
+            var tree = new ReplayDeltaCodec.Reader(15).Decode(JObject.Parse(json));
+            var stream = new ReplayDeltaCodec.StreamReader(15).DecodeRecord(json)!;
+            check(tree.Audio[0].Pitch == audio.Pitch && stream.Audio[0].Pitch == audio.Pitch);
+            check(AudioReplayRules.PlaybackPitch(audio.Pitch, 1) == audio.Pitch);
+            check(AudioReplayRules.PlaybackPitch(audio.Pitch, .5f) == audio.Pitch * .5f);
+            check(AudioReplayRules.PlaybackPitch(audio.Pitch, 8) == audio.Pitch * 8);
+            check(Math.Abs(AudioReplayRules.Cursor(audio, 100.1) - (double)audio.Pitch * .1) < 1e-8);
+            var cropped = AudioReplayRules.Rebase(audio, 100);
+            check(cropped.Pitch == audio.Pitch && Math.Abs(AudioReplayRules.Cursor(cropped, .1) - AudioReplayRules.Cursor(audio, 100.1)) < 1e-8);
+        });
+        test("native audio pitch stays bounded while legacy formats retain their original limit", () =>
+        {
+            foreach (float pitch in new[] { -AudioReplayRules.MaximumNativePitch, -5f, 3.021165f, 5f, 19.5f, AudioReplayRules.MaximumNativePitch })
+            {
+                var audio = Sound(); audio.Pitch = pitch; AudioReplayRules.Validate(audio); AudioReplayRules.ValidateVersion(audio, 15);
+                for (int schema = 10; schema <= 14; schema++) Reject(() => AudioReplayRules.ValidateVersion(audio, schema));
+            }
+            foreach (float pitch in new[] { -32.001f, 32.001f, float.PositiveInfinity, float.NegativeInfinity, float.NaN })
+            { var audio = Sound(); audio.Pitch = pitch; Reject(() => AudioReplayRules.Validate(audio)); }
+            foreach (float pitch in new[] { -3f, 0f, 3f })
+            { var audio = Sound(); audio.Pitch = pitch; AudioReplayRules.Validate(audio); AudioReplayRules.ValidateVersion(audio, 14); }
+        });
+        test("native charge and rope pitches round trip without opening the extended range to old schemas", () =>
+        {
+            foreach (float pitch in new[] { 3.021165f, 5f, 19.5f })
+            {
+                var audio = Sound(); audio.Pitch = pitch;
+                var frame = new ReplayFrame { T = 100, Actors = new[] { new ActorFrame { Id = "actor" } }, Audio = new[] { audio } };
+                var encoded = JObject.FromObject(new ReplayDeltaCodec.Writer(15).Encode(frame));
+                check(new ReplayDeltaCodec.Reader(15).Decode(encoded).Audio[0].Pitch == pitch);
+                check(new ReplayDeltaCodec.StreamReader(15).DecodeRecord(encoded.ToString(Formatting.None))!.Audio[0].Pitch == pitch);
+                for (int schema = 10; schema <= 14; schema++)
+                {
+                    Reject(() => ReplayRules.ValidateVersion(frame, schema));
+                    Reject(() => new ReplayDeltaCodec.Writer(schema).Encode(frame));
+                    var legacy = new ReplayFrame { T = 100, Actors = frame.Actors, Audio = new[] { Sound() } };
+                    var tampered = JObject.FromObject(new ReplayDeltaCodec.Writer(schema).Encode(legacy));
+                    tampered["Audio"]![0]![nameof(AudioReplayFrame.Pitch)] = pitch;
+                    Reject(() => new ReplayDeltaCodec.Reader(schema).Decode(tampered));
+                    Reject(() => new ReplayDeltaCodec.StreamReader(schema).DecodeRecord(tampered.ToString(Formatting.None)));
+                }
+            }
+        });
         test("audio loop cursor uses replay time not wall time", () =>
         {
             var a = Sound(); check(AudioReplayRules.Cursor(a, 103) == 5);

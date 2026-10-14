@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 
 namespace PeakReplayLab;
 
@@ -65,37 +64,43 @@ public sealed class ContinuousReplayResult
     public double NativeEnd { get; internal set; }
 }
 
-// A segment owns weak translation caches, not a second 120-second recording
-// buffer. Published capture frames remain immutable, including event sequences.
+// The writer owns small bounded translation caches, not a second recording
+// buffer. No Mono ephemeron table is touched by these background rebasers.
+// Published capture frames remain immutable, including event sequences.
 internal sealed class ContinuousReplayRebaser
 {
-    private sealed class Value<T> where T : class { public T Item = null!; }
     private sealed class Track<T> where T : class
     {
-        private readonly ConditionalWeakTable<T, Value<T>> states = new();
-        private readonly ConditionalWeakTable<T[], Value<T[]>> arrays = new();
+        private readonly BoundedReferenceCache<T, T> states = new(1024);
+        private readonly BoundedReferenceCache<T[], T[]> arrays = new(128);
         private readonly Func<T, double, T> rebase;
+        private readonly Func<T, T> stateFactory;
+        private readonly Func<T[], T[]> arrayFactory;
         private readonly double start;
-        public Track(Func<T, double, T> rebase, double start) { this.rebase = rebase; this.start = start; }
+        public Track(Func<T, double, T> rebase, double start)
+        { this.rebase = rebase; this.start = start; stateFactory = ShiftState; arrayFactory = ShiftArray; }
         public T[] Apply(T[] source)
         {
             if (source.Length == 0) return source;
-            return arrays.GetValue(source, values =>
-            {
-                var result = new T[values.Length];
-                for (int i = 0; i < result.Length; i++)
-                    result[i] = states.GetValue(values[i], value => new Value<T> { Item = rebase(value, start) }).Item;
-                return new Value<T[]> { Item = result };
-            }).Item;
+            return arrays.GetValue(source, arrayFactory);
+        }
+        private T ShiftState(T source) => rebase(source, start);
+        private T[] ShiftArray(T[] source)
+        {
+            var result = new T[source.Length];
+            for (int i = 0; i < result.Length; i++) result[i] = states.GetValue(source[i], stateFactory);
+            return result;
         }
     }
     private readonly double origin;
+    private readonly ItemAnimationRebaser items;
     private readonly Track<CrateFrame> crates;
     private readonly Track<RopeReplayFrame> ropes;
     private readonly Track<EffectReplayFrame> effects;
     private readonly Track<AudioReplayFrame> audio;
     private readonly Track<SpawnedReplayFrame> spawned;
     private readonly Track<BalloonReplayFrame> balloons;
+    private readonly Track<CreatureReplayFrame> creatures;
     private readonly ActorJointRebaser actors;
     private readonly EnvironmentTimeRebaser environment;
     public ContinuousReplayRebaser(double origin)
@@ -103,9 +108,13 @@ internal sealed class ContinuousReplayRebaser
         this.origin = origin;
         actors = new ActorJointRebaser(origin);
         environment = new EnvironmentTimeRebaser(origin);
+        items = new(origin);
         crates = new(CrateAnimationTimeline.Rebase, origin); ropes = new(RopeReplayRules.Rebase, origin);
-        effects = new(EffectReplayRules.Rebase, origin); audio = new(AudioReplayRules.Rebase, origin);
+        var effectInitialStates = new EffectReplayInitialStateRebaser(origin);
+        effects = new((effect, start) => EffectReplayRules.Rebase(effect, start, effectInitialStates.Apply(effect.InitialState), effectInitialStates.Particles(effect.Particles)), origin);
+        audio = new(AudioReplayRules.Rebase, origin);
         spawned = new(SpawnedReplayRules.Rebase, origin); balloons = new(BalloonReplayRules.Rebase, origin);
+        creatures = new(CreatureReplayRules.Rebase, origin);
     }
     public ReplayFrame Apply(ReplayFrame source)
     {
@@ -118,10 +127,13 @@ internal sealed class ContinuousReplayRebaser
             });
         return new ReplayFrame
         {
-            Type = source.Type, T = source.T - origin, World = environment.Apply(source.World), Actors = actors.Apply(source.Actors), Items = source.Items,
+            Type = source.Type, T = source.T - origin, World = environment.Apply(source.World), Actors = actors.Apply(source.Actors), Items = items.Apply(source.Items),
+            SceneSampleTimeKnown = source.SceneSampleTimeKnown,
+            SceneSampleTime = source.SceneSampleTimeKnown ? source.SceneSampleTime - origin : 0,
             Crates = crates.Apply(source.Crates), Ropes = ropes.Apply(source.Ropes), Effects = effects.Apply(source.Effects),
             Audio = audio.Apply(source.Audio), Spawned = spawned.Apply(source.Spawned), Balloons = balloons.Apply(source.Balloons),
-            Creatures = source.Creatures,
+            Creatures = creatures.Apply(source.Creatures),
+            Interactions = source.Interactions,
             Events = events.Count == 0 ? Array.Empty<ItemEvent>() : events.ToArray(),
         };
     }
@@ -143,13 +155,26 @@ internal sealed class ContinuousReplayBudget
         {
             if (ReferenceEquals(values, last)) return 0;
             long result = 0;
-            foreach (var value in values)
+            for (int i = 0; i < values.Length; i++)
+            {
+                var value = values[i];
+                if (last != null && i < last.Length && ReferenceEquals(last[i], value)) continue;
                 if (!previous.TryGetValue(key(value), out var old) || !ReferenceEquals(old, value)) result = checked(result + estimate(value));
+            }
             return result;
         }
         public void Commit(T[] values)
         {
             if (ReferenceEquals(values, last)) return;
+            bool sameDirectory = last != null && last.Length == values.Length;
+            for (int i = 0; sameDirectory && i < values.Length; i++)
+                if (!ReferenceEquals(last![i], values[i]) && key(last[i]) != key(values[i])) sameDirectory = false;
+            if (sameDirectory)
+            {
+                for (int i = 0; i < values.Length; i++)
+                    if (!ReferenceEquals(last![i], values[i])) previous[key(values[i])] = values[i];
+                last = values; return;
+            }
             next.Clear(); foreach (var value in values) next.Add(key(value), value);
             var spare = previous; previous = next; next = spare; last = values;
         }
@@ -162,13 +187,14 @@ internal sealed class ContinuousReplayBudget
     private readonly Track<SpawnedReplayFrame> spawned = new(x => x.Key, SpawnedReplayRules.Estimate);
     private readonly Track<BalloonReplayFrame> balloons = new(x => x.Key, BalloonReplayRules.Estimate);
     private readonly Track<CreatureReplayFrame> creatures = new(x => x.Key, CreatureReplayRules.Estimate);
+    private readonly Track<InteractionReplayFrame> interactions = new(x => x.Key, InteractionReplayRules.Estimate);
     public long Bytes { get; private set; }
     public long Additional(ReplayFrame frame) => checked(RollingBuffer.EstimateFrame(frame) + items.Additional(frame.Items) +
         crates.Additional(frame.Crates) + ropes.Additional(frame.Ropes) + effects.Additional(frame.Effects) +
-        audio.Additional(frame.Audio) + spawned.Additional(frame.Spawned) + balloons.Additional(frame.Balloons) + creatures.Additional(frame.Creatures));
+        audio.Additional(frame.Audio) + spawned.Additional(frame.Spawned) + balloons.Additional(frame.Balloons) + creatures.Additional(frame.Creatures) + interactions.Additional(frame.Interactions));
     public void Commit(ReplayFrame frame, long additional)
     {
         items.Commit(frame.Items); crates.Commit(frame.Crates); ropes.Commit(frame.Ropes); effects.Commit(frame.Effects);
-        audio.Commit(frame.Audio); spawned.Commit(frame.Spawned); balloons.Commit(frame.Balloons); creatures.Commit(frame.Creatures); Bytes = checked(Bytes + additional);
+        audio.Commit(frame.Audio); spawned.Commit(frame.Spawned); balloons.Commit(frame.Balloons); creatures.Commit(frame.Creatures); interactions.Commit(frame.Interactions); Bytes = checked(Bytes + additional);
     }
 }

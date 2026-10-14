@@ -15,6 +15,13 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
         public WindChillZone Source = null!;
         public readonly Dictionary<string, Storm> Storms = new(StringComparer.Ordinal);
     }
+    private sealed class StormParticle
+    {
+        public ParticleSystem Source = null!;
+        public ParticleSystemRenderer? Renderer;
+        public bool RenderingOff, AuthoredEmission;
+        public readonly EnvironmentStormPresentationCursor Cursor = new();
+    }
     private sealed class Storm
     {
         public StormVisual Source = null!;
@@ -30,6 +37,8 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
         public double LastTime = double.NaN;
         public bool Visible, Emitting, EmissionStarted, WasWindActive;
         public float LastActiveFor;
+        public int Generation = -1;
+        public readonly List<StormParticle> Particles = new();
     }
     private sealed class Lava
     {
@@ -54,6 +63,9 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
     private readonly List<LavaSurface> lavaSurfaces = new();
     private readonly Dictionary<ParticleSystem, (bool Playing, bool Paused, bool Emission)> particleStates = new();
     private readonly Action<string>? warning;
+    private readonly PresentationWorkBudget workBudget;
+    private readonly List<StormParticle> presentations = new();
+    private int presentationGeneration, presentationSerial, presentationFrame = -1;
     private readonly ReplayShaderClock? shaderClock;
     private bool warnedMissing;
     private readonly EnvironmentReplayFrame initial;
@@ -72,9 +84,9 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
     private bool disposed, warnedUnknown;
     public string Warning { get; private set; } = "";
 
-    public EnvironmentReplayPlayer(Action<string>? warning = null)
+    public EnvironmentReplayPlayer(Action<string>? warning = null, PresentationWorkBudget? workBudget = null)
     {
-        this.warning = warning;
+        this.warning = warning; this.workBudget = workBudget ?? new();
         initial = EnvironmentReplayCapture.Sample(force: true);
         foreach (string name in new[] { "_WeatherBlend", "GlobalWind", "HeightFogAmount", "HeightFogSpirit", "FogEnabled", "_FogSphereSize", "CloseDistanceMod", "FakeMountainEnabled",
             "WindSkyBrightnessValue", "WindTextureInfluence", "WindFogDensity", "WindFogTextureDensity", "WindMixInfluence", "WindRotationAngle", "WindSphereScale", "LavaAlpha", "LavaHeight", "LavaStart" }) floats[name] = Shader.GetGlobalFloat(name);
@@ -98,7 +110,17 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
                     if (visual.quadRend) visual.quadRend.GetPropertyBlock(storm.InitialBlock);
                     if (visual.particleForceField) { storm.ForceX = visual.particleForceField.directionX; storm.ForceZ = visual.particleForceField.directionZ; }
                     foreach (var particle in visual.part ?? Array.Empty<ParticleSystem>())
-                        if (particle && !particleStates.ContainsKey(particle)) particleStates.Add(particle, (particle.isPlaying, particle.isPaused, particle.emission.enabled));
+                        if (particle)
+                        {
+                            if (!particleStates.ContainsKey(particle)) particleStates.Add(particle, (particle.isPlaying, particle.isPaused, particle.emission.enabled));
+                            var renderer = particle.GetComponent<ParticleSystemRenderer>();
+                            var presentation = new StormParticle { Source = particle, Renderer = renderer,
+                                RenderingOff = renderer && renderer.forceRenderingOff, AuthoredEmission = particle.emission.enabled };
+                            storm.Particles.Add(presentation); presentations.Add(presentation);
+                            // Native StormVisual is suspended for the entire replay.
+                            // Its particle clock must not run between budget slices.
+                            particle.Pause(false);
+                        }
                     wind.Storms.Add(EnvironmentReplayCapture.Key(visual), storm); Suspend(visual);
                     if (storm.Fog) Suspend(storm.Fog);
                 }
@@ -280,49 +302,95 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
         float elapsed = activeFor(storm.Zone);
         if (!visible)
         {
-            foreach (var particle in storm.Source.part ?? Array.Empty<ParticleSystem>())
-                if (particle && (particle.isPlaying || particle.isPaused || particle.particleCount > 0))
-                    particle.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear);
+            if (storm.Visible || storm.Generation != presentationGeneration)
+                foreach (var particle in storm.Particles)
+                {
+                    if (particle.Renderer) particle.Renderer!.forceRenderingOff = true;
+                    particle.Cursor.Rebuild(true, 0, 0, false);
+                }
             storm.Visible = false; storm.LastTime = time; storm.Emitting = false;
-            storm.WasWindActive = active; storm.LastActiveFor = elapsed;
+            storm.WasWindActive = active; storm.LastActiveFor = elapsed; storm.Generation = presentationGeneration;
             return;
         }
         bool newGust = active && (!storm.WasWindActive || elapsed + .001f < storm.LastActiveFor);
-        bool discontinuity = !storm.Visible || newGust || double.IsNaN(storm.LastTime) || time < storm.LastTime || time - storm.LastTime > .5;
+        bool discontinuity = storm.Generation != presentationGeneration || !storm.Visible || newGust || double.IsNaN(storm.LastTime) || time < storm.LastTime || time - storm.LastTime > .5;
         if (discontinuity) storm.EmissionStarted = EmissionStarted(storm);
         if (active && storm.Zone.windIntensity > .1f) storm.EmissionStarted = true;
         bool emitting = EnvironmentStormReplayRules.ShouldEmit(storm.Source.useWindChillZoneIntensity,
             active, storm.Zone.windIntensity, storm.EmissionStarted);
         if (!active && storm.Source.windFactor <= 0 && stormIntensity(storm.Source) <= 0) emitting = false;
-        foreach (var particle in storm.Source.part ?? Array.Empty<ParticleSystem>())
+        // A changed emission event supersedes the old plan, so a pending tail
+        // cannot emit at the newly requested wind phase using an older state.
+        discontinuity |= emitting != storm.Emitting;
+        foreach (var particle in storm.Particles)
         {
-            if (!particle) continue;
-            bool authoredEmission = !particleStates.TryGetValue(particle, out var saved) || saved.Emission;
-            var emission = particle.emission;
+            if (!particle.Source) continue;
             if (discontinuity)
             {
                 var phase = EnvironmentStormReplayRules.Rebuild(emitting, storm.EmissionStarted, active,
-                    storm.Source.windFactor, stormIntensity(storm.Source), elapsed, duration(storm.Zone), until(storm.Zone), particle.main.startLifetime.constantMax);
-                if (phase.Clear) { emission.enabled = false; particle.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear); continue; }
-                emission.enabled = authoredEmission;
-                particle.Simulate(phase.Warmup, false, true, false);
-                emission.enabled = authoredEmission && emitting;
-                if (!emitting) particle.Stop(false, ParticleSystemStopBehavior.StopEmitting);
-                if (phase.Coast > 0) particle.Simulate(phase.Coast, false, false, false);
+                    storm.Source.windFactor, stormIntensity(storm.Source), elapsed, duration(storm.Zone), until(storm.Zone), particle.Source.main.startLifetime.constantMax);
+                particle.Cursor.Rebuild(phase.Clear, phase.Warmup, phase.Coast, emitting);
+                if (particle.Renderer) particle.Renderer!.forceRenderingOff = true;
             }
-            else
-            {
-                emission.enabled = authoredEmission && emitting;
-                if (emitting && !storm.Emitting) particle.Play(false);
-                else if (!emitting && storm.Emitting) particle.Stop(false, ParticleSystemStopBehavior.StopEmitting);
-                if (!emitting && storm.Source.windFactor <= 0 && stormIntensity(storm.Source) <= 0)
-                { particle.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear); continue; }
-                if (time > storm.LastTime) particle.Simulate((float)(time - storm.LastTime), false, false, false);
-            }
-            particle.Pause(false);
+            else particle.Cursor.Advance(Math.Max(0, time - storm.LastTime), emitting);
         }
         storm.Visible = visible; storm.LastTime = time; storm.Emitting = visible && emitting;
-        storm.WasWindActive = active; storm.LastActiveFor = elapsed;
+        storm.WasWindActive = active; storm.LastActiveFor = elapsed; storm.Generation = presentationGeneration;
+    }
+
+    public void InvalidatePresentation()
+    {
+        presentationGeneration++;
+        foreach (var particle in presentations)
+        {
+            particle.Cursor.Cancel();
+            if (particle.Renderer) particle.Renderer!.forceRenderingOff = true;
+        }
+    }
+
+    // Tick calls this even when playback is paused. UI/camera updates never
+    // wait for an eight-second snow/rain reconstruction to finish.
+    public void EnforcePresentation(bool completePending = true)
+    {
+        if (disposed) return;
+        Enforce();
+        if (!completePending || presentationFrame == Time.frameCount) return;
+        presentationFrame = Time.frameCount; workBudget.BeginFrame(Time.frameCount);
+        int count = presentations.Count; if (count == 0) return;
+        int start = presentationSerial % count;
+        for (int index = 0; index < count; index++)
+        {
+            var presentation = presentations[(index + start) % count]; var particle = presentation.Source;
+            if (!particle) { presentation.Cursor.Cancel(); continue; }
+            for (int local = 0; local < 8 && presentation.Cursor.Pending; local++)
+            {
+                if (!workBudget.Step()) { presentationSerial = (index + start) % count; return; }
+                var operation = presentation.Cursor.Take(out float seconds);
+                var emission = particle.emission;
+                switch (operation)
+                {
+                    case EnvironmentStormPresentationStep.Reset:
+                        emission.enabled = presentation.AuthoredEmission;
+                        particle.Simulate(0, false, true, false); particle.Pause(false); break;
+                    case EnvironmentStormPresentationStep.Clear:
+                        emission.enabled = false;
+                        particle.Stop(false, ParticleSystemStopBehavior.StopEmittingAndClear); break;
+                    case EnvironmentStormPresentationStep.Warm:
+                    case EnvironmentStormPresentationStep.Coast:
+                    case EnvironmentStormPresentationStep.Advance:
+                        emission.enabled = presentation.AuthoredEmission && (operation == EnvironmentStormPresentationStep.Warm ||
+                            operation == EnvironmentStormPresentationStep.Advance && presentation.Cursor.Emitting);
+                        particle.Simulate(seconds, false, false, false); particle.Pause(false); break;
+                    case EnvironmentStormPresentationStep.Finish:
+                        emission.enabled = presentation.AuthoredEmission && presentation.Cursor.Emitting;
+                        if (!presentation.Cursor.Emitting) particle.Stop(false, ParticleSystemStopBehavior.StopEmitting);
+                        particle.Pause(false);
+                        if (presentation.Renderer) presentation.Renderer!.forceRenderingOff = presentation.RenderingOff;
+                        break;
+                }
+            }
+        }
+        presentationSerial = (start + 1) % count;
     }
 
     private static bool EmissionStarted(Storm storm)
@@ -404,6 +472,8 @@ internal sealed class EnvironmentReplayPlayer : IDisposable
         foreach (var wind in winds.Values) foreach (var storm in wind.Storms.Values)
         {
             if (!storm.Source) continue;
+            foreach (var particle in storm.Particles)
+            { particle.Cursor.Cancel(); if (particle.Renderer) particle.Renderer!.forceRenderingOff = particle.RenderingOff; }
             storm.Source.transform.SetPositionAndRotation(storm.Position, storm.Rotation);
             if (storm.Source.quadRend) { storm.Source.quadRend.enabled = storm.QuadEnabled; storm.Source.quadRend.SetPropertyBlock(storm.InitialBlock); }
             if (storm.Source.particleForceField) { storm.Source.particleForceField.directionX = storm.ForceX; storm.Source.particleForceField.directionZ = storm.ForceZ; }

@@ -1,16 +1,17 @@
-using System.Runtime.CompilerServices;
+using System;
 
 namespace PeakReplayLab;
 
 // Translate immutable observation clocks while retaining all renderer/source
-// arrays. Weak keys prevent a save worker from retaining a run's earlier pages.
+// arrays. Bounded hot caches avoid retaining a run's earlier pages or invoking
+// Mono's ephemeron machinery from the save worker.
 internal sealed class EnvironmentTimeRebaser
 {
     private readonly double origin;
-    private readonly ConditionalWeakTable<EnvironmentReplayFrame, EnvironmentReplayFrame> environments = new();
-    private readonly ConditionalWeakTable<WorldFrame, WorldFrame> worlds = new();
-    private readonly ConditionalWeakTable<WorldFrame, WorldFrame>.CreateValueCallback worldFactory;
-    private readonly ConditionalWeakTable<EnvironmentReplayFrame, EnvironmentReplayFrame>.CreateValueCallback environmentFactory;
+    private readonly BoundedReferenceCache<EnvironmentReplayFrame, EnvironmentReplayFrame> environments = new(256);
+    private readonly BoundedReferenceCache<WorldFrame, WorldFrame> worlds = new(128);
+    private readonly Func<WorldFrame, WorldFrame> worldFactory;
+    private readonly Func<EnvironmentReplayFrame, EnvironmentReplayFrame> environmentFactory;
     public EnvironmentTimeRebaser(double origin)
     { this.origin = origin; worldFactory = ShiftWorld; environmentFactory = ShiftEnvironment; }
     public WorldFrame Apply(WorldFrame source)

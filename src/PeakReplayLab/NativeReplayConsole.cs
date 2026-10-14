@@ -38,12 +38,14 @@ internal sealed class NativeReplayConsole : IDisposable
     private readonly StringBuilder events = new();
     private readonly List<(Button Button, float Speed)> speeds = new();
     private readonly ReplayDrawerMotion drawer = new();
+    private readonly ReplayBufferingNotice bufferingNotice = new();
     private GameObject? root;
     private RectTransform canvasRect = null!, panel = null!, controls = null!, details = null!, viewport = null!, content = null!;
     private CanvasGroup group = null!, panelGroup = null!;
     private NativeReplayDrawerHandle drawerHandle = null!;
     private RectTransform handleRect = null!, handlePill = null!, handleShadow = null!;
-    private TMP_Text handleHint = null!;
+    private TMP_Text handleHint = null!, bufferingText = null!, bufferingDetail = null!, playText = null!, cameraText = null!;
+    private RectTransform bufferingRoot = null!;
     private TMP_Text title = null!, clock = null!, status = null!, detailTitle = null!, held = null!, itemEvents = null!, diagnostics = null!;
     private Button play = null!, camera = null!, backpack = null!, diagnosticButton = null!, collapse = null!;
     private Slider timeline = null!;
@@ -57,12 +59,15 @@ internal sealed class NativeReplayConsole : IDisposable
     private GameObject? oldSelection;
     private bool detailsExpanded, diagnosticExpanded, disposed;
     private float width = -1, height = -1;
-    private double nextDetailUpdate;
+    private double nextDetailUpdate, nextDiagnosticUpdate;
+    private long clockSecond = long.MinValue;
+    private int titleActors = -1;
     private int detailRevision = -1;
     private string detailFocus = "";
     private static readonly Color Cream = new(.8742f, .8567f, .7615f, 1);
     private static readonly Color Brown = new(.20f, .17f, .14f, .97f);
     public bool IsExpanded => drawer.Open || drawer.Dragging || drawer.Progress > .01f;
+    public bool IsBufferingNoticeVisible => bufferingRoot && bufferingRoot.gameObject.activeInHierarchy;
     private float DrawerTravel => Mathf.Max(1, height + 12);
 
     public NativeReplayConsole(PlaybackSession session, Action close, Action toggleDiagnostics, Action<Exception> error)
@@ -112,6 +117,7 @@ internal sealed class NativeReplayConsole : IDisposable
         panel.anchoredPosition = Vector2.zero;
         panelGroup = panel.gameObject.AddComponent<CanvasGroup>();
         panelImage = Image(panel, fillSprite, Brown);
+        panelImage.raycastTarget = true; // Empty control-panel space also owns its wheel input.
         var border = Rect("Native outline", panel);
         Stretch(border); Image(border, outlineSprite, new Color(Cream.r, Cream.g, Cream.b, .78f));
 
@@ -120,6 +126,7 @@ internal sealed class NativeReplayConsole : IDisposable
         timeline = MakeTimeline(panel);
         controls = Rect("Playback actions", panel);
         play = Button("播放 [空格]", controls, () => session.Paused = !session.Paused);
+        playText = play.GetComponentInChildren<TMP_Text>(true);
         SetSelected(play, true);
         foreach (float speed in new[] { .25f, .5f, 1f, 2f })
         {
@@ -129,7 +136,8 @@ internal sealed class NativeReplayConsole : IDisposable
         }
         Button("切换玩家 [Tab]", controls, session.CycleFocus);
         camera = Button("跟随镜头", controls, session.ToggleCamera);
-        backpack = Button("背包详情", controls, () => { detailsExpanded = !detailsExpanded; nextDetailUpdate = 0; width = -1; });
+        cameraText = camera.GetComponentInChildren<TMP_Text>(true);
+        backpack = Button("背包详情", controls, () => { detailsExpanded = !detailsExpanded; nextDetailUpdate = 0; detailRevision = -1; width = -1; });
         Button("返回 [Esc]", controls, close);
         status = Text("Camera and loading hints", panel, 20, TextAlignmentOptions.Left);
         diagnosticButton = Button("详细信息 [F9]", panel, toggleDiagnostics);
@@ -137,6 +145,8 @@ internal sealed class NativeReplayConsole : IDisposable
         details = Rect("Recorded inventory details", panel);
         detailTitle = Text("Inventory heading", details, 23, TextAlignmentOptions.Left);
         viewport = Rect("Inventory viewport", details); viewport.gameObject.AddComponent<RectMask2D>();
+        var inventoryHit = viewport.gameObject.AddComponent<Image>();
+        inventoryHit.color = Color.clear; inventoryHit.raycastTarget = true;
         content = Rect("Recorded inventory cells", viewport);
         content.anchorMin = new Vector2(0, 1); content.anchorMax = new Vector2(1, 1); content.pivot = new Vector2(.5f, 1);
         var scroll = viewport.gameObject.AddComponent<ScrollRect>();
@@ -149,6 +159,7 @@ internal sealed class NativeReplayConsole : IDisposable
         collapse = Button("收起 [H]", panel, Hide);
         details.gameObject.SetActive(false); diagnostics.gameObject.SetActive(false);
         BuildDrawerHandle();
+        BuildBufferingNotice();
         ConnectNavigation();
         BuildInput();
         root.SetActive(true);
@@ -198,29 +209,50 @@ internal sealed class NativeReplayConsole : IDisposable
         diagnosticExpanded = showDiagnostics;
         group.interactable = Application.isFocused && !session.CameraLooking;
         group.blocksRaycasts = group.interactable;
-        title.text = "这一段回忆  ·  " + session.VisibleActors + " 位参与者";
-        double displayed = session.Buffering ? session.RequestedTime : session.Time;
-        clock.text = MemoriesLibraryModel.FormatDuration(displayed) + " / " + MemoriesLibraryModel.FormatDuration(session.Duration);
-        timeline.maxValue = Math.Max(.001f, (float)session.Duration);
-        timeline.SetValueWithoutNotify((float)displayed);
-        play.GetComponentInChildren<TMP_Text>(true).text = session.Paused ? "播放 [空格]" : "暂停 [空格]";
-        camera.GetComponentInChildren<TMP_Text>(true).text = session.FreeCamera ? "自由镜头" : "跟随镜头";
-        SetSelected(camera, session.FreeCamera); SetSelected(backpack, detailsExpanded);
-        foreach (var speed in speeds) SetSelected(speed.Button, speed.Speed == session.Speed);
-        SetSelected(diagnosticButton, diagnosticExpanded);
-        string hint = session.FreeCamera ? "右键 + WASD / Q E 移动 · Shift 加速" : "按住右键转向 · 滚轮调整跟随距离";
-        if (session.Buffering) hint = session.BufferingLabel;
-        else if (!string.IsNullOrEmpty(hudWarning)) hint = hudWarning;
-        else if (!string.IsNullOrEmpty(session.ObjectWarning)) hint = session.ObjectWarning;
-        else if (session.MissingJointCount > 0) hint = session.MissingJointCount + " 个人物关节未匹配 · F9 查看诊断";
-        status.text = hint;
-        diagnostics.text = performance + "\n场景物品 " + session.VisibleItemCount + "/" + session.RecordedItemCount +
-            " · 箱子 " + session.RecordedCrateCount + " · 关节 " + session.RecordedJointCount + " · 录制采样 " + session.SampleHz + " Hz" +
-            (string.IsNullOrEmpty(session.ObjectWarning) ? "" : "\n" + session.ObjectWarning) + "\nEnd 紧急返回 · F7 退出回忆";
-        if (detailsExpanded && IsExpanded && (Time.unscaledTimeAsDouble >= nextDetailUpdate || detailRevision != session.UiRevision || detailFocus != session.FocusId))
+        // This is a sibling of the drawer, so collapsing controls cannot hide
+        // a real read wait. It also remains visible while looking with the mouse.
+        if (bufferingNotice.Update(session.Buffering, session.RequestedTime, session.PreparingAudio, session.PreparingWorld))
         {
-            nextDetailUpdate = Time.unscaledTimeAsDouble + .1; detailRevision = session.UiRevision; detailFocus = session.FocusId;
-            RefreshInventory(); changed = true;
+            SetText(bufferingText, bufferingNotice.Text);
+            bufferingRoot.gameObject.SetActive(bufferingNotice.Visible);
+        }
+        bool controlsVisible = IsExpanded;
+        if (controlsVisible)
+        {
+            if (titleActors != session.VisibleActors)
+            { titleActors = session.VisibleActors; title.text = "这一段回忆  ·  " + titleActors + " 位参与者"; }
+            double displayed = session.Buffering ? session.RequestedTime : session.Time;
+            long displayedSecond = (long)Math.Floor(displayed);
+            if (clockSecond != displayedSecond)
+            {
+                clockSecond = displayedSecond;
+                clock.text = MemoriesLibraryModel.FormatDuration(displayed) + " / " + MemoriesLibraryModel.FormatDuration(session.Duration);
+            }
+            timeline.SetValueWithoutNotify((float)displayed);
+            SetText(playText, session.Paused ? "播放 [空格]" : "暂停 [空格]");
+            SetText(cameraText, session.FreeCamera ? "自由镜头" : "跟随镜头");
+            SetSelected(camera, session.FreeCamera); SetSelected(backpack, detailsExpanded);
+            foreach (var speed in speeds) SetSelected(speed.Button, speed.Speed == session.Speed);
+            SetSelected(diagnosticButton, diagnosticExpanded);
+            string hint = session.FreeCamera ? "右键 + WASD / Q E 移动 · Shift 加速" : "按住右键转向 · 指向画面滚轮缩放（1–35 米）";
+            if (session.Buffering) hint = bufferingNotice.Text;
+            else if (!string.IsNullOrEmpty(hudWarning)) hint = hudWarning;
+            else if (!string.IsNullOrEmpty(session.ObjectWarning)) hint = session.ObjectWarning;
+            else if (session.MissingJointCount > 0) hint = session.MissingJointCount + " 个人物关节未匹配 · F9 查看诊断";
+            SetText(status, hint);
+            // Hidden F9 diagnostics must not format a long string every frame.
+            if (showDiagnostics && (changed || Time.unscaledTimeAsDouble >= nextDiagnosticUpdate))
+            {
+                nextDiagnosticUpdate = Time.unscaledTimeAsDouble + .2;
+                SetText(diagnostics, performance + "\n场景物品 " + session.VisibleItemCount + "/" + session.RecordedItemCount +
+                    " · 箱子 " + session.RecordedCrateCount + " · 关节 " + session.RecordedJointCount + " · 录制采样 " + session.SampleHz + " Hz" +
+                    (string.IsNullOrEmpty(session.ObjectWarning) ? "" : "\n" + session.ObjectWarning) + "\nEnd 紧急返回 · F7 退出回忆");
+            }
+            if (detailsExpanded && (detailFocus != session.FocusId || Time.unscaledTimeAsDouble >= nextDetailUpdate && detailRevision != session.UiRevision))
+            {
+                nextDetailUpdate = Time.unscaledTimeAsDouble + .1; detailRevision = session.UiRevision; detailFocus = session.FocusId;
+                int previousCount = ordered.Count; RefreshInventory(); if (previousCount != ordered.Count) changed = true;
+            }
         }
         float desiredWidth = Mathf.Min(1500, canvasRect.rect.width - 64);
         float desiredHeight = 184 + (detailsExpanded ? 240 : 0) + (diagnosticExpanded ? 108 : 0);
@@ -234,6 +266,10 @@ internal sealed class NativeReplayConsole : IDisposable
     {
         width = Mathf.Max(600, desiredWidth); height = desiredHeight;
         panel.sizeDelta = new Vector2(width, height);
+        float noticeWidth = Mathf.Max(320, Mathf.Min(800, canvasRect.rect.width - 64));
+        bufferingRoot.sizeDelta = new Vector2(noticeWidth, 76);
+        Place(bufferingText.rectTransform, 20, 9, noticeWidth - 40, 30);
+        Place(bufferingDetail.rectTransform, 20, 43, noticeWidth - 40, 23);
         float inner = width - 40, y = 16;
         float heading = inner - 176;
         Place(title.rectTransform, 20, y, heading * .60f, 32);
@@ -267,6 +303,32 @@ internal sealed class NativeReplayConsole : IDisposable
         diagnostics.gameObject.SetActive(diagnosticExpanded);
         if (diagnosticExpanded) Place(diagnostics.rectTransform, 20, y, inner, 100);
     }
+
+    private void BuildBufferingNotice()
+    {
+        bufferingRoot = Rect("Independent replay read notice", root!.transform);
+        bufferingRoot.anchorMin = bufferingRoot.anchorMax = bufferingRoot.pivot = new Vector2(.5f, 1);
+        bufferingRoot.anchoredPosition = new Vector2(0, -112);
+        var noticeCanvas = bufferingRoot.gameObject.AddComponent<Canvas>();
+        noticeCanvas.overrideSorting = true; noticeCanvas.sortingOrder = 1020;
+        noticeCanvas.additionalShaderChannels = AdditionalCanvasShaderChannels.TexCoord1 |
+            AdditionalCanvasShaderChannels.TexCoord2 | AdditionalCanvasShaderChannels.TexCoord3;
+        var noticeGroup = bufferingRoot.gameObject.AddComponent<CanvasGroup>();
+        noticeGroup.alpha = 1; noticeGroup.interactable = false; noticeGroup.blocksRaycasts = false; noticeGroup.ignoreParentGroups = true;
+        Image(bufferingRoot, fillSprite, Brown);
+        if (outlineSprite != fillSprite)
+        {
+            var border = Rect("Native read notice outline", bufferingRoot); Stretch(border);
+            Image(border, outlineSprite, new Color(Cream.r, Cream.g, Cream.b, .78f));
+        }
+        bufferingText = Text("Read wait message", bufferingRoot, 26, TextAlignmentOptions.Center);
+        bufferingDetail = Text("Read wait continuation", bufferingRoot, 19, TextAlignmentOptions.Center);
+        bufferingDetail.text = "读取完成后显示目标画面";
+        bufferingRoot.gameObject.SetActive(false);
+    }
+
+    private static void SetText(TMP_Text text, string value)
+    { if (text.text != value) text.text = value; }
 
     private void BuildDrawerHandle()
     {

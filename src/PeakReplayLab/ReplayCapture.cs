@@ -32,6 +32,7 @@ internal static class Capture
         public double NextCosmeticRead;
         public readonly ActorJointCapture Joints = new();
         public ReplayHudState? HudState;
+        public WebWrapReplayFrame? WebWrap;
         public ActorRouteState? RouteState;
         public double NextRouteRead;
         public int WarpSequence;
@@ -88,7 +89,7 @@ internal static class Capture
         return header;
     }
 
-    public static ActorFrame Actor(Character c, double time)
+    public static ActorFrame Actor(Character c, double time, bool sampleAttachments = true)
     {
         var cache = actors.GetValue(c, _ => new ActorCache());
         Vector3 p = c.refs.hip.transform.position;
@@ -113,7 +114,7 @@ internal static class Capture
             Stamina = d.currentStamina, ExtraStamina = d.extraStamina,
             HudState = HudStateOf(c, cache),
             RouteState = RouteStateOf(c, cache, time),
-            WebWrap = WebWrapReplayCapture.Sample(c),
+            WebWrap = sampleAttachments ? cache.WebWrap = WebWrapReplayCapture.Sample(c) : cache.WebWrap,
             Appearance = AppearanceOf(c),
             Inventory = inventory, InventoryKnown = inventoryKnown,
             BackpackType = backpackType, BackpackWorn = backpackType > 0 && !backpackHeld,
@@ -226,24 +227,96 @@ internal sealed class RollingCapture : IDisposable
 {
     private readonly List<Character> players = new();
     private readonly Transform[] mapObjects;
-    private readonly ItemCapture items;
-    private readonly LuggageCapture crates;
-    private readonly RopeReplayCapture ropes = null!;
-    private readonly EffectReplayCapture effects = null!;
-    private readonly AudioReplayCapture audio = null!;
-    private readonly SpawnedReplayCapture spawned = null!;
-    private readonly BalloonReplayCapture balloons = null!;
-    private readonly CreatureReplayCapture creatures = null!;
-    private readonly ReplayRegionCapture regions = null!;
+    private ItemCapture items = null!;
+    private LuggageCapture crates = null!;
+    private RopeReplayCapture ropes = null!;
+    private EffectReplayCapture effects = null!;
+    private AudioReplayCapture audio = null!;
+    private SpawnedReplayCapture spawned = null!;
+    private BalloonReplayCapture balloons = null!;
+    private CreatureReplayCapture creatures = null!;
+    private InteractionReplayCapture interactions = null!;
+    private ReplayRegionCapture regions = null!;
+    private readonly CaptureSegmentScope segmentScope = null!;
     private readonly Action<string>? warning;
     private readonly SampleClock clock;
+    private readonly SceneCaptureSchedule sceneSchedule = new();
+    private readonly Func<float>? itemCaptureDistance;
     private bool disposed;
+    private int bootstrapTrackPhase;
+    private bool bootstrapObservedScene;
+    private int bootstrapPrepareFrame = -1;
+    private string bootstrapValidationFailure = "";
+    private bool freshLiveCheckpoint;
+    internal bool BootstrapReady { get; private set; }
+    internal bool BootstrapHasObservedActors { get; private set; }
+    internal bool HasRecordableActors => players.Count != 0;
+    internal int BootstrapPendingCount => segmentScope.PendingCount;
+    internal object BootstrapDiagnostics => new
+    {
+        Ready = BootstrapReady, ObservedActorPrefix = BootstrapHasObservedActors,
+        InitializedTracks = bootstrapTrackPhase, ObservedScene = bootstrapObservedScene,
+        ScopePending = segmentScope.PendingCount,
+        ValidationFailure = bootstrapValidationFailure,
+        Items = items != null && items.InitialBaselineReady,
+        Crates = crates != null && crates.InitialBaselineReady,
+        Ropes = ropes != null && ropes.InitialBaselineReady,
+        Spawned = spawned != null && spawned.InitialBaselineReady,
+        Balloons = balloons != null && balloons.InitialBaselineReady,
+        Creatures = creatures != null && creatures.InitialBaselineReady,
+        Interactions = interactions != null && interactions.InitialBaselineReady,
+        Effects = effects != null && effects.InitialBaselineReady,
+        Audio = audio != null && audio.InitialBaselineReady,
+        Environment = bootstrapObservedScene && EnvironmentReplayCapture.InitialBaselineReady,
+        Budget = "First native snapshots share a cooperative 2 ms loading budget. A catalogue constructor or individual native read cannot be preempted; urgent real events are never delayed by this baseline budget.",
+    };
     private double previous = -1;
     public RollingBuffer Buffer { get; }
     public ReplayHeader Header { get; }
     public double ObservedHz => clock.ObservedRate;
     public long SkippedSamples => clock.Skipped;
+    internal object SceneDiagnostics => new
+    {
+        TargetHz = SceneCaptureSchedule.MaximumHz, sceneSchedule.ObservedHz, sceneSchedule.SkippedSlots,
+        LocalPlayerTargetHz = Header.SampleHz,
+        TeammateNetworkTargetHz = Photon.Pun.PhotonNetwork.SerializationRate,
+        sceneSchedule.CaptureTicks, sceneSchedule.ReusedTicks,
+        Measurement = "Non-player periodic tracks share one 30 Hz rendered-frame clock; discrete event queues retain native timestamps. Local player models retain the configured recording clock.",
+    };
+    internal object SegmentDiagnostics => segmentScope.Diagnostics;
     public int ItemCount { get; private set; }
+    internal object ItemDiagnostics => items == null ? new { Initializing = true } : new
+    {
+        items.ActiveVisits, items.SleepingDistanceChecks, items.FallbackReads,
+        items.NativeReads, items.RegistryVisits, HooksHealthy = ItemCapture.EventHooksHealthy,
+        items.RootReads, items.ChildReads, items.LightReads, items.AnimationProbes, items.SleepTransitions, items.WakeTransitions,
+        items.FrogRootChecks, items.FrogIdleSkips, items.FrogIdleTransitions,
+        items.SparseSkips, items.WormClockChecks, items.WormGeometrySkips, items.WormDescriptorChanges,
+        items.ContinuousRootProbes, items.MetadataReads,
+        Measurement = "Cumulative item work since this capture session started; cached-distance checks do not read Unity objects. Counters are work counts, not elapsed time.",
+    };
+    internal object RopeDiagnostics => ropes == null ? new { Initializing = true } : new
+    {
+        ropes.ProbeCount, ropes.ColdSkipCount, ropes.ChangedFrameCount, ropes.SleepingCount,
+        ropes.SleepCount, ropes.WakeCount, ropes.ManagedMotionChecks, ropes.VisibilityProbeCount,
+        ropes.PointReadCount, ropes.BoneReadCount,
+        ropes.DiscoveryFallbackEnabled, ropes.DiscoveryFallbackTicks, ropes.DegradedSafetyReads,
+        Measurement = "Cumulative full geometry reads, managed wake checks and liveness probes are separate work counts, not CPU milliseconds.",
+    };
+    internal object InteractionDiagnostics => interactions == null ? new { Initializing = true } : new
+    {
+        interactions.ProbeCount, interactions.RootReadCount, interactions.GeometryReadCount,
+        interactions.AnimationReadCount, interactions.MotionReadCount, interactions.AppearanceReadCount,
+        interactions.LightReadCount, interactions.PostReadCount, interactions.GloomReadCount,
+        interactions.EventWakeCount, interactions.SleepingSkipCount, interactions.UnknownFallbackReadCount,
+        interactions.EventBurstReadCount, interactions.ContinuousReadCount,
+    };
+    internal object SpawnedDiagnostics => spawned == null ? new { Initializing = true } : new
+    { spawned.GeometryReads, spawned.LightReads, spawned.AppearanceReads, spawned.SleepingGeometrySkips };
+    internal object CreatureDiagnostics => creatures == null ? new { Initializing = true } : creatures.Diagnostics;
+    internal object AudioDiagnostics => audio == null ? new { Initializing = true } : new
+    { audio.PoolDiscoveryPasses, audio.IdlePoolSkips, audio.NativeLivenessReads };
+    internal object EffectDiagnostics => effects == null ? new { Initializing = true } : effects.Diagnostics;
     public int CrateCount { get; private set; }
     public long EventCount { get; private set; }
     public int RopeCount { get; private set; }
@@ -252,11 +325,14 @@ internal sealed class RollingCapture : IDisposable
     public int SpawnedCount { get; private set; }
     public int BalloonCount { get; private set; }
     public int CreatureCount { get; private set; }
+    public int InteractionCount { get; private set; }
     public int JointCount { get; private set; }
 
-    public RollingCapture(int hz, long budget, Action<string>? warning = null)
+    public RollingCapture(int hz, long budget, Action<string>? warning = null, Func<float>? itemCaptureDistance = null,
+        bool prepareEarly = false)
     {
         this.warning = warning;
+        this.itemCaptureDistance = itemCaptureDistance;
         Header = Capture.Header(hz);
         mapObjects = WorldTrack.MapObjects();
         Header.MapObjects = mapObjects.Select(WorldTrack.Path).ToArray();
@@ -265,42 +341,153 @@ internal sealed class RollingCapture : IDisposable
         // immutable snapshots; it does not create a second capture or cache.
         Buffer = new RollingBuffer(budget, frameLimit: ReplayRules.MaxFrames);
         clock = new SampleClock(hz);
-        items = new ItemCapture(warning);
-        crates = new LuggageCapture(warning);
+        segmentScope = new CaptureSegmentScope(warning, NativeSpawnOriginCapture.ResolveOwner);
         try
         {
-            regions = new ReplayRegionCapture(Header, warning);
-            ropes = new RopeReplayCapture(warning);
-            spawned = new SpawnedReplayCapture(warning);
-            balloons = new BalloonReplayCapture(warning);
-            creatures = new CreatureReplayCapture(warning);
-            effects = new EffectReplayCapture(warning);
-            audio = new AudioReplayCapture(warning);
+            if (!prepareEarly) while (bootstrapTrackPhase < 10) InitializeBootstrapTrack();
         }
         catch { Dispose(); throw; }
     }
 
-    public void Tick(Action<ReplayFrame, long>? accepted = null)
+    private void InitializeBootstrapTrack()
     {
-        double time = Time.timeAsDouble;
-        if (disposed || !clock.ShouldCapture(time)) return;
-        using var timing = ReplayPerformance.Measure(ReplayStage.Capture);
+        // Catalogue constructors are not preemptible. Spread them across
+        // rendered loading frames instead of constructing every directory in
+        // one native host-spawn callback. Birth/audio observers are first.
+        switch (bootstrapTrackPhase)
+        {
+            case 0: effects = new EffectReplayCapture(warning); break;
+            case 1: audio = new AudioReplayCapture(warning); break;
+            case 2: items = new ItemCapture(warning, itemCaptureDistance); break;
+            case 3: crates = new LuggageCapture(warning); break;
+            case 4: regions = new ReplayRegionCapture(Header, warning); break;
+            case 5: ropes = new RopeReplayCapture(warning); break;
+            case 6: spawned = new SpawnedReplayCapture(warning); break;
+            case 7: balloons = new BalloonReplayCapture(warning); break;
+            case 8: creatures = new CreatureReplayCapture(warning); break;
+            case 9: interactions = new InteractionReplayCapture(warning); break;
+            default: return;
+        }
+        bootstrapTrackPhase++;
+    }
+
+    internal bool PrepareBootstrap()
+    {
+        if (disposed) throw new ObjectDisposedException(nameof(RollingCapture));
+        if (BootstrapReady) return true;
+        if (bootstrapPrepareFrame == Time.frameCount) return false;
+        bootstrapPrepareFrame = Time.frameCount;
+        using var sharedAppearanceReads = NativeVisualAppearance.BeginCapture();
+        segmentScope.Observe();
         Capture.Players(players);
-        if (players.Count == 0) return;
-        var frame = new ReplayFrame { T = time, Actors = new ActorFrame[players.Count] };
-        using (ReplayPerformance.Measure(ReplayStage.Actors))
-            for (int i = 0; i < players.Count; i++) frame.Actors[i] = Capture.Actor(players[i], time);
-        JointCount = frame.Actors.Sum(actor => actor.JointPose.Length);
+        if (players.Count != 0)
+        {
+            // An existing teammate/client must remain on the real actor/event
+            // clock. Never consume its scene events in an unrecorded prewarm.
+            while (bootstrapTrackPhase < 10) InitializeBootstrapTrack();
+            items.DiscoverBaseline();
+            return false;
+        }
+        if (bootstrapTrackPhase < 10)
+        {
+            InitializeBootstrapTrack();
+            // Observe short native births while other directories are being
+            // installed. This preserves their existing bounded event queues.
+            effects?.ObservePendingEvents(Time.timeAsDouble);
+            return false;
+        }
+        items.DiscoverBaseline();
+        using var workBudget = CaptureBootstrapWorkBudget.Begin(initialOnly: true);
+        double time = Time.timeAsDouble;
+        effects.ObservePendingEvents(time);
+        if (sceneSchedule.Due(time))
+        {
+            var baseline = new ReplayFrame { T = time, Actors = Array.Empty<ActorFrame>() };
+            CaptureScene(baseline, time);
+            try { ReplayRules.ValidateCapture(baseline, -1); }
+            catch (Exception error)
+            {
+                bootstrapValidationFailure = error.Message;
+                throw new InvalidOperationException("回放初态验证失败：" + error.Message, error);
+            }
+            sceneSchedule.Observed(baseline); bootstrapObservedScene = true;
+        }
+        // Read already-admitted initial snapshots first. A new registry batch
+        // must not consume every frame's budget and starve the actual poses.
+        if (CaptureBootstrapWorkBudget.HasTime) segmentScope.Drain(budgetMilliseconds: .5, maxAdmissions: 64);
+        if (bootstrapObservedScene && !segmentScope.HasPending && InitialTrackBaselinesReady()) BootstrapReady = true;
+        return BootstrapReady;
+    }
+
+    private bool InitialTrackBaselinesReady() =>
+        items.InitialBaselineReady && crates.InitialBaselineReady && ropes.InitialBaselineReady &&
+        spawned.InitialBaselineReady && balloons.InitialBaselineReady && creatures.InitialBaselineReady &&
+        interactions.InitialBaselineReady && effects.InitialBaselineReady && audio.InitialBaselineReady &&
+        EnvironmentReplayCapture.InitialBaselineReady;
+
+    internal void RefreshOrigin(GameObject source) => segmentScope.RefreshOrigin(source);
+    internal void RefreshNextLiveCheckpoint() => freshLiveCheckpoint = true;
+    internal void InvalidateBootstrap()
+    {
+        // A late native save restoration can replace active roots after an
+        // earlier prewarm. Its old completion is not evidence for the new map.
+        BootstrapReady = bootstrapObservedScene = false; bootstrapPrepareFrame = -1;
+        segmentScope.Observe();
+    }
+
+    private void CaptureScene(ReplayFrame frame, double time)
+    {
         using (ReplayPerformance.Measure(ReplayStage.World)) frame.World = WorldTrack.Capture(mapObjects);
-        regions.Apply(frame);
-        using (ReplayPerformance.Measure(ReplayStage.Items)) frame.Items = items.Capture();
+        using (ReplayPerformance.Measure(ReplayStage.Items)) frame.Items = items.Capture(frame.Actors);
         using (ReplayPerformance.Measure(ReplayStage.Crates)) frame.Crates = crates.Capture(time);
-        using (ReplayPerformance.Measure(ReplayStage.Ropes)) frame.Ropes = ropes.Capture(time);
+        using (ReplayPerformance.Measure(ReplayStage.Ropes)) frame.Ropes = ropes.Capture(time, frame.Actors, itemCaptureDistance?.Invoke() ?? 40);
         using (ReplayPerformance.Measure(ReplayStage.Effects)) frame.Effects = effects.Capture(time);
         using (ReplayPerformance.Measure(ReplayStage.Audio)) frame.Audio = audio.Capture(time);
         using (ReplayPerformance.Measure(ReplayStage.Spawned)) frame.Spawned = spawned.Capture(time);
         using (ReplayPerformance.Measure(ReplayStage.Balloons)) frame.Balloons = balloons.Capture(time);
         using (ReplayPerformance.Measure(ReplayStage.Creatures)) frame.Creatures = creatures.Capture(time);
+        using (ReplayPerformance.Measure(ReplayStage.Interactions)) frame.Interactions = interactions.Capture(time);
+    }
+
+    public void Tick(Action<ReplayFrame, long>? accepted = null)
+    {
+        double time = Time.timeAsDouble;
+        if (bootstrapTrackPhase < 10) return;
+        if (disposed || !clock.ShouldCapture(time)) return;
+        using var timing = ReplayPerformance.Measure(ReplayStage.Capture);
+        using var sharedAppearanceReads = NativeVisualAppearance.BeginCapture();
+        Capture.Players(players);
+        if (players.Count == 0) return;
+        if (!BootstrapReady) BootstrapHasObservedActors = true;
+        using var initialBudget = !BootstrapReady ? CaptureBootstrapWorkBudget.Begin() : null;
+        segmentScope.Observe();
+        // A bootstrap observation may contain a loading-only short run that
+        // ended before local control. The first real frame observes the native
+        // scene again rather than inheriting that event array from preparation.
+        bool sceneDue = sceneSchedule.Due(time) || previous < 0 || freshLiveCheckpoint;
+        using (ReplayPerformance.Measure(ReplayStage.Effects)) effects.ObservePendingEvents(time);
+        var frame = new ReplayFrame { T = time, Actors = new ActorFrame[players.Count] };
+        using (ReplayPerformance.Measure(ReplayStage.Actors))
+            for (int i = 0; i < players.Count; i++) frame.Actors[i] = Capture.Actor(players[i], time, sceneDue);
+        JointCount = frame.Actors.Sum(actor => actor.JointPose.Length);
+        if (sceneDue)
+        {
+            if (BootstrapReady) segmentScope.Drain();
+            else segmentScope.Drain(budgetMilliseconds: 2, maxAdmissions: 64);
+            if (previous < 0 || freshLiveCheckpoint) { effects.InvalidateLiveBaselines(); freshLiveCheckpoint = false; }
+            CaptureScene(frame, time);
+            sceneSchedule.Observed(frame);
+            bootstrapObservedScene = true;
+            if (!BootstrapReady && !segmentScope.HasPending && InitialTrackBaselinesReady()) BootstrapReady = true;
+        }
+        else
+        {
+            // Immutable scene state retains its real observation clock. The
+            // playback index brackets these 30 Hz observations, not the copies
+            // carried by intervening high-frequency local-player frames.
+            sceneSchedule.Reuse(frame);
+        }
+        regions.Apply(frame);
         frame.Events = ItemEventCapture.Drain(time);
         using (ReplayPerformance.Measure(ReplayStage.Validate)) ReplayRules.ValidateCapture(frame, previous);
         using (ReplayPerformance.Measure(ReplayStage.Buffer)) Buffer.Add(frame);
@@ -308,7 +495,7 @@ internal sealed class RollingCapture : IDisposable
         RopeCount = frame.Ropes.Length; EffectCount = frame.Effects.Length; AudioCount = frame.Audio.Length;
         SpawnedCount = frame.Spawned.Length;
         BalloonCount = frame.Balloons.Length;
-        CreatureCount = frame.Creatures.Length;
+        CreatureCount = frame.Creatures.Length; InteractionCount = frame.Interactions.Length;
         previous = time;
         // Immutable frame tee; no file access or JSON work on the game thread.
         // The rolling buffer may evict old frames independently of full-run capture.
@@ -324,8 +511,11 @@ internal sealed class RollingCapture : IDisposable
         Release(items); Release(crates); Release(ropes); Release(effects); Release(audio);
         Release(spawned);
         Release(balloons);
-        Release(creatures);
+        Release(creatures); Release(interactions);
         Release(regions);
+        try { EnvironmentReplayCapture.Reset(); }
+        catch (Exception error) { try { warning?.Invoke("环境采集清理：" + error.Message); } catch { } }
+        finally { Release(segmentScope); }
         // The pure rolling buffer remains available for F6 after returning to the menu.
     }
 }

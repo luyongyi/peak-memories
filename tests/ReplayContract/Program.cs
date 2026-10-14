@@ -1,6 +1,18 @@
 using Newtonsoft.Json;
 using PeakReplayLab;
 
+if (args.Length == 3 && args[0] == "--capture-lifecycle-inspect")
+{ CaptureLifecycleInspection.Run(args[1], args[2]); return; }
+if (args.Length == 3 && args[0] == "--capture-lifecycle-verify")
+{ CaptureLifecycleInspection.VerifyExisting(args[1], args[2]); return; }
+
+if ((args.Length == 3 || args.Length == 4 && args[3] == "--continuous") && args[0] == "--event-storage-inspect")
+{ EventStorageInspection.Run(args[1], args[2], args.Length == 4); return; }
+if (args.Length == 4 && args[0] == "--paired-decode-inspect")
+{ PairedReplayDecodeInspection.Run(args[1], args[2], args[3]); return; }
+if (args.Length == 5 && args[0] == "--paired-versioned-decode-inspect")
+{ VersionedReplayDecodeInspection.Run(args[1], args[2], args[3], args[4]); return; }
+
 // Read-only, bounded catalog inspection for local debugging. No frame payload or
 // private actor identity is printed and no recording is rewritten.
 if (args.Length > 1 && args[0] == "--inspect-covers")
@@ -21,6 +33,9 @@ if (args.Length > 1 && args[0] == "--inspect-covers")
     return;
 }
 
+if (args.Length > 1 && args[0] == "--native-audit")
+{ NativeCoverageInspection.Run(args[1], args.Contains("--all-pages")); return; }
+
 int passed = 0;
 void Test(string name, Action test)
 {
@@ -28,6 +43,53 @@ void Test(string name, Action test)
     catch (Exception e) { Console.Error.WriteLine("FAIL " + name + ": " + e); Environment.Exit(1); }
 }
 void Check(bool value) { if (!value) throw new Exception("Assertion failed."); }
+if (args.Contains("--bounded-reference-only")) { BoundedReferenceCacheTests.Run(Test); return; }
+BoundedReferenceCacheTests.Run(Test);
+WorkerRebaseCacheTests.Run(Test);
+if (args.Contains("--fauna-animation-only")) { FaunaNativeAnimationStorageTests.Run(Test); return; }
+ItemUsesContractTests.Run(Test);
+if (args.Contains("--item-uses-only")) return;
+EffectInitialStateStorageTests.Run(Test);
+ParticleCheckpointStorageTests.Run(Test);
+ReplayTrackSharedBudgetTests.Run(Test);
+BootstrapBaselineValidationTests.Run(Test);
+if(args.Contains("--effect-initial-only")) return;
+SceneObservationTests.Run(Test);
+SparseItemObservationTests.Run(Test);
+EarlyWormAnimationStorageTests.Run(Test);
+if(args.Contains("--sparse-items-only")) return;
+if(args.Contains("--scene-clock-only")) return;
+SceneCaptureScheduleTests.Run(Test);
+SceneAdmittedLifecycleTests.Run(Test);
+if(args.Contains("--scene-lifecycle-only")) return;
+RopeCaptureLifecycleTests.Run(Test);
+InteractionLifecycleTests.Run(Test);
+ItemLifecycleTests.Run(Test, Check);
+RopeObservationTests.Run(Test);
+CreatureObservationClockTests.Run(Test);
+CreatureIdleAnimationTests.Run(Test);
+CreatureNativeIdleStorageTests.Run(Test);
+FaunaNativeAnimationStorageTests.Run(Test);
+SpawnedLifecycleTests.Run(Test, Check);
+if (args.Contains("--capture-lifecycle-only")) return;
+CreatureActivationLifecycleTests.Run(Test);
+CreatureDormancyTests.Run(Test);
+if (args.Contains("--creature-dormancy-only")) return;
+if (args.Contains("--scoutmaster-lifecycle-only")) return;
+EventStorageInspection.RunHelperTests(Test);
+PairedReplayDecodeInspection.RunHelperTests(Test);
+VersionedReplayDecodeInspection.RunHelperTests(Test);
+if (args.Contains("--inspection-helper-only")) return;
+NativeColorEncodingTests.Run(Test);
+if (args.Contains("--colors-only")) return;
+ActorJointTimeCodecTests.Run(Test);
+if (args.Contains("--joint-times-only")) { ActorJointCodecTests.Run(Test); return; }
+ReplayObjectNodeCodecTests.Run(Test);
+if (args.Contains("--nodes-only")) return;
+FullReplaySharedBlockTests.Run(Test);
+if (args.Contains("--shared-only")) return;
+ItemEventDrivenTests.Run(Test, Check);
+if (args.Contains("--items-only")) return;
 void Reject(Action action)
 {
     try { action(); } catch (Exception e) when (e is InvalidDataException || e is JsonException || e is ArgumentOutOfRangeException) { return; }
@@ -182,9 +244,13 @@ Test("each explicit save has a distinct file without overwriting", () => {
 });
 SampleClockTests.Run(Test);
 WorldSegmentIndexTests.Run(Test);
+WorldSeekPreparationBatchTests.Run(Test);
 ObjectTrackTests.Run(Test);
 ItemOptimizationTests.Run(Test, Check);
+ItemDistancePolicyTests.Run(Test, Check);
+ItemRestPolicyTests.Run(Test, Check);
 PerformanceContractTests.Run(Test, Check);
+AudioStartDiagnosticContractTests.Run(Test, Check);
 FrameCadenceTests.Run(Test);
 NativeCapturePolicyTests.Run(Test);
 EnvironmentPerformanceTests.Run(Test);
@@ -195,6 +261,7 @@ ActorJointTimelineTests.Run(Test);
 CrateTimelineTests.Run(Test);
 ReplayDeltaTests.Run(Test);
 PresentationTrackTests.Run(Test);
+PresentationTemplatePoolTests.Run(Test);
 AudioReplayTests.Run(Test, Check);
 RopeReplayTests.Run(Test);
 EffectReplayTests.Run(Test);
@@ -214,6 +281,7 @@ NativeMemoriesNoteLayoutTests.Run(Test);
 NativeMemoriesRecordingControlsTests.Run(Test);
 ReplayTrashTests.Run(Test);
 FullReplayArchiveTests.Run(Test);
+ReplayEffectProjectionTests.Run(Test);
 FullReplayTimestampTests.Run(Test);
 ConcurrentRecordingTests.Run(Test);
 ReplayTimelineTests.Run(Test);
@@ -226,8 +294,14 @@ NativePresentationIntegrationTests.Run(Test);
 EnvironmentReplayMathTests.Run(Test);
 ReplayVisualClockTests.Run(Test);
 CreatureReplayTests.Run(Test);
+CreatureCoverageTests.Run(Test);
+CreatureExtendedCoverageTests.Run(Test);
+BlendShapeCaptureTests.Run(Test);
+NativeCaptureDirectoryTests.Run(Test);
+InteractionReplayTests.Run(Test);
 ReplayQueueBudgetTests.Run(Test);
 CreatureDirectoryTests.Run(Test);
+GhostBodyDirectoryTests.Run(Test);
 CreatureCapacityTests.Run(Test);
 Console.WriteLine($"TOTAL: {passed} checks passed. No Unity runtime is simulated by these tests.");
 

@@ -28,3 +28,43 @@ public static class EnvironmentStormReplayRules
         return (false, warmup, coast);
     }
 }
+
+// A rebuild is a replaceable plan. Advancing it never performs Unity work;
+// callers admit one operation through their shared presentation budget first.
+public enum EnvironmentStormPresentationStep { None, Reset, Clear, Warm, Coast, Advance, Finish }
+
+public sealed class EnvironmentStormPresentationCursor
+{
+    public const double MaximumSliceSeconds = 1.0 / 30;
+    private bool reset, clear;
+    private double warm, coast, advance;
+    public bool Pending { get; private set; }
+    public bool Emitting { get; private set; }
+    public void Rebuild(bool clear, double warm, double coast, bool emitting)
+    {
+        this.clear = clear; reset = !clear; this.warm = Math.Max(0, warm); this.coast = Math.Max(0, coast);
+        advance = 0; Emitting = emitting; Pending = true;
+    }
+    public void Advance(double seconds, bool emitting)
+    {
+        advance += Math.Max(0, seconds); Emitting = emitting;
+        if (seconds > 0) Pending = true;
+    }
+    public void Cancel() { Pending = reset = clear = false; warm = coast = advance = 0; }
+    public EnvironmentStormPresentationStep Take(out float seconds)
+    {
+        seconds = 0;
+        if (!Pending) return EnvironmentStormPresentationStep.None;
+        if (clear) { Cancel(); return EnvironmentStormPresentationStep.Clear; }
+        if (reset) { reset = false; return EnvironmentStormPresentationStep.Reset; }
+        if (warm > .0000001) { seconds = Slice(ref warm); return EnvironmentStormPresentationStep.Warm; }
+        if (coast > .0000001) { seconds = Slice(ref coast); return EnvironmentStormPresentationStep.Coast; }
+        if (advance > .0000001) { seconds = Slice(ref advance); return EnvironmentStormPresentationStep.Advance; }
+        Pending = false; return EnvironmentStormPresentationStep.Finish;
+    }
+    private static float Slice(ref double remaining)
+    {
+        double amount = Math.Min(MaximumSliceSeconds, remaining); remaining = Math.Max(0, remaining - amount);
+        return (float)amount;
+    }
+}

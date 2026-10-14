@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/BoundedReferenceCache.cs" Link="BoundedReferenceCache.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectParticleCheckpoint.cs" Link="EffectParticleCheckpoint.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectParticleCheckpointCodec.cs" Link="EffectParticleCheckpointCodec.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectParticleCheckpointRuntime.cs" Link="EffectParticleCheckpointRuntime.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectCaptureEventState.cs" Link="EffectCaptureEventState.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectCheckpointPlaybackPlan.cs" Link="EffectCheckpointPlaybackPlan.cs" />
+    <Compile Include="../../src/PeakReplayLab/EffectEmitterCapturePolicy.cs" Link="EffectEmitterCapturePolicy.cs" />
+  </ItemGroup>
+  <ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup>
+</Project>

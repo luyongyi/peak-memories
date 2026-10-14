@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/SpawnedReplayPlayback.cs" Link="SpawnedReplayPlayback.cs" />
+    <Compile Include="../../src/PeakReplayLab/InteractionReplayPlayback.cs" Link="InteractionReplayPlayback.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureReplayPlayback.cs" Link="CreatureReplayPlayback.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureIdleAnimation.cs" Link="CreatureIdleAnimation.cs" />
+    <Compile Include="../../src/PeakReplayLab/PresentationResourcePolicy.cs" Link="PresentationResourcePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/PresentationTemplatePool.cs" Link="PresentationTemplatePool.cs" />
+  </ItemGroup>
+</Project>

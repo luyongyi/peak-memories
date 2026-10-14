@@ -4,6 +4,51 @@ internal static class ReplayDrawerMotionTests
 {
     public static void Run(Action<string, Action> test)
     {
+        test("buffering notice stays visible independently of a closed or moving drawer", () =>
+        {
+            var drawer = new ReplayDrawerMotion(); var notice = new ReplayBufferingNotice();
+            Check(notice.Update(true, 75) && notice.Visible && !drawer.Open);
+            string text = notice.Text;
+            for (int frame = 0; frame < 6000; frame++)
+            {
+                if (frame % 100 == 0) drawer.Toggle(); drawer.Tick(.016f);
+                Check(!notice.Update(true, 75) && notice.Visible && ReferenceEquals(notice.Text, text));
+            }
+            Check(notice.Update(false, 75) && !notice.Visible && notice.Text == "");
+            Check(!notice.Update(false, 75));
+        });
+        test("buffering notice follows the latest seek without allocating for repeated whole seconds", () =>
+        {
+            var notice = new ReplayBufferingNotice(); notice.Update(true, 123.1); string text = notice.Text;
+            Check(text.Contains("00:02:03"));
+            notice.Update(true, 123.9); Check(ReferenceEquals(notice.Text, text));
+            Check(notice.Update(true, 4567) && notice.Text.Contains("01:16:07"));
+            notice.Update(false, 4567); Check(notice.Update(true, 123.1) && notice.Visible && notice.Text.Contains("00:02:03"));
+        });
+        test("stable buffering notice formatting allocates no managed memory per frame", () =>
+        {
+            var notice = new ReplayBufferingNotice(); notice.Update(true, 123.5);
+            for (int frame = 0; frame < 100; frame++) notice.Update(true, 123.6);
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int frame = 0; frame < 10000; frame++) notice.Update(true, 123.6);
+            Check(GC.GetAllocatedBytesForCurrentThread() == before && notice.Visible);
+        });
+        test("buffering notice handles unavailable clocks without losing its wait state", () =>
+        {
+            var notice = new ReplayBufferingNotice();
+            foreach (double time in new[] { -1d, double.NaN, double.PositiveInfinity })
+            { notice.Update(true, time); Check(notice.Visible && notice.Text.Contains("--:--:--")); }
+            notice.Update(false, 0); Check(!notice.Visible);
+        });
+        test("cross-segment world preparation is visible and supersedes the audio notice", () =>
+        {
+            var notice = new ReplayBufferingNotice();
+            Check(notice.Update(true, 90, preparingAudio: true) && notice.Text.Contains("声音"));
+            Check(notice.Update(true, 90, preparingAudio: false, preparingWorld: true) && notice.Text.Contains("目标关卡"));
+            string held = notice.Text;
+            Check(!notice.Update(true, 90.5, preparingWorld: true) && ReferenceEquals(notice.Text, held));
+            Check(notice.Update(false, 90) && !notice.Visible);
+        });
         test("drawer starts closed and a click completes its unscaled animation", () =>
         {
             var drawer = new ReplayDrawerMotion();

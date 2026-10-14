@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.3";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.25";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
@@ -41,6 +41,10 @@ public sealed class ReplayFrame
     [JsonIgnore] public bool CoverNadirEntered { get; set; }
     public string Type { get; set; } = "frame";
     public double T { get; set; }
+    // Schema 22: every non-player track shares an actual 30 Hz observation
+    // clock. A repeated 60 Hz player frame holds this immutable scene sample.
+    public bool SceneSampleTimeKnown { get; set; }
+    public double SceneSampleTime { get; set; }
     public WorldFrame World { get; set; } = new();
     public ActorFrame[] Actors { get; set; } = Array.Empty<ActorFrame>();
     public ItemFrame[] Items { get; set; } = Array.Empty<ItemFrame>();
@@ -52,6 +56,7 @@ public sealed class ReplayFrame
     public SpawnedReplayFrame[] Spawned { get; set; } = Array.Empty<SpawnedReplayFrame>();
     public BalloonReplayFrame[] Balloons { get; set; } = Array.Empty<BalloonReplayFrame>();
     public CreatureReplayFrame[] Creatures { get; set; } = Array.Empty<CreatureReplayFrame>();
+    public InteractionReplayFrame[] Interactions { get; set; } = Array.Empty<InteractionReplayFrame>();
 }
 
 public sealed class ActorFrame
@@ -140,21 +145,31 @@ public sealed class ReplayClip
 
 public static class ReplayRules
 {
-    public const int CurrentSchema = 14;
-    public static bool SupportedSchema(int schema) => schema == 10 || schema == 11 || schema == 12 || schema == 13 || schema == CurrentSchema;
+    public const int CurrentSchema = 25;
+    public static bool SupportedSchema(int schema) => schema >= 10 && schema <= CurrentSchema;
     // Scoped to one immutable save/read operation, never trusts a previous operation.
     internal sealed class ValidationMemo
     {
+        public readonly VersionValidationMemo Version = new();
         public readonly HashSet<ItemFrame[]> ItemArrays = new();
         public readonly HashSet<CrateFrame[]> CrateArrays = new();
         public readonly HashSet<ItemFrame> Items = new();
         public readonly HashSet<CrateFrame> Crates = new();
         public readonly ReplayTrackValidation<RopeReplayFrame> Ropes = RopeValidation();
         public readonly ReplayTrackValidation<EffectReplayFrame> Effects = EffectValidation();
+        public readonly ConditionalWeakTable<EffectReplayFrame[], EffectObservationBound> EffectObservations = new();
         public readonly ReplayTrackValidation<AudioReplayFrame> Audio = AudioValidation();
         public readonly ReplayTrackValidation<SpawnedReplayFrame> Spawned = SpawnedValidation();
         public readonly ReplayTrackValidation<BalloonReplayFrame> Balloons = BalloonValidation();
         public readonly ReplayTrackValidation<CreatureReplayFrame> Creatures = CreatureValidation();
+        public readonly ReplayTrackValidation<InteractionReplayFrame> Interactions = InteractionValidation();
+    }
+    // Immutable arrays are shared across frames. Older schemas only need each
+    // track/appearance checked once within this save/read operation.
+    internal sealed class VersionValidationMemo
+    {
+        public readonly HashSet<object> Tracks = new();
+        public readonly HashSet<NativeRendererFrame[]> Visuals = new();
     }
     // Capture data is immutable after insertion. Weak keys avoid retaining evicted
     // world snapshots; disk reads/saves deliberately do not trust this cache.
@@ -165,11 +180,17 @@ public static class ReplayRules
     private static readonly object validated = new();
     private static readonly ReplayTrackValidation<RopeReplayFrame> capturedRopes = RopeValidation();
     private static readonly ReplayTrackValidation<EffectReplayFrame> capturedEffects = EffectValidation();
+    internal sealed class EffectObservationBound { internal double Latest; }
+    private static readonly ConditionalWeakTable<EffectReplayFrame[], EffectObservationBound> capturedEffectObservations = new();
+    private static readonly ConditionalWeakTable<EffectReplayFrame[], EffectObservationBound>.CreateValueCallback effectObservationBound =
+        values => new EffectObservationBound { Latest = LatestEffectObservation(values) };
     private static readonly ReplayTrackValidation<AudioReplayFrame> capturedAudio = AudioValidation();
     private static readonly ReplayTrackValidation<SpawnedReplayFrame> capturedSpawned = SpawnedValidation();
     private static readonly ReplayTrackValidation<BalloonReplayFrame> capturedBalloons = BalloonValidation();
     private static readonly ReplayTrackValidation<CreatureReplayFrame> capturedCreatures = CreatureValidation();
-    private static ReplayTrackValidation<RopeReplayFrame> RopeValidation() => new(x => x.Key, MaxRopes, RopeReplayRules.Validate);
+    private static readonly ReplayTrackValidation<InteractionReplayFrame> capturedInteractions = InteractionValidation();
+    private static ReplayTrackValidation<InteractionReplayFrame> InteractionValidation() => new(x => x.Key, MaxInteractions, InteractionReplayRules.Validate);
+    private static ReplayTrackValidation<RopeReplayFrame> RopeValidation() => new(x => x.Key, MaxRopes, RopeReplayRules.Validate, RopeReplayRules.ValidateCounts);
     private static ReplayTrackValidation<EffectReplayFrame> EffectValidation() => new(x => x.Key, MaxEffects, EffectReplayRules.Validate);
     private static ReplayTrackValidation<AudioReplayFrame> AudioValidation() => new(x => x.Key, MaxAudio, AudioReplayRules.Validate);
     private static ReplayTrackValidation<SpawnedReplayFrame> SpawnedValidation() => new(x => x.Key, MaxSpawned, SpawnedReplayRules.Validate);
@@ -184,12 +205,13 @@ public static class ReplayRules
     public const int MaxCrates = 1024;
     public const int MaxNodes = 256;
     public const int MaxEvents = 4096;
-    public const int MaxRopes = RopeReplayRules.MaximumEntities;
+    public const int MaxRopes = RopeReplayRules.MaximumTotalEntities;
     public const int MaxEffects = EffectReplayRules.Maximum;
     public const int MaxAudio = AudioReplayRules.MaxVoices;
     public const int MaxSpawned = SpawnedReplayRules.MaximumEntities;
     public const int MaxBalloons = BalloonReplayRules.MaximumEntities;
     public const int MaxCreatures = CreatureReplayRules.MaximumEntities;
+    public const int MaxInteractions = InteractionReplayRules.MaximumEntities;
     public static bool Finite(double n) => !double.IsInfinity(n) && !double.IsNaN(n);
     private static bool Vector(float[]? value, int size)
     {
@@ -212,7 +234,7 @@ public static class ReplayRules
     public static void Validate(ReplayHeader h)
     {
         if (!SupportedSchema(h.Schema))
-            throw new InvalidDataException("此版本支持格式 10 至 14，请使用支持的录像或重新录制。");
+            throw new InvalidDataException($"此版本支持格式 10 至 {CurrentSchema}，请使用支持的录像或重新录制。");
         if (h.Type != "header" || string.IsNullOrWhiteSpace(h.Scene) || h.Scene.Length > 200 ||
             h.Route == null || h.Route.Length > 4096 || h.GameVersion == null || h.GameVersion.Length > 100 ||
             h.GameAssembly == null || h.GameAssembly.Length > 64 || h.SampleHz < 1 || h.SampleHz > 60)
@@ -231,15 +253,52 @@ public static class ReplayRules
     internal static void ValidateStored(ReplayFrame frame, double previous, ValidationMemo memo, double maximumStoredTime = 121) =>
         ValidateFrame(frame, previous, false, memo, maximumStoredTime);
 
-    internal static void ValidateVersion(ReplayFrame frame, int schema)
+    internal static void ValidateVersion(ReplayFrame frame, int schema, VersionValidationMemo? memo = null)
     {
         if (!SupportedSchema(schema)) throw new InvalidDataException("Unsupported replay format; record a new replay.");
+        if (schema < 25 && (Array.Exists(frame.Items, item => item.SampleTimeKnown || item.SampleTime != 0 || item.ClockMode != CreatureReplayRules.ActiveClock || item.SampleDiscontinuity ||
+                item.IdleAnimation is { } animation && (CreatureIdleAnimationRules.IsEarlyWormClip(animation.Clip) || animation.SpinRotation != null || animation.SpinSpeed != 0)) ||
+            Array.Exists(frame.Creatures, creature => creature.SampleDiscontinuity || creature.IdleAnimation is { } animation && (animation.SpinRotation != null || animation.SpinSpeed != 0))))
+            throw new InvalidDataException("Independent item observation clocks require schema 25.");
+        if (schema < 24 && (Array.Exists(frame.Items, item => item.IdleAnimation != null) ||
+            Array.Exists(frame.Creatures, creature => creature.IdleAnimation != null && creature.IdleAnimation.Clip != CreatureIdleAnimationRules.SpiderIdle)))
+            throw new InvalidDataException("Native frog and raven animation clocks require schema 24.");
+        if (schema < 23)
+            foreach (var effect in frame.Effects)
+                if (HasParticleCheckpoint(effect.Particles) || HasParticleCheckpoint(effect.InitialState?.Particles))
+                    throw new InvalidDataException("Particle playback checkpoints require schema 23.");
+        if (schema < 22 && (frame.SceneSampleTimeKnown || frame.SceneSampleTime != 0))
+            throw new InvalidDataException("Scene observation clocks require schema 22.");
+        if (schema < 22 && Array.Exists(frame.Effects, effect => effect.InitialState != null))
+            throw new InvalidDataException("Effect initial observations require schema 22.");
+        if (schema < 21 && Array.Exists(frame.Creatures, creature => creature.IdleAnimation != null || creature.Kind == "ghost-ball" || creature.Kind == "player-ghost"))
+            throw new InvalidDataException("Native idle animation and ghost bodies require schema 21.");
+        if (schema < 20 && Array.Exists(frame.Creatures, creature => creature.SampleTimeKnown || creature.SampleTime != 0 || creature.ClockMode != CreatureReplayRules.ActiveClock))
+            throw new InvalidDataException("Creature observation clocks require schema 20.");
+        if (schema < 19 && Array.Exists(frame.Ropes, rope => rope.SampleTimeKnown || rope.SampleTime != 0))
+            throw new InvalidDataException("Rope observation clocks require schema 19.");
+        if (schema < 18)
+        {
+            ValidateLegacyColorTrack(frame.Items, item => item.Visuals, memo);
+            ValidateLegacyColorTrack(frame.Crates, crate => crate.Visuals, memo);
+            ValidateLegacyColorTrack(frame.Creatures, creature => creature.Visuals, memo);
+            ValidateLegacyColorTrack(frame.Spawned, spawned => spawned.Visuals, memo);
+            ValidateLegacyColorTrack(frame.Interactions, interaction => interaction.Visuals, memo);
+        }
+        if (schema < 15) foreach (var audio in frame.Audio) AudioReplayRules.ValidateVersion(audio, schema);
         if (schema < 12 && (frame.World.Environment != null || frame.Creatures.Length != 0 ||
             Array.Exists(frame.Actors, a => a.WebWrap != null) || Array.Exists(frame.Items, i => i.Visuals != null || i.Lights != null) ||
             Array.Exists(frame.Spawned, s => s.Visuals != null || s.Lights != null || !SpawnedReplayRules.LegacyKind(s.Kind))))
             throw new InvalidDataException("Environment, creatures and native visual snapshots require schema 12.");
         if (schema < 13 && frame.World.Environment?.SampleTimeKnown == true)
             throw new InvalidDataException("Environment observation clocks require schema 13.");
+        if (schema < 15 && (frame.Interactions.Length != 0 ||
+            Array.Exists(frame.Crates, c => c.Visuals != null || c.Lights != null) ||
+            Array.Exists(frame.Effects, e => e.Particles != null || e.ForceField != null) ||
+            Array.Exists(frame.Ropes, r => r.SceneVine || r.BreakAmount != 0) ||
+            Array.Exists(frame.Creatures, c => !CreatureDirectoryRules.IsLegacyKind(c.Kind) || c.Resource != c.Kind || HasBlendShapes(c.Visuals)) ||
+            Array.Exists(frame.Items, i => HasBlendShapes(i.Visuals)) || Array.Exists(frame.Spawned, s => HasBlendShapes(s.Visuals))))
+            throw new InvalidDataException("Extended native capture requires schema 15.");
         if (schema < 14 && Array.Exists(frame.Actors, a => a.RouteState != null))
             throw new InvalidDataException("Actor route evidence requires schema 14.");
         if (schema == 10)
@@ -251,6 +310,27 @@ public static class ReplayRules
             }
     }
 
+    private static bool HasParticleCheckpoint(EffectParticleFrame[]? particles) => particles != null && Array.Exists(particles, particle => particle.Checkpoint != null);
+    private static bool HasBlendShapes(NativeRendererFrame[]? values) => values != null && Array.Exists(values, v => v.BlendShapes != null);
+
+    private static void ValidateLegacyColorTrack<T>(T[] track, Func<T, NativeRendererFrame[]?> visuals, VersionValidationMemo? memo)
+    {
+        if (memo != null && memo.Tracks.Contains(track)) return;
+        foreach (var entry in track) ValidateLegacyColors(visuals(entry), memo);
+        memo?.Tracks.Add(track);
+    }
+
+    private static void ValidateLegacyColors(NativeRendererFrame[]? visuals, VersionValidationMemo? memo)
+    {
+        if (visuals == null || memo != null && memo.Visuals.Contains(visuals)) return;
+        foreach (var renderer in visuals)
+            foreach (var material in renderer.Materials)
+                foreach (var property in material.Properties)
+                    if (property.ColorEncoding != 0)
+                        throw new InvalidDataException("Raw native HDR colors require schema 18.");
+        memo?.Visuals.Add(visuals);
+    }
+
     private static void ValidateFrame(ReplayFrame frame, double previous, bool capture, ValidationMemo? memo = null, double maximumStoredTime = 121)
     {
         if (!Finite(maximumStoredTime) || maximumStoredTime < 1 || maximumStoredTime > 4 * 60 * 60)
@@ -258,6 +338,10 @@ public static class ReplayRules
         if (frame.Type != "frame" || !Finite(frame.T) || frame.T < 0 || frame.T <= previous || (!capture && frame.T > maximumStoredTime) ||
             frame.Actors == null)
             throw new InvalidDataException("Invalid replay time or actor count.");
+        if (!Finite(frame.SceneSampleTime) || Math.Abs(frame.SceneSampleTime) > 1_000_000 ||
+            (!frame.SceneSampleTimeKnown && frame.SceneSampleTime != 0) ||
+            frame.SceneSampleTimeKnown && frame.SceneSampleTime > frame.T + .000001)
+            throw new InvalidDataException("Invalid scene observation clock.");
         if (frame.World == null || frame.World.Segment < 0 || frame.World.Segment > 10 ||
             !Finite(frame.World.TimeOfDay) || frame.World.TimeOfDay < 0 || frame.World.TimeOfDay > 1000 ||
             frame.World.Day < 0 || frame.World.Day > 100000 || frame.World.ActiveMapObjects == null || frame.World.ActiveMapObjects.Length > 128)
@@ -289,7 +373,7 @@ public static class ReplayRules
             {
                 if (item == null || item.Slot < 0 || (item.Slot > 63 && item.Slot != 250) || !ValidItemId(item.ItemId) ||
                     !Text(item.Instance, 256) ||
-                    item.Uses < -1 || item.Uses > 1_000_000 || !Finite(item.Fuel) || item.Fuel < -1 || item.Fuel > 1_000_000 ||
+                    !ValidItemUses(item.Uses) || !Finite(item.Fuel) || item.Fuel < -1 || item.Fuel > 1_000_000 ||
                     !Finite(item.UiFuel) || (item.UiFuel != -1 && (item.UiFuel < 0 || item.UiFuel > 1)) ||
                     item.Cooked < -1 || item.Cooked > 1_000_000)
                     throw new InvalidDataException("Invalid inventory item.");
@@ -313,12 +397,27 @@ public static class ReplayRules
         }
         actorIds.Clear();
         ValidateObjects(frame, capture, memo);
+        if (!capture) foreach (var item in frame.Items)
+            if (item.SampleTimeKnown && item.SampleTime > frame.T + .000001)
+                throw new InvalidDataException("Item observation is outside its recording clock.");
         (capture ? capturedRopes : memo?.Ropes ?? RopeValidation()).Validate(frame.Ropes);
+        if (!capture) foreach (var rope in frame.Ropes)
+            if (rope.SampleTimeKnown && rope.SampleTime > frame.T + .000001)
+                throw new InvalidDataException("Rope observation is outside its recording clock.");
         (capture ? capturedEffects : memo?.Effects ?? EffectValidation()).Validate(frame.Effects);
+        var effectTimes = capture ? capturedEffectObservations : memo?.EffectObservations;
+        double latestEffect = effectTimes == null ? LatestEffectObservation(frame.Effects) :
+            effectTimes.GetValue(frame.Effects, effectObservationBound).Latest;
+        if (latestEffect > frame.T + .000001)
+            throw new InvalidDataException("Effect observation is outside its recording clock.");
         (capture ? capturedAudio : memo?.Audio ?? AudioValidation()).Validate(frame.Audio);
         (capture ? capturedSpawned : memo?.Spawned ?? SpawnedValidation()).Validate(frame.Spawned);
         (capture ? capturedBalloons : memo?.Balloons ?? BalloonValidation()).Validate(frame.Balloons);
         (capture ? capturedCreatures : memo?.Creatures ?? CreatureValidation()).Validate(frame.Creatures);
+        if (!capture) foreach (var creature in frame.Creatures)
+            if (creature.SampleTimeKnown && creature.SampleTime > frame.T + .000001)
+                throw new InvalidDataException("Creature observation is outside its recording clock.");
+        (capture ? capturedInteractions : memo?.Interactions ?? InteractionValidation()).Validate(frame.Interactions);
         if (frame.Events == null || frame.Events.Length > MaxEvents) throw new InvalidDataException("Invalid item event count.");
         long lastSequence = -1;
         double lastEventTime = -1;
@@ -333,8 +432,31 @@ public static class ReplayRules
     }
 
     private static bool Text(string? value, int maximum, bool required = false) => value != null && value.Length <= maximum && (!required || !string.IsNullOrWhiteSpace(value));
+    private static double LatestEffectObservation(EffectReplayFrame[] effects)
+    {
+        double latest = double.NegativeInfinity;
+        foreach (var effect in effects)
+        {
+            latest = LatestCheckpointObservation(effect.Particles, latest);
+            if (effect.InitialState is not { } initial) continue;
+            latest = Math.Max(latest, Math.Max(initial.ObservedAt, initial.UntilTime));
+            if (initial.EndTime.HasValue) latest = Math.Max(latest, initial.EndTime.Value);
+            latest = LatestCheckpointObservation(initial.Particles, latest);
+        }
+        return latest;
+    }
+    private static double LatestCheckpointObservation(EffectParticleFrame[]? particles, double latest)
+    {
+        if (particles != null) foreach (var particle in particles)
+            if (particle.Checkpoint is { } checkpoint) latest = Math.Max(latest, checkpoint.ObservedAt);
+        return latest;
+    }
     private static bool Cosmetic(int value) => value >= 0 && value <= 1024;
     private static bool ValidItemId(int value) => value >= 0 && value <= ushort.MaxValue;
+    // Native Item.Start copies its int totalUses without an upper cap, and
+    // Action_ReduceUses decrements any positive value (Frog starts at 100M).
+    // Preserve that fixed-size counter and the -1 unavailable/unlimited marker.
+    private static bool ValidItemUses(int value) => value >= -1;
     public static void ValidateObjects(ReplayFrame frame) => ValidateObjects(frame, false);
     internal static void ValidateObjectsStored(ReplayFrame frame, ValidationMemo memo) => ValidateObjects(frame, false, memo);
     private static void ValidateObjects(ReplayFrame frame, bool capture, ValidationMemo? memo = null)
@@ -377,12 +499,23 @@ public static class ReplayRules
 
     private static void ValidateItem(ItemFrame item)
     {
+        if (!Finite(item.SampleTime) || Math.Abs(item.SampleTime) > 1_000_000 ||
+            item.ClockMode < CreatureReplayRules.ActiveClock || item.ClockMode > CreatureReplayRules.SleepingClock ||
+            !item.SampleTimeKnown && (item.SampleTime != 0 || item.ClockMode != CreatureReplayRules.ActiveClock || item.SampleDiscontinuity))
+            throw new InvalidDataException("Invalid item observation clock.");
         if (!ValidItemId(item.ItemId) || !Text(item.Prefab, 256) || !Text(item.Name, 256) || !Text(item.HolderId, 256) || item.State < 0 || item.State > 64 ||
             (item.RevealBackpackContents && item.State != 2) ||
             !Finite(item.Progress) || item.Progress < -1 || item.Progress > 1_000_000 ||
-            item.Uses < -1 || item.Uses > 1_000_000 || !Finite(item.Fuel) || item.Fuel < -1 || item.Fuel > 1_000_000 ||
+            !ValidItemUses(item.Uses) || !Finite(item.Fuel) || item.Fuel < -1 || item.Fuel > 1_000_000 ||
             !Finite(item.Cooked) || Math.Abs(item.Cooked) > 1_000_000 || !Vector(item.Color, 4)) throw new InvalidDataException("Invalid replay item.");
         ValidatePose(item.Pose);
+        if (item.IdleAnimation != null)
+        {
+            CreatureIdleAnimationRules.Validate(item.IdleAnimation);
+            if (!(item.ItemId == 172 && item.IdleAnimation.Clip == CreatureIdleAnimationRules.FrogIdle ||
+                item.ItemId == 184 && CreatureIdleAnimationRules.IsEarlyWormClip(item.IdleAnimation.Clip)))
+                throw new InvalidDataException("Native item animation requires a matching audited checkpoint.");
+        }
         if (!NativeVisualAppearanceRules.Validate(item.Visuals)) throw new InvalidDataException("Invalid recorded native renderer state.");
         if (!NativeLightRules.Validate(item.Lights)) throw new InvalidDataException("Invalid recorded native light state.");
     }
@@ -393,6 +526,8 @@ public static class ReplayRules
         ValidatePose(crate.Pose);
         if (crate.Animation != null && !CrateAnimationTimeline.Valid(crate.Animation))
             throw new InvalidDataException("Invalid crate animation.");
+        if (!NativeVisualAppearanceRules.Validate(crate.Visuals) || !NativeLightRules.Validate(crate.Lights))
+            throw new InvalidDataException("Invalid recorded crate appearance.");
     }
 
     private static void ValidatePose(ObjectPose pose)
@@ -432,6 +567,20 @@ public static class ReplayFiles
     // ordinary standalone recordings still require at least two frames.
     public static ReplayClip Read(TextReader reader, System.Threading.CancellationToken cancellation = default,
         bool allowSingleFrame = false, long decodedByteLimit = ReplayRules.MaxBytes, double maximumStoredTime = 121)
+        => ReadCore(reader, cancellation, allowSingleFrame, decodedByteLimit, maximumStoredTime, effectsOnly: false);
+
+    internal static ReplayClip ReadEffects(TextReader reader, System.Threading.CancellationToken cancellation = default,
+        bool allowSingleFrame = false, long decodedByteLimit = ReplayRules.MaxBytes, double maximumStoredTime = 121)
+        => ReadCore(reader, cancellation, allowSingleFrame, decodedByteLimit, maximumStoredTime, effectsOnly: true);
+
+    internal static ReplayClip ReadBuffered(TextReader reader, ReplayLineBufferPool buffers,
+        System.Threading.CancellationToken cancellation, bool effectsOnly, long decodedByteLimit, double maximumStoredTime,
+        Func<Type, int, object>? sharedSnapshots = null)
+        => ReadCore(reader, cancellation, true, decodedByteLimit, maximumStoredTime, effectsOnly, buffers, sharedSnapshots);
+
+    private static ReplayClip ReadCore(TextReader reader, System.Threading.CancellationToken cancellation,
+        bool allowSingleFrame, long decodedByteLimit, double maximumStoredTime, bool effectsOnly, ReplayLineBufferPool? buffers = null,
+        Func<Type, int, object>? sharedSnapshots = null)
     {
         if (reader == null) throw new ArgumentNullException(nameof(reader));
         if (decodedByteLimit < 1 || decodedByteLimit > ReplayRules.MaxBytes)
@@ -440,7 +589,8 @@ public static class ReplayFiles
             throw new ArgumentOutOfRangeException(nameof(maximumStoredTime));
         cancellation.ThrowIfCancellationRequested();
         var replay = new ReplayClip();
-        string headerLine = ReadBoundedLine(reader) ?? throw new InvalidDataException("Missing header.");
+        using var lineBuffer = new BoundedReplayLineBuffer(buffers);
+        string headerLine = ReadBoundedLine(reader, lineBuffer) ?? throw new InvalidDataException("Missing header.");
         replay.Header = ReadHeaderRecord(headerLine);
         ReplayRules.Validate(replay.Header);
         double previous = -1;
@@ -454,19 +604,38 @@ public static class ReplayFiles
         var decodedAudio = new HashSet<AudioReplayFrame>();
         var decodedSpawned = new HashSet<SpawnedReplayFrame>();
         var decodedBalloons = new HashSet<BalloonReplayFrame>();
+        var decodedCreatures = new HashSet<CreatureReplayFrame>();
+        var decodedInteractions = new HashSet<InteractionReplayFrame>();
         var validation = new ReplayRules.ValidationMemo();
-        var fieldDeltas = new ReplayDeltaCodec.Reader(replay.Header.Schema);
-        string? line;
-        while ((line = ReadBoundedLine(reader)) != null)
+        var fieldDeltas = effectsOnly ? null : new ReplayDeltaCodec.StreamReader(replay.Header.Schema, sharedSnapshots);
+        var effectDeltas = effectsOnly ? new ReplayDeltaCodec.EffectReader(replay.Header.Schema) : null;
+        var effectJsonBuffers = effectsOnly ? new ReplayJsonBufferPool() : null;
+        var effectProjection = effectsOnly ? new ReplayEffectProjection() : null;
+        while (lineBuffer.Read(reader))
         {
             cancellation.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(line)) continue;
+            if (lineBuffer.IsWhiteSpace) continue;
             if (replay.Complete) throw new InvalidDataException("Records found after the replay footer.");
-            var token = ParseObject(line);
-            if ((string?)token["Type"] == "end") { replay.Complete = true; continue; }
-            ReplayFrame frame = fieldDeltas.Decode(token);
+            ReplayFrame? frame;
+            if (effectsOnly)
+            {
+                char[] input = lineBuffer.Buffer; int inputLength = lineBuffer.Length;
+                // The conservative fast path verifies canonical JSON while
+                // replacing discarded values. Unfamiliar syntax retains the
+                // original parser and its exact validation behavior.
+                if (effectProjection!.TryProject(input, inputLength))
+                { input = effectProjection.Buffer; inputLength = effectProjection.Length; }
+                var token = ParseEffectObject(input, inputLength, replay.Header.Schema, effectJsonBuffers!);
+                frame = (string?)token["Type"] == "end" ? null : effectDeltas!.Decode(token);
+            }
+            else
+            {
+                try { frame = fieldDeltas!.DecodeRecord(lineBuffer.Buffer, lineBuffer.Length); }
+                catch (OverflowException e) { throw new InvalidDataException("Delta number outside range.", e); }
+            }
+            if (frame == null) { replay.Complete = true; continue; }
             ReplayRules.ValidateStored(frame, previous, validation, maximumStoredTime);
-            ReplayRules.ValidateVersion(frame, replay.Header.Schema);
+            ReplayRules.ValidateVersion(frame, replay.Header.Schema, validation.Version);
             decodedBytes += RollingBuffer.EstimateFrame(frame);
             foreach (var item in frame.Items) if (decodedItems.Add(item)) decodedBytes += RollingBuffer.Estimate(item);
             foreach (var crate in frame.Crates) if (decodedCrates.Add(crate)) decodedBytes += RollingBuffer.Estimate(crate);
@@ -475,6 +644,8 @@ public static class ReplayFiles
             foreach (var sound in frame.Audio) if (decodedAudio.Add(sound)) decodedBytes += AudioReplayRules.Estimate(sound);
             foreach (var spawn in frame.Spawned) if (decodedSpawned.Add(spawn)) decodedBytes += SpawnedReplayRules.Estimate(spawn);
             foreach (var balloon in frame.Balloons) if (decodedBalloons.Add(balloon)) decodedBytes += BalloonReplayRules.Estimate(balloon);
+            foreach (var creature in frame.Creatures) if (decodedCreatures.Add(creature)) decodedBytes += CreatureReplayRules.Estimate(creature);
+            foreach (var interaction in frame.Interactions) if (decodedInteractions.Add(interaction)) decodedBytes += InteractionReplayRules.Estimate(interaction);
             if (decodedBytes > decodedByteLimit) throw new InvalidDataException("Decoded replay exceeds its conservative memory limit.");
             foreach (var e in frame.Events)
             {
@@ -505,9 +676,53 @@ public static class ReplayFiles
     {
         var token = ParseObject(line);
         if (token["Schema"]?.Type != Newtonsoft.Json.Linq.JTokenType.Integer || !ReplayRules.SupportedSchema((int)token["Schema"]!))
-            throw new InvalidDataException("此版本支持格式 10 至 14，请使用支持的录像或重新录制。");
+            throw new InvalidDataException($"此版本支持格式 10 至 {ReplayRules.CurrentSchema}，请使用支持的录像或重新录制。");
         var h = JsonConvert.DeserializeObject<ReplayHeader>(line, Json) ?? throw new InvalidDataException("Missing header.");
         return h;
+    }
+
+    private static Newtonsoft.Json.Linq.JObject ParseEffectObject(char[] buffer, int length, int schema, ReplayJsonBufferPool buffers)
+    {
+        using var text = new ReplayRecordTextReader(buffer, length);
+        using var json = new JsonTextReader(text) { MaxDepth = 24, DateParseHandling = DateParseHandling.None, ArrayPool = buffers };
+        var settings = new Newtonsoft.Json.Linq.JsonLoadSettings
+        { DuplicatePropertyNameHandling = Newtonsoft.Json.Linq.DuplicatePropertyNameHandling.Error };
+        var result = new Newtonsoft.Json.Linq.JObject();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        if (!json.Read() || json.TokenType != JsonToken.StartObject) throw new InvalidDataException("Expected a replay object.");
+        while (json.Read() && json.TokenType != JsonToken.EndObject)
+        {
+            if (json.TokenType != JsonToken.PropertyName || json.Value is not string name || !seen.Add(name))
+                throw new InvalidDataException("Invalid or duplicate replay field.");
+            if (!json.Read()) throw new InvalidDataException("Incomplete replay field.");
+            if (name == "World")
+            {
+                if (json.TokenType != JsonToken.StartObject) throw new InvalidDataException("Missing world patch.");
+                var world = new Newtonsoft.Json.Linq.JObject(); var worldNames = new HashSet<string>(StringComparer.Ordinal);
+                while (json.Read() && json.TokenType != JsonToken.EndObject)
+                {
+                    if (json.TokenType != JsonToken.PropertyName || json.Value is not string field || !worldNames.Add(field) ||
+                        !ReplayDeltaCodec.EffectReader.AllowsWorldField(field, schema)) throw new InvalidDataException("Invalid or duplicate world field.");
+                    if (!json.Read()) throw new InvalidDataException("Incomplete world field.");
+                    if (field is nameof(WorldFrame.ActiveMapObjects) or nameof(WorldFrame.Segment)) world.Add(field, Newtonsoft.Json.Linq.JToken.ReadFrom(json, settings));
+                    else json.Skip();
+                }
+                if (json.TokenType != JsonToken.EndObject) throw new InvalidDataException("Incomplete world patch.");
+                result.Add(name, world);
+            }
+            else if (name is "Type" or "T" or "SceneSampleTimeKnown" or "SceneSampleTime" or "ObjectsFull" or "Effects" or "RemovedEffects" or "EffectOrder")
+                result.Add(name, Newtonsoft.Json.Linq.JToken.ReadFrom(json, settings));
+            else
+            {
+                // Preserve unknown top-level identities for the ordinary frame
+                // rejection, but do not construct actor/item/geometry JTokens.
+                if (!ReplayDeltaCodec.Reader.AllowsField(name, schema)) result.Add(name, Newtonsoft.Json.Linq.JValue.CreateNull());
+                json.Skip();
+            }
+        }
+        if (json.TokenType != JsonToken.EndObject) throw new InvalidDataException("Incomplete replay object.");
+        if (json.Read()) throw new InvalidDataException("Multiple JSON values in one record.");
+        return result;
     }
 
     private static Newtonsoft.Json.Linq.JObject ParseObject(string line)
@@ -520,18 +735,129 @@ public static class ReplayFiles
         return token;
     }
 
-    private static string? ReadBoundedLine(TextReader reader)
+    private static string? ReadBoundedLine(TextReader reader, BoundedReplayLineBuffer? reusable = null)
     {
-        var line = new System.Text.StringBuilder();
-        int next;
-        while ((next = reader.Read()) != -1 && next != '\n')
+        var line = reusable ?? new BoundedReplayLineBuffer();
+        return line.Read(reader) ? line.Text() : null;
+    }
+    private sealed class BoundedReplayLineBuffer : IDisposable
+    {
+        private readonly ReplayLineBufferPool? pool;
+        internal char[] Buffer { get; private set; }
+        internal int Length { get; private set; }
+        internal BoundedReplayLineBuffer(ReplayLineBufferPool? pool = null)
+        { this.pool = pool; Buffer = pool?.Rent() ?? new char[4096]; }
+        internal bool IsWhiteSpace
         {
-            if (line.Length >= ReplayRules.MaxLineCharacters) throw new InvalidDataException("Replay record exceeds 8 MiB.");
-            line.Append((char)next);
+            get { for (int i = 0; i < Length; i++) if (!char.IsWhiteSpace(Buffer[i])) return false; return true; }
         }
-        if (next == -1 && line.Length == 0) return null;
-        string text = line.ToString().TrimEnd('\r');
-        if (System.Text.Encoding.UTF8.GetByteCount(text) > ReplayRules.MaxLineCharacters) throw new InvalidDataException("Replay record exceeds 8 MiB UTF-8.");
-        return text;
+        internal bool Read(TextReader reader)
+        {
+            Length = 0; int next;
+            while ((next = reader.Read()) != -1 && next != '\n')
+            {
+                if (Length >= ReplayRules.MaxLineCharacters) throw new InvalidDataException("Replay record exceeds 8 MiB.");
+                if (Length == Buffer.Length)
+                {
+                    var grown = new char[Math.Min(ReplayRules.MaxLineCharacters, Buffer.Length * 2)];
+                    Array.Copy(Buffer, grown, Length); Buffer = grown;
+                }
+                Buffer[Length++] = (char)next;
+            }
+            if (next == -1 && Length == 0) return false;
+            while (Length > 0 && Buffer[Length - 1] == '\r') Length--;
+            if (System.Text.Encoding.UTF8.GetByteCount(Buffer, 0, Length) > ReplayRules.MaxLineCharacters)
+                throw new InvalidDataException("Replay record exceeds 8 MiB UTF-8.");
+            return true;
+        }
+        internal string Text() => new(Buffer, 0, Length);
+        public void Dispose()
+        {
+            var released = Buffer; Buffer = Array.Empty<char>(); Length = 0;
+            if (released.Length != 0) pool?.Return(released);
+        }
+    }
+}
+
+// A recording owns one reusable text buffer, leased exclusively to a page read.
+// Large baseline lines otherwise grow 4 Ki -> 8 Mi characters afresh on every
+// page (about 32 MiB of temporary arrays). Keep at most one on-demand buffer,
+// <=16 MiB, without retaining parsed frames or reusing delta/validation state.
+// Concurrent reads get separate storage; cancellation/errors return in finally.
+internal sealed class ReplayLineBufferPool : IDisposable
+{
+    private readonly object gate = new();
+    private char[]? spare;
+    private bool disposed;
+    internal char[] Rent()
+    {
+        lock (gate)
+        {
+            if (disposed) throw new ObjectDisposedException(nameof(ReplayLineBufferPool));
+            var result = spare; spare = null;
+            return result ?? new char[4096];
+        }
+    }
+    internal void Return(char[] buffer)
+    {
+        if (buffer.Length < 4096 || buffer.Length > ReplayRules.MaxLineCharacters) return;
+        lock (gate)
+            if (!disposed && (spare == null || spare.Length < buffer.Length)) spare = buffer;
+    }
+    public void Dispose()
+    { lock (gate) { disposed = true; spare = null; } }
+}
+
+// Both full and projected readers consume the same bounded line storage.
+// A reader never outlives its record; expanded models own their strings/arrays.
+internal sealed class ReplayRecordTextReader : TextReader
+{
+    private readonly char[] buffer;
+    private readonly int length;
+    private int position;
+    internal ReplayRecordTextReader(char[] buffer, int length)
+    {
+        if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+        if (length < 0 || length > buffer.Length) throw new ArgumentOutOfRangeException(nameof(length));
+        this.buffer = buffer; this.length = length;
+    }
+    public override int Read() => position < length ? buffer[position++] : -1;
+    public override int Peek() => position < length ? buffer[position] : -1;
+    public override int Read(char[] target, int index, int count)
+    {
+        if (target == null) throw new ArgumentNullException(nameof(target));
+        if (index < 0 || count < 0 || index > target.Length - count) throw new ArgumentOutOfRangeException(nameof(index));
+        int available = Math.Min(count, length - position);
+        Array.Copy(buffer, position, target, index, available); position += available; return available;
+    }
+}
+
+// JsonTextReader also grows private character buffers for long strings (joint
+// blobs in particular). Reuse scratch within one page reader, never globally.
+// At most four arrays of 128 Ki characters survive a record: <= 1 MiB total.
+internal sealed class ReplayJsonBufferPool : Newtonsoft.Json.IArrayPool<char>
+{
+    internal const int Capacity = 4, MaximumRetainedLength = 128 * 1024;
+    private readonly char[]?[] slots = new char[Capacity][];
+    public char[] Rent(int minimumLength)
+    {
+        int best = -1;
+        for (int i = 0; i < slots.Length; i++)
+            if (slots[i] is char[] candidate && candidate.Length >= minimumLength &&
+                (best < 0 || candidate.Length < slots[best]!.Length)) best = i;
+        if (best < 0) return new char[minimumLength];
+        var result = slots[best]!; slots[best] = null; return result;
+    }
+    public void Return(char[]? array)
+    {
+        if (array == null || array.Length > MaximumRetainedLength) return;
+        for (int i = 0; i < slots.Length; i++) if (ReferenceEquals(slots[i], array)) return;
+        int smallest = 0;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            if (slots[i] == null) { slots[i] = array; return; }
+            if (slots[i]!.Length < slots[smallest]!.Length) smallest = i;
+        }
+        if (array.Length > slots[smallest]!.Length) slots[smallest] = array;
     }
 }

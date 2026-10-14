@@ -47,6 +47,7 @@ internal sealed class ReplayTheatre : IDisposable
     public bool Loading => Busy && phase != Phase.Play;
     public bool NativeLoadingVisible => nativeLoading?.Visible == true;
     public string Label { get; private set; } = "";
+    public string SourceFileName { get; private set; } = "";
 
     public ReplayTheatre(Action<string> note, Action<Exception> error, Action<string>? trace = null) { this.note = note; this.error = error; this.trace = trace; }
 
@@ -56,6 +57,7 @@ internal sealed class ReplayTheatre : IDisposable
         if (SceneManager.GetActiveScene().name != "Title" || PhotonNetwork.InRoom || NetCode.Matchmaking.InLobby)
             throw new InvalidOperationException("请先退出本局，回到游戏主菜单再打开回忆录。");
         if (LoadingScreenHandler.loading) throw new InvalidOperationException("游戏仍在加载，请稍后打开回忆录。");
+        SourceFileName = Path.GetFileName(path);
         failure = "";
         readCancellation = new CancellationTokenSource();
         var token = readCancellation.Token;
@@ -65,9 +67,14 @@ internal sealed class ReplayTheatre : IDisposable
             if (string.Equals(Path.GetExtension(path), ".peakrun", StringComparison.OrdinalIgnoreCase))
             {
                 var info = FullReplayArchive.ReadInfo(path, token);
-                result = new PagedReplayTimeline(info.Header, info.Duration, info.FrameCount, info.ActorIds,
-                    info.Pages.Select(p => new ReplayPageRange(p.Start, p.End)).ToArray(),
-                    (index, cancellation) => FullReplayArchive.ReadPage(path, info, index, cancellation), info.Complete);
+                var source = FullReplayArchive.OpenPlayback(path, info, token);
+                try
+                {
+                    result = new PagedReplayTimeline(info.Header, info.Duration, info.FrameCount, info.ActorIds,
+                        source.Ranges, source.Load, info.Complete, source.DecodedPageBytes, source,
+                        source.LoadHistory, source.HistoryDecodedPageBytes);
+                }
+                catch { source.Dispose(); throw; }
             }
             else result = new MemoryReplayTimeline(ReplayFiles.Read(path, token));
             if (token.IsCancellationRequested) { result.Dispose(); token.ThrowIfCancellationRequested(); }
@@ -163,7 +170,8 @@ internal sealed class ReplayTheatre : IDisposable
                         actors.Add(id, new VisualActor(Character.localCharacter));
                         return; // Spread visual allocations across frames; none were kept during normal play.
                     }
-                    Playback = new PlaybackSession(timeline!, actors, error, WorldTrack.Player(timeline!.Header), message => trace?.Invoke("Replay objects: " + message));
+                    Playback = new PlaybackSession(timeline!, actors, error, warning: message => trace?.Invoke("Replay objects: " + message),
+                        stagedWorld: WorldTrack.Player(timeline!.Header));
                     trace?.Invoke("Replay presentation: " + Playback.PresentationDiagnostic);
                     Transition(Phase.Play, "回忆录 · 人物 / 物品 / 绳索 / 特效 / 游戏音效 · Esc 返回首页");
                     break;

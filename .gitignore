@@ -7,6 +7,8 @@
 # Private recordings and diagnostics.
 *.peakrun
 *.peakrun.partial
+*.peakrun.seekcache/
+*.seekpage
 *.peakreplay
 *.ndjson
 *.partial

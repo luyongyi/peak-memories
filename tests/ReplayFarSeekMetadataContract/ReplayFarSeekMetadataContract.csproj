@@ -1,0 +1,4 @@
+<Project>
+  <Import Project="../ReplayContract/ReplayContract.csproj" />
+  <ItemGroup><Compile Include="../../local/checks/full-remediation-0.8.25-20261013/far-seek-probe/Metadata.cs" Link="Metadata.cs" /></ItemGroup>
+</Project>

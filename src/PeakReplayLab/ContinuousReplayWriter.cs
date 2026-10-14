@@ -376,7 +376,7 @@ public sealed class ContinuousReplayWriter
         public bool TryWrite(ReplayFrame native)
         {
             var frame = rebaser.Apply(native);
-            ReplayRules.ValidateStored(frame, previous, validation); ReplayRules.ValidateVersion(frame, owner.template.Schema);
+            ReplayRules.ValidateStored(frame, previous, validation); ReplayRules.ValidateVersion(frame, owner.template.Schema, validation.Version);
             if (frame.World.ActiveMapObjects.Length != owner.template.MapObjects.Length) throw new InvalidDataException("Continuous map state shape changed.");
             foreach (var e in frame.Events)
                 if (e.Sequence <= eventSequence || e.T < eventTime) throw new InvalidDataException("Segment item events are not ordered.");

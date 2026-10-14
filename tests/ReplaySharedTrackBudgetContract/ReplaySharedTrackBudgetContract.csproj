@@ -1,0 +1,4 @@
+<Project>
+  <Import Project="../ReplayContract/ReplayContract.csproj" />
+  <ItemGroup><Compile Include="../ReplayContract/ReplayTrackSharedBudgetTests.cs" Link="ReplayTrackSharedBudgetTests.cs" /></ItemGroup>
+</Project>

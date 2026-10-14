@@ -71,7 +71,7 @@ public static class MemoriesLibraryModel
         if (problem.Length == 0) problem = metadataProblem;
         if (problem.Length == 0 && (!info.Complete || !string.IsNullOrEmpty(info.Fault) || !string.IsNullOrEmpty(info.FaultCode)))
             problem = "录像未完整结束，暂不可播放。";
-        if (problem.Length == 0 && (info.Version != 1 || !ReplayRules.SupportedSchema(header.Schema) || header.Duration != 0 || header.FrameCount != 0 ||
+        if (problem.Length == 0 && (!FullReplayArchive.SupportsContainerVersion(info.Version) || !ReplayRules.SupportedSchema(header.Schema) || header.Duration != 0 || header.FrameCount != 0 ||
             !ReplayRules.Finite(info.Duration) || info.Duration <= 0 || info.Duration > FullReplayArchive.MaximumDuration ||
             info.FrameCount < 2 || info.FrameCount > 4L * 60 * 60 * 60 + 1 ||
             info.Pages == null || info.Pages.Length == 0 || info.Pages.Length > FullReplayArchive.MaximumPages ||

@@ -40,6 +40,24 @@ Test("other cameras and environmental volumes retain their original enabled stat
     Check(f.Environment.enabled && !f.DisabledEnvironment.enabled, "An environmental volume was altered.");
 });
 
+Test("world seek cover sits below replay controls, ignores input and is removed on Dispose", () =>
+{
+    var f = new Fixture();
+    var view = new ReplayView(f.Errors.Add);
+    view.CoverWorldPreparation(true);
+    var cover = UObject.Registry.OfType<GameObject>().Single(o => o.name == "PEAK Memories - world preparation");
+    Check(cover.activeSelf && cover.GetComponent<Canvas>().renderMode == RenderMode.ScreenSpaceOverlay &&
+        cover.GetComponent<Canvas>().sortingOrder == 1009 && !cover.GetComponent<UnityEngine.UI.Image>().raycastTarget,
+        "World cover can obscure replay controls or intercept timeline input.");
+    int count = UObject.Registry.Count;
+    view.CoverWorldPreparation(true);
+    Check(UObject.Registry.Count == count, "Repeated world preparation allocated a second cover.");
+    view.CoverWorldPreparation(false);
+    Check(!cover.activeSelf && f.Camera.enabled, "Completed world preparation hid the native camera.");
+    view.CoverWorldPreparation(true); view.Dispose();
+    Check(cover.Destroyed && f.Errors.Count == 0, "World cover survived replay disposal.");
+});
+
 Test("local eye controller, material and full-screen feature are suppressed", () =>
 {
     var f = new Fixture();

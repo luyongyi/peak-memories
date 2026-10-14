@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
@@ -96,45 +97,106 @@ internal static class NativeLightAppearance
     {
         private readonly VisualReplica replica;
         private readonly Dictionary<string, Texture> cookies = new(StringComparer.Ordinal);
+        private readonly NativeRendererVisibilityPolicy<Light> visibility = new(
+            static light => light.enabled, static (light, enabled) => light.enabled = enabled);
         private readonly NativeLightFrame[] baseline;
         private NativeLightFrame[]? applied;
-        private bool expanded;
-        public Playback(VisualReplica replica, GameObject nativeSource)
+        private readonly NativeVisualResourceCatalog<Texture>.Lease sharedTextures;
+        private NativeLightFrame[]? preparing, requested;
+        private bool preparingActive, stateDirty;
+        private int prepareLight, prepareAbsent;
+        private int initializeLight;
+        public bool IsReady { get; private set; }
+        public Playback(VisualReplica replica, GameObject nativeSource, bool incremental = false)
         {
+            if (!replica.IsReady) throw new InvalidOperationException("Light baselines require a completed visual hierarchy.");
             this.replica = replica;
-            foreach (var source in nativeSource.GetComponentsInChildren<Light>(true)) Register(source.cookie);
-            baseline = Capture(replica.Root.transform, maximumNodes: 1024, includeHierarchyActivity: false);
+            sharedTextures = NativeVisualAppearance.AcquireTextureCatalog(SceneManager.GetActiveScene().handle);
+            baseline = new NativeLightFrame[replica.LightDirectory.Count];
+            if (!incremental) while (!IsReady) InitializeNext();
         }
-        private void Register(Texture? texture) { if (texture && !cookies.ContainsKey(CookieName(texture))) cookies.Add(CookieName(texture), texture!); }
+        public bool ContinueBuild(PresentationWorkBudget budget)
+        { while (!IsReady && budget.Build()) InitializeNext(); return IsReady; }
+        private void InitializeNext()
+        {
+            if (initializeLight >= replica.LightDirectory.Count) { IsReady = true; return; }
+            var entry = replica.LightDirectory[initializeLight]; var light = entry.Clone; Register(entry.Source.cookie);
+            var color = light.color; var size = light.cookieSize2D;
+            baseline[initializeLight++] = new NativeLightFrame { Path = entry.Path, Index = entry.Index, Enabled = light.enabled, Type = (int)light.type,
+                Color = new[] { color.r, color.g, color.b, color.a }, Intensity = light.intensity, Range = light.range, SpotAngle = light.spotAngle,
+                InnerSpotAngle = light.innerSpotAngle, BounceIntensity = light.bounceIntensity, Shadows = (int)light.shadows, ShadowStrength = light.shadowStrength,
+                ShadowBias = light.shadowBias, ShadowNormalBias = light.shadowNormalBias, ShadowNearPlane = light.shadowNearPlane, CullingMask = light.cullingMask,
+                RenderingLayerMask = unchecked((uint)light.renderingLayerMask), Cookie = CookieName(light.cookie), CookieSize = size.x, CookieSize2D = new[] { size.x, size.y },
+                RenderMode = (int)light.renderMode, UseColorTemperature = light.useColorTemperature, ColorTemperature = light.colorTemperature };
+        }
+        private void Register(Texture? texture)
+        {
+            if (!texture) return;
+            string key = CookieName(texture); if (!cookies.ContainsKey(key)) cookies.Add(key, texture!);
+            sharedTextures.Register(key, texture!);
+        }
+        private Texture? FindCookie(string key)
+        {
+            if (cookies.TryGetValue(key, out var local) && local) return local;
+            return sharedTextures.TryGet(key, out var shared) ? shared : null;
+        }
+        public void CancelPending() { preparingActive = false; preparing = requested = null; }
+        public bool TryApply(NativeLightFrame[]? frames, PresentationWorkBudget budget, bool restart = false)
+        {
+            if (!IsReady) throw new InvalidOperationException("An unfinished light baseline cannot be applied.");
+            if (restart) CancelPending();
+            if (!preparingActive && !stateDirty && ReferenceEquals(applied, frames)) return true;
+            if (!preparingActive)
+            { requested = frames; preparing = frames ?? baseline; preparingActive = true; stateDirty = true; prepareLight = prepareAbsent = 0; visibility.Begin(); }
+            while (prepareLight < preparing!.Length)
+            {
+                var frame = preparing[prepareLight];
+                if (frame.Cookie.Length != 0 && !FindCookie(frame.Cookie) &&
+                    !sharedTextures.ExpandIncremental(() => Resources.FindObjectsOfTypeAll<Texture>(), NativeVisualAppearance.TextureIdentity, budget.Build)) return false;
+                if (!budget.Build()) return false;
+                ApplyLight(frame); prepareLight++;
+            }
+            // A shared work budget can yield between any two lights. Keep the
+            // previous valid illumination until its replacement is ready; an
+            // off-then-on reset would leave retained visuals dark while yielding.
+            while (prepareAbsent < baseline.Length)
+            {
+                if (!budget.Build()) return false;
+                var prior = baseline[prepareAbsent++];
+                if (replica.TryCloneLight(prior.Path, prior.Index, out var previous)) visibility.HideAbsent(previous);
+            }
+            applied = requested; preparing = requested = null; preparingActive = false; stateDirty = false; return true;
+        }
         public void Apply(NativeLightFrame[]? frames)
         {
-            if (ReferenceEquals(applied, frames)) return;
-            if (frames == null) { if (applied != null) Apply(baseline); applied = null; return; }
+            if (!IsReady) throw new InvalidOperationException("An unfinished light baseline cannot be applied.");
+            if (!stateDirty && ReferenceEquals(applied, frames)) return;
+            if (frames == null) { if (applied != null || stateDirty) Apply(baseline); applied = null; stateDirty = false; return; }
             // A known empty/partial snapshot clears lights that existed at another
             // seek point. Null alone means use authored lighting from an old recording.
+            visibility.Begin();
+            foreach (var frame in frames) ApplyLight(frame);
             foreach (var authored in baseline)
-                if (replica.TryCloneLight(authored.Path, authored.Index, out var previous)) previous.enabled = false;
-            foreach (var frame in frames)
-            {
-                if (!replica.TryCloneLight(frame.Path, frame.Index, out var light)) continue;
-                light.type = (LightType)frame.Type; light.color = new Color(frame.Color[0], frame.Color[1], frame.Color[2], frame.Color[3]);
-                light.intensity = frame.Intensity; light.range = frame.Range; light.spotAngle = frame.SpotAngle; light.innerSpotAngle = frame.InnerSpotAngle;
-                light.bounceIntensity = frame.BounceIntensity; light.shadows = (LightShadows)frame.Shadows; light.shadowStrength = frame.ShadowStrength;
-                light.shadowBias = frame.ShadowBias; light.shadowNormalBias = frame.ShadowNormalBias; light.shadowNearPlane = frame.ShadowNearPlane;
-                light.cullingMask = frame.CullingMask; light.renderingLayerMask = unchecked((int)frame.RenderingLayerMask); light.cookieSize2D = new Vector2(frame.CookieSize2D[0], frame.CookieSize2D[1]);
-                light.renderMode = (LightRenderMode)frame.RenderMode; light.useColorTemperature = frame.UseColorTemperature; light.colorTemperature = frame.ColorTemperature;
-                if (frame.Cookie.Length == 0) light.cookie = null;
-                else
-                {
-                    if (!cookies.TryGetValue(frame.Cookie, out var cookie) && !expanded)
-                    { expanded = true; foreach (var source in Resources.FindObjectsOfTypeAll<Texture>()) Register(source); cookies.TryGetValue(frame.Cookie, out cookie); }
-                    light.cookie = cookie ? cookie : null;
-                }
-                light.enabled = frame.Enabled;
-            }
-            applied = frames;
+                if (replica.TryCloneLight(authored.Path, authored.Index, out var previous)) visibility.HideAbsent(previous);
+            applied = frames; stateDirty = false;
         }
-        public void Dispose() { cookies.Clear(); applied = null; }
+        private void ApplyLight(NativeLightFrame frame)
+        {
+            if (!replica.TryCloneLight(frame.Path, frame.Index, out var light)) return;
+            light.type = (LightType)frame.Type; light.color = new Color(frame.Color[0], frame.Color[1], frame.Color[2], frame.Color[3]);
+            light.intensity = frame.Intensity; light.range = frame.Range; light.spotAngle = frame.SpotAngle; light.innerSpotAngle = frame.InnerSpotAngle;
+            light.bounceIntensity = frame.BounceIntensity; light.shadows = (LightShadows)frame.Shadows; light.shadowStrength = frame.ShadowStrength;
+            light.shadowBias = frame.ShadowBias; light.shadowNormalBias = frame.ShadowNormalBias; light.shadowNearPlane = frame.ShadowNearPlane;
+            light.cullingMask = frame.CullingMask; light.renderingLayerMask = unchecked((int)frame.RenderingLayerMask); light.cookieSize2D = new Vector2(frame.CookieSize2D[0], frame.CookieSize2D[1]);
+            light.renderMode = (LightRenderMode)frame.RenderMode; light.useColorTemperature = frame.UseColorTemperature; light.colorTemperature = frame.ColorTemperature;
+            if (frame.Cookie.Length == 0) light.cookie = null;
+            else
+            {
+                var cookie = FindCookie(frame.Cookie); light.cookie = cookie ? cookie : null;
+            }
+            visibility.SetDesired(light, frame.Enabled);
+        }
+        public void Dispose() { cookies.Clear(); visibility.Clear(); applied = null; preparing = requested = null; preparingActive = false; sharedTextures.Dispose(); }
     }
     internal sealed class Originals : IDisposable
     {

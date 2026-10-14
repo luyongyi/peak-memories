@@ -1,6 +1,37 @@
 <Solution>
   <Folder Name="/tests/">
+    <Project Path="tests/EarlyWormAnimationContract/EarlyWormAnimationContract.csproj" />
+    <Project Path="tests/CreatureSamplingCadenceContract/CreatureSamplingCadenceContract.csproj" />
+    <Project Path="tests/FrogCaptureContract/FrogCaptureContract.csproj" />
+    <Project Path="tests/FrogTongueSamplingContract/FrogTongueSamplingContract.csproj" />
+    <Project Path="tests/CratePlaybackContract/CratePlaybackContract.csproj" />
+    <Project Path="tests/ItemPlaybackContract/ItemPlaybackContract.csproj" />
     <Project Path="tests/NativeAppearanceContract/NativeAppearanceContract.csproj" />
+    <Project Path="tests/NativeCreatureObserverContract/NativeCreatureObserverContract.csproj" />
+    <Project Path="tests/NativeItemObserverContract/NativeItemObserverContract.csproj" />
+    <Project Path="tests/StaticPlaybackContract/StaticPlaybackContract.csproj" />
+    <Project Path="tests/CreatureIdleAnimationContract/CreatureIdleAnimationContract.csproj" />
+    <Project Path="tests/RavenAnimationContract/RavenAnimationContract.csproj" />
+    <Project Path="tests/NativeSpiderIdleLineContract/NativeSpiderIdleLineContract.csproj" />
+    <Project Path="tests/ActorNetworkContract/ActorNetworkContract.csproj" />
+    <Project Path="tests/AudioSceneEventContract/AudioSceneEventContract.csproj" />
+    <Project Path="tests/NativeAudioPoolContract/NativeAudioPoolContract.csproj" />
+    <Project Path="tests/AudioSeekPreparationContract/AudioSeekPreparationContract.csproj" />
+    <Project Path="tests/AudioClipMetadataContract/AudioClipMetadataContract.csproj" />
+    <Project Path="tests/NativeStaticEventContract/NativeStaticEventContract.csproj" />
+    <Project Path="tests/EffectEventCaptureContract/EffectEventCaptureContract.csproj" />
+    <Project Path="tests/SceneItemCadenceContract/SceneItemCadenceContract.csproj" />
+    <Project Path="tests/NativePlacementActivityContract/NativePlacementActivityContract.csproj" />
+    <Project Path="tests/NativeParameterCadenceContract/NativeParameterCadenceContract.csproj" />
+    <Project Path="tests/ReplaySceneBudgetContract/ReplaySceneBudgetContract.csproj" />
+    <Project Path="tests/NativeSegmentScopeContract/NativeSegmentScopeContract.csproj" />
+    <Project Path="tests/EnvironmentSegmentScopeContract/EnvironmentSegmentScopeContract.csproj" />
+    <Project Path="tests/AutomaticFullRunStartContract/AutomaticFullRunStartContract.csproj" />
+    <Project Path="tests/NativeSpawnOriginContract/NativeSpawnOriginContract.csproj" />
+    <Project Path="tests/NativeItemCaptureContract/NativeItemCaptureContract.csproj" />
+    <Project Path="tests/NativeCaptureBootstrapContract/NativeCaptureBootstrapContract.csproj" />
+    <Project Path="tests/NativeEffectForcesContract/NativeEffectForcesContract.csproj" />
+    <Project Path="tests/EffectCheckpointContract/EffectCheckpointContract.csproj" />
   </Folder>
   <Project Path="src/PeakReplayLab/PeakReplayLab.csproj" />
   <Project Path="tests/ReplayContract/ReplayContract.csproj" />

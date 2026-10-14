@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/CreatureIdleAnimation.cs" Link="CreatureIdleAnimation.cs" />
+    <Compile Include="../../src/PeakReplayLab/CreatureIdleAnimationRuntime.cs" Link="CreatureIdleAnimationRuntime.cs" />
+    <Compile Include="../ReplayContract/CreatureIdleAnimationTests.cs" Link="CreatureIdleAnimationTests.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>

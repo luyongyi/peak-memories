@@ -4,6 +4,7 @@ internal static class RecordingModePolicyTests
 {
     public static void Run(Action<string, Action> test)
     {
+        ReplayNoticeStateTests.Run(test);
         test("legacy modes preserve highlight saving while only Continuous enables the full sink", () =>
         {
             foreach (var mode in new[] { ReplayRecordingMode.Rolling120, ReplayRecordingMode.Continuous })

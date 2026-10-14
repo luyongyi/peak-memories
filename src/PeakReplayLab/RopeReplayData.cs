@@ -22,6 +22,9 @@ public sealed class RopeReplayPoint
 
 public sealed class RopeReplayFrame
 {
+    // Schema 19: the last actual observation, retained while the object sleeps.
+    public bool SampleTimeKnown { get; set; }
+    public double SampleTime { get; set; }
     public string Key { get; set; } = "";
     public string Kind { get; set; } = ""; // rope / vine / hook / anchor
     public string Resource { get; set; } = "";
@@ -40,22 +43,47 @@ public sealed class RopeReplayFrame
     public float Hang { get; set; }
     public float LengthScale { get; set; } = 1;
     public float Jitter { get; set; }
+    public float BreakAmount { get; set; }
+    public bool SceneVine { get; set; }
 }
 
 public static class RopeReplayRules
 {
     public const int MaximumEntities = 256;
+    public const int MaximumSceneVines = 1024;
+    public const int MaximumTotalEntities = MaximumEntities + MaximumSceneVines;
     public const int MaximumPoints = 128;
     public const int MaximumBones = 64;
     public static readonly Type[] KnownTypes = { typeof(RopeReplayFrame), typeof(RopeReplayPoint) };
-    public static RopeReplayFrame Rebase(RopeReplayFrame frame, double start) => frame;
+    public static RopeReplayFrame Rebase(RopeReplayFrame frame, double start) => !frame.SampleTimeKnown || start == 0 ? frame : new()
+    {
+        SampleTimeKnown = true, SampleTime = frame.SampleTime - start,
+        Key = frame.Key, Kind = frame.Kind, Resource = frame.Resource, SourcePath = frame.SourcePath,
+        Pose = frame.Pose, Visible = frame.Visible, Attachment = frame.Attachment,
+        CollisionKind = frame.CollisionKind, Points = frame.Points, Bones = frame.Bones,
+        Width = frame.Width, Cutoff = frame.Cutoff, Hang = frame.Hang, LengthScale = frame.LengthScale,
+        Jitter = frame.Jitter, BreakAmount = frame.BreakAmount, SceneVine = frame.SceneVine,
+    };
+    public static void ValidateCounts(RopeReplayFrame[] frames)
+    {
+        if (frames == null) throw new InvalidDataException("Missing rope directory.");
+        int scene = 0, dynamic = 0;
+        foreach (var frame in frames)
+        { if (frame == null) throw new InvalidDataException("Missing rope frame."); if (frame.SceneVine) scene++; else dynamic++; }
+        if (scene > MaximumSceneVines || dynamic > MaximumEntities)
+            throw new InvalidDataException("Rope family count exceeds limits.");
+    }
 
     public static void Validate(RopeReplayFrame frame)
     {
         if (frame == null) throw new InvalidDataException("Missing rope frame.");
+        if (!ReplayRules.Finite(frame.SampleTime) || Math.Abs(frame.SampleTime) > 1_000_000 || !frame.SampleTimeKnown && frame.SampleTime != 0)
+            throw new InvalidDataException("Invalid rope observation time.");
         Text(frame.Key, 256, true); Text(frame.Resource, 256, true); Text(frame.SourcePath, 2048, false);
         if (frame.Kind != "rope" && frame.Kind != "vine" && frame.Kind != "hook" && frame.Kind != "anchor")
             throw new InvalidDataException("Unknown rope kind.");
+        if (frame.SceneVine && (frame.Kind != "vine" || string.IsNullOrWhiteSpace(frame.SourcePath)))
+            throw new InvalidDataException("Invalid scene bridge identity.");
         if (frame.CollisionKind != "none" && frame.CollisionKind != "capsule" && frame.CollisionKind != "box")
             throw new InvalidDataException("Unknown rope collision shape.");
         if (frame.Attachment < 0 || frame.Attachment > 2 || frame.Pose == null || frame.Pose.Nodes == null || frame.Pose.Nodes.Length > 256)
@@ -74,6 +102,7 @@ public static class RopeReplayRules
         if (frame.Kind != "rope" && frame.Bones.Length != 0) throw new InvalidDataException("Only native ropes have rope bones.");
         Nonnegative(frame.Width, 1000); Bounded(frame.Cutoff, 10); Bounded(frame.Hang, 10000);
         Nonnegative(frame.LengthScale, 1000); Nonnegative(frame.Jitter, 10000);
+        Nonnegative(frame.BreakAmount, 10);
     }
 
     public static bool CanInterpolate(RopeReplayFrame left, RopeReplayFrame right) =>
@@ -83,7 +112,9 @@ public static class RopeReplayRules
 
     public static long Estimate(RopeReplayFrame frame)
     {
-        long bytes = 384L + TextBytes(frame.Key) + TextBytes(frame.Kind) + TextBytes(frame.Resource) + TextBytes(frame.SourcePath) + TextBytes(frame.CollisionKind);
+        // Timeless frames must retain the exact budget used by legacy page
+        // indices. Only schema 19 observations carry the optional clock cost.
+        long bytes = 384L + (frame.SampleTimeKnown ? 16L : 0L) + TextBytes(frame.Key) + TextBytes(frame.Kind) + TextBytes(frame.Resource) + TextBytes(frame.SourcePath) + TextBytes(frame.CollisionKind);
         bytes += 8L * (frame.Points.Length + frame.Bones.Length + frame.Pose.Nodes.Length);
         bytes += 184L * (frame.Points.Length + frame.Bones.Length);
         foreach (var node in frame.Pose.Nodes) bytes += 184L + TextBytes(node.Path);

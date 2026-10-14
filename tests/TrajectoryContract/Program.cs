@@ -214,8 +214,8 @@ Test("complete archives export an independent map-landmark whitelist without mov
 }));
 Test("existing schema 14 complete recordings without landmarks retain absent alignment", () => InRoot(root =>
 {
-    var header = Header(); header.RouteContext!.Alignment = null;
-    var source = Save(root, header, SyntheticFrames());
+    var header = Header(); header.Schema = 14; header.RouteContext!.Alignment = null;
+    var source = new FullReplayResult { FilePath = LegacyReplayFixture.Save(root, header, SyntheticFrames().ToArray()) };
     var info = FullReplayArchive.ReadInfo(source.FilePath); Check(info.Header.Schema == 14 && info.Header.RouteContext!.Alignment == null);
     var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "out"));
     Check(result.MapLandmarkCount == 0);

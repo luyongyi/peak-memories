@@ -5,6 +5,8 @@ internal static class CrateTimelineTests
 {
     public static void Run(Action<string, Action> test)
     {
+        CrateAppearanceCapturePolicyTests.Run(test);
+        CrateAppearanceDataTests.Run(test);
         static void Check(bool value) { if (!value) throw new Exception("Crate timeline assertion failed."); }
         static CrateAnimationFrame Anchor(double start = 10, float initial = 0, float rate = 1, float duration = 2) => new()
         { Clip = "Luggage/Open|2|60", Anchored = true, AnchorTime = start, Time = initial, Rate = rate, Duration = duration };

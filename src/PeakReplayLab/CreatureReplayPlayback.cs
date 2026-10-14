@@ -9,12 +9,90 @@ internal sealed class CreatureReplayPlayback : IDisposable
 {
     private sealed class Entry : IDisposable
     {
-        public string Kind = "", Path = "";
-        public VisualReplica Visual = null!;
+        public string Kind = "", Resource = "", Path = "";
+        public VisualReplica? Visual;
+        public GameObject? LineRoot;
         public LineRenderer? Line;
         public NativeVisualAppearance.Playback? Appearance;
+        public CreatureIdleAnimationRuntime? IdleRuntime;
+        public RavenAnimationRuntime? RavenRuntime;
+        public SpiderIdleLinePlayback? IdleLine;
+        public bool IdlePresented;
+        public ObjectPose? IdlePose;
+        public CreatureIdleAnimation? IdleFrame;
+        public GameObject Native = null!;
+        public string Key = "";
+        private bool lineInitialized;
+        public bool Presented, RestartAppearance = true, NeedsRefresh;
+        private bool appearancePending;
+        private NativeRendererFrame[]? appearanceTarget;
+        public string Template => Kind + "\n" + Native.GetInstanceID().ToString(System.Globalization.CultureInfo.InvariantCulture);
+        public bool Ready => LineRoot || Visual != null && Visual.IsReady && !Visual.IsResetting && Appearance?.IsReady == true && lineInitialized;
         public int Seen;
-        public void Dispose() { Appearance?.Dispose(); Visual.Dispose(); }
+        public void Hide()
+        {
+            Visual?.Hide(); Visual?.InvalidatePose(); if (LineRoot && LineRoot!.activeSelf) LineRoot.SetActive(false);
+            IdleRuntime?.Invalidate(); IdlePresented = false; IdlePose = null; IdleFrame = null;
+            RavenRuntime?.Invalidate();
+            Presented = false; RestartAppearance = true; NeedsRefresh = false; appearancePending = false; appearanceTarget = null;
+        }
+        public void Defer()
+        {
+            if (Presented) return;
+            Visual?.Hide(); if (LineRoot && LineRoot!.activeSelf) LineRoot.SetActive(false);
+        }
+        public bool ApplyAppearance(NativeRendererFrame[]? frames, PresentationWorkBudget budget)
+        {
+            if (!appearancePending || RestartAppearance) appearanceTarget = frames;
+            bool ready = Appearance!.TryApply(frames, budget, restart: RestartAppearance);
+            appearancePending = !ready; RestartAppearance = false;
+            // A completed pass can advance the pose even while a newer animated
+            // appearance is waiting. Retain pending work without starving motion.
+            NeedsRefresh = ready && !ReferenceEquals(appearanceTarget, frames);
+            return ready;
+        }
+        public void Dispose() { IdleRuntime?.Dispose(); RavenRuntime?.Dispose(); Appearance?.Dispose(); Visual?.Dispose(); if (LineRoot) { LineRoot!.SetActive(false); Object.Destroy(LineRoot); } }
+        public void Retire() { IdleRuntime?.Dispose(); RavenRuntime?.Dispose(); Appearance?.Dispose(); Visual?.Retire(); if (LineRoot) { LineRoot!.SetActive(false); Object.Destroy(LineRoot); } }
+        public bool PrepareIdle(CreatureIdleAnimation animation, PresentationWorkBudget budget)
+        {
+            if (RavenAnimationRuntime.IsRaven(animation.Clip))
+            {
+                if (RavenRuntime != null) return true;
+                if (!budget.Build()) return false;
+                if (Visual == null || !RavenAnimationRuntime.TryCreate(Visual, Native, animation, out RavenRuntime))
+                    throw new InvalidOperationException("原生乌鸦动画不可用，无法复现已停采片段。");
+                return true;
+            }
+            if (IdleRuntime != null) return true;
+            if (!budget.Build()) return false;
+            if (Visual == null || !CreatureIdleAnimationRuntime.TryCreate(Visual, Native, animation, out IdleRuntime))
+                throw new InvalidOperationException("原生蜘蛛待机动画不可用，无法复现已停采片段。");
+            IdleLine = SpiderIdleLinePlayback.TryCreate(Visual, Native, Line);
+            if (IdleLine == null) throw new InvalidOperationException("原生蜘蛛待机蛛丝模板不可用。");
+            return true;
+        }
+        public bool ContinueBuild(PresentationWorkBudget budget)
+        {
+            if (LineRoot) return true;
+            if (Visual!.IsResetting && !Visual.ContinueReuse(budget)) return false;
+            if (!Visual.ContinueBuild(budget)) return false;
+            if (Appearance == null) { if (!budget.Build()) return false; Appearance = new NativeVisualAppearance.Playback(Visual, Native, true); }
+            if (!Appearance.ContinueBuild(budget)) return false;
+            if (!lineInitialized)
+            {
+                if (!budget.Build()) return false;
+                var spider = Native.GetComponent<Spider>();
+                if (spider && spider.line && Visual.TryCloneTransform(spider.line.transform, out var target)) Line = CloneLine(spider.line, target);
+                lineInitialized = true;
+            }
+            return true;
+        }
+        public void BeginReuse()
+        {
+            Hide(); if (Line) { Line!.enabled = false; Line.positionCount = 0; }
+            if (Visual == null) return;
+            Appearance?.Dispose(); Appearance = null; Visual.BeginReuse();
+        }
     }
     private sealed class StaticEntry
     {
@@ -23,7 +101,7 @@ internal sealed class CreatureReplayPlayback : IDisposable
         public string Path = "";
         public Vector3 OriginalPosition, OriginalScale;
         public Quaternion OriginalRotation;
-        public bool Visible, FallbackVisible;
+        public bool Visible, FallbackVisible, FallbackRequested;
         public ObjectPose? AppliedPose, AppliedNext;
         public float AppliedMix;
         public int Seen;
@@ -44,6 +122,7 @@ internal sealed class CreatureReplayPlayback : IDisposable
     private readonly Dictionary<string, StaticEntry> statics = new(StringComparer.Ordinal);
     private readonly Dictionary<string, CreatureReplayFrame> following = new(StringComparer.Ordinal);
     private readonly Dictionary<Renderer, RenderState> hidden = new();
+    private readonly Dictionary<WobbleSpinBounce, bool> suspendedCapyMotion = new();
     private readonly Dictionary<Renderer, StaticEntry> staticOwners = new();
     private readonly Dictionary<string, double> retry = new(StringComparer.Ordinal);
     private readonly HashSet<string> current = new(StringComparer.Ordinal), warned = new(StringComparer.Ordinal);
@@ -52,36 +131,64 @@ internal sealed class CreatureReplayPlayback : IDisposable
     private readonly List<StaticEntry> fallbackSleeping = new();
     private readonly Action<string>? warning;
     private readonly CreatureReplayObserver observer;
+    private readonly PresentationWorkBudget workBudget;
+    private readonly Func<Vector3, float>? priorityScore;
+    private readonly bool includeExtended;
+    private readonly bool includeNativeBodies;
+    private readonly List<CreatureReplayFrame> ordered = new();
+    private readonly PresentationTemplatePool<Entry> pool = new(16, 8192, static entry => entry.Retire());
+    private CreatureReplayFrame[] pendingLeft = Array.Empty<CreatureReplayFrame>(), pendingRight = Array.Empty<CreatureReplayFrame>();
+    private float pendingMix;
+    private double pendingTime;
+    private CreatureObservationTimeline? pendingObservations;
+    private bool pending;
+    private int lastApplyFrame = -1;
     private int serial, enforcedFrame = -1, fallbackCount, fallbackUsed;
     private bool disposed;
     public int MissingCount { get; private set; }
     public int VisibleCount { get; private set; }
-    public CreatureReplayPlayback(Action<string>? warning = null)
+    public int PendingCount { get; private set; }
+    public CreatureReplayPlayback(Action<string>? warning = null, PresentationWorkBudget? workBudget = null, Func<Vector3, float>? priorityScore = null, bool includeExtended = false, bool includeNativeBodies = false)
     {
         this.warning = warning;
+        this.workBudget = workBudget ?? new PresentationWorkBudget();
+        this.priorityScore = priorityScore;
+        this.includeExtended = includeExtended;
+        this.includeNativeBodies = includeNativeBodies;
         observer = new CreatureReplayObserver(Hide);
         try
         {
             CreatureReplayResources.Refresh();
-            foreach (var source in Object.FindObjectsByType<Spider>(FindObjectsInactive.Include, FindObjectsSortMode.None)) Hide(source.gameObject);
-            foreach (var source in Object.FindObjectsByType<MushroomZombie>(FindObjectsInactive.Include, FindObjectsSortMode.None)) Hide(source.gameObject);
-            foreach (var source in Object.FindObjectsByType<TriggerEvent>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-            { var trap = CreatureReplayResources.Trap(source.transform); if (trap) Hide(trap!.gameObject); }
+            CreatureReplayResources.VisitScene(Hide);
         }
         catch { Dispose(); throw; }
     }
     private void Hide(GameObject source)
     {
-        if (!source || CreatureReplayResources.Ours(source.transform) || !source.GetComponent<Spider>() && !source.GetComponent<MushroomZombie>() && CreatureReplayResources.Trap(source.transform) != source.transform) return;
+        if (!source || CreatureReplayResources.Ours(source.transform)) return;
+        string kind = CreatureReplayResources.Kind(source); if (kind.Length == 0) return;
+        // Old files never owned these native bodies. Only schema 15 has a full
+        // extended directory, including the meaningful absence of a new kind.
+        if (!includeExtended && !CreatureDirectoryRules.IsLegacyKind(kind)) return;
+        if (!includeNativeBodies && CreatureDirectoryRules.BodyRequiresSchema21(kind)) return;
+        CreatureReplayResources.Register(source, kind);
+        bool frog = kind == "frog-tongue";
+        if (kind == "capybara")
+            foreach (var motion in source.GetComponentsInChildren<WobbleSpinBounce>(true))
+                if (motion && !suspendedCapyMotion.ContainsKey(motion))
+                { suspendedCapyMotion.Add(motion, motion.enabled); motion.enabled = false; }
         foreach (var renderer in source.GetComponentsInChildren<Renderer>(true))
         {
+            if (frog && !(renderer is LineRenderer)) continue; // ItemPlayback owns the body.
             if (!(renderer is MeshRenderer || renderer is SkinnedMeshRenderer || renderer is LineRenderer) || hidden.ContainsKey(renderer)) continue;
             hidden.Add(renderer, new RenderState(renderer)); renderer.forceRenderingOff = true;
         }
     }
-    public void Enforce()
+    public void Enforce(bool completePending = true)
     {
         if (disposed || enforcedFrame == Time.frameCount) return;
+        workBudget.BeginFrame(Time.frameCount); VisualReplica.DrainRetired(workBudget);
+        if (completePending && pending && lastApplyFrame != Time.frameCount) Apply(pendingLeft, pendingRight, pendingMix, pendingTime, false, pendingObservations);
         enforcedFrame = Time.frameCount;
         foreach (var pair in hidden)
             if (pair.Key)
@@ -90,58 +197,139 @@ internal sealed class CreatureReplayPlayback : IDisposable
                 if (pair.Key.forceRenderingOff != desired) pair.Key.forceRenderingOff = desired;
             }
     }
-    public void Apply(CreatureReplayFrame[] left, CreatureReplayFrame[] right, float mix, double time, bool discontinuity)
+    public void Apply(CreatureReplayFrame[] left, CreatureReplayFrame[] right, float mix, double time, bool discontinuity, CreatureObservationTimeline? observations = null)
     {
         if (disposed) throw new ObjectDisposedException(nameof(CreatureReplayPlayback));
-        serial++; MissingCount = VisibleCount = fallbackUsed = 0; following.Clear(); current.Clear();
-        foreach (var entry in statics.Values) entry.Visible = entry.FallbackVisible = false;
+        lastApplyFrame = Time.frameCount; workBudget.BeginFrame(Time.frameCount);
+        VisualReplica.DrainRetired(workBudget);
+        pendingLeft = left; pendingRight = right; pendingMix = mix; pendingTime = time; pendingObservations = observations; pending = false;
+        serial++; MissingCount = VisibleCount = PendingCount = fallbackUsed = 0; following.Clear(); current.Clear();
+        foreach (var entry in statics.Values) entry.Visible = entry.FallbackVisible = entry.FallbackRequested = false;
         foreach (var frame in right) following[frame.Key] = frame;
-        foreach (var frame in left) current.Add(frame.Key);
-        Reclaim();
-        double now = Time.realtimeSinceStartupAsDouble;
-        foreach (var frame in left)
+        bool prioritize = false;
+        foreach (var frame in left) if (frame.Pose.Active)
         {
+            current.Add(frame.Key);
+            if (CreatureReplayRules.CompactStaticTrap(frame))
+            {
+                if (!statics.TryGetValue(frame.Key, out var trap) || trap.Root && !trap.Root.gameObject.activeSelf && (trap.Fallback == null || !trap.Fallback.IsReady)) prioritize = true;
+            }
+            else if (!entries.TryGetValue(frame.Key, out var existing) || !existing.Ready) prioritize = true;
+        }
+        Reclaim();
+        ordered.Clear(); ordered.AddRange(left);
+        if (prioritize && priorityScore != null) ordered.Sort((a, b) => { int score = priorityScore(V(a.Pose.Position)).CompareTo(priorityScore(V(b.Pose.Position))); return score != 0 ? score : string.CompareOrdinal(a.Key, b.Key); });
+        double now = Time.realtimeSinceStartupAsDouble;
+        foreach (var recorded in ordered)
+        {
+            var frame = recorded;
+            following.TryGetValue(frame.Key, out var next);
+            float frameMix = mix;
+            bool interpolate;
+            if (frame.SampleTimeKnown && observations != null && observations.TrySample(frame.Key, time, out var observedLeft, out var observedRight, out float observedMix))
+            {
+                frame = observedLeft; next = observedRight; frameMix = observedMix;
+                // Visibility/topology cuts were checked once by the worker,
+                // avoiding a full node-tree comparison in the display loop.
+                interpolate = !ReferenceEquals(frame, next);
+            }
+            else interpolate = next != null && CreatureReplayRules.CanInterpolate(frame, next);
             if (retry.TryGetValue(frame.Key, out double nextRetry) && now < nextRetry) { MissingCount++; continue; }
             entries.TryGetValue(frame.Key, out var entry);
             try
             {
                 if (CreatureReplayRules.CompactStaticTrap(frame))
                 {
-                    if (entry != null) { entry.Dispose(); entries.Remove(frame.Key); entry = null; }
+                    if (entry != null) { entry.Retire(); entries.Remove(frame.Key); entry = null; }
                     ApplyStatic(frame, mix); retry.Remove(frame.Key); continue;
                 }
-                if (entry != null && (entry.Kind != frame.Kind || entry.Path != frame.SourcePath))
-                { entry.Dispose(); entries.Remove(frame.Key); entry = null; }
+                if (entry != null && (entry.Kind != frame.Kind || entry.Resource != frame.Resource || entry.Path != frame.SourcePath))
+                { entry.Retire(); entries.Remove(frame.Key); entry = null; }
                 if (entry == null)
                 {
-                    var native = CreatureReplayResources.Find(frame.Kind, frame.SourcePath);
+                    if (!frame.Pose.Active) continue;
+                    var native = CreatureReplayResources.Find(frame.Kind, frame.Resource, frame.SourcePath);
                     if (!native) throw new InvalidOperationException("原版生物模板不可用：" + frame.Kind);
                     if (entries.Count >= CreatureReplayRules.MaximumDynamicEntities * 2 + 16) throw new InvalidOperationException("生物视觉池已满");
-                    entry = new Entry { Kind = frame.Kind, Path = frame.SourcePath,
-                        Visual = new VisualReplica(native!, false, CreatureReplayRules.MaximumNodes) };
+                    string template = frame.Kind + "\n" + native!.GetInstanceID().ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    entry = TakePooledEntry(template, frame.Key);
+                    if (entry != null) { if (entry.Key != frame.Key) entry.BeginReuse(); }
+                    else
+                    {
+                    if (!VisualReplica.CanStartBuild || !workBudget.Create()) { pending = true; PendingCount++; continue; }
+                    entry = new Entry { Kind = frame.Kind, Resource = frame.Resource, Path = frame.SourcePath, Native = native! };
                     try
                     {
-                        entry.Visual.Root.name = "PEAK Replay Creature - " + frame.Kind;
-                        entry.Appearance = new NativeVisualAppearance.Playback(entry.Visual, native!);
-                        var spider = native!.GetComponent<Spider>();
-                        if (spider && spider.line && entry.Visual.TryCloneTransform(spider.line.transform, out var target))
-                            entry.Line = CloneLine(spider.line, target);
-                        entries.Add(frame.Key, entry);
+                        if (frame.Kind == "frog-tongue")
+                        {
+                            var line = native!.GetComponentInChildren<LineRenderer>(true);
+                            if (!line) throw new InvalidOperationException("原版青蛙舌头模板不可用");
+                            entry.LineRoot = new GameObject("PEAK Replay Creature - frog-tongue") { layer = line!.gameObject.layer };
+                            entry.LineRoot.SetActive(false);
+                            entry.Line = CloneLine(line, entry.LineRoot.transform);
+                        }
+                        else
+                        {
+                            entry.Visual = VisualReplica.BeginBuild(native!, false, CreatureReplayRules.MaximumNodes);
+                            entry.Visual.Root.name = "PEAK Replay Creature - " + frame.Kind;
+                        }
                     }
-                    catch { entry.Dispose(); entry = null; throw; }
+                    catch { entry.Retire(); entry = null; throw; }
+                    }
+                    entry.Key = frame.Key; entry.Resource = frame.Resource; entry.Path = frame.SourcePath; entries.Add(frame.Key, entry);
                 }
-                following.TryGetValue(frame.Key, out var next);
-                bool interpolate = next != null && CreatureReplayRules.CanInterpolate(frame, next);
-                if (discontinuity) entry.Visual.InvalidatePose();
-                entry.Visual.Apply(frame.Pose, interpolate ? next!.Pose : null, mix);
-                entry.Appearance?.Apply(frame.Visuals);
-                ApplyLine(entry.Line, frame.Line, interpolate ? next!.Line : null, mix);
+                if (discontinuity) entry.Hide();
+                if (!entry.ContinueBuild(workBudget)) { entry.Defer(); pending = true; PendingCount++; continue; }
+                if (frame.IdleAnimation != null && !entry.PrepareIdle(frame.IdleAnimation, workBudget))
+                { entry.Defer(); pending = true; PendingCount++; continue; }
+                if (entry.Appearance != null)
+                {
+                    bool appearanceReady = entry.ApplyAppearance(frame.Visuals, workBudget);
+                    if (!appearanceReady)
+                    {
+                        entry.Defer(); pending = true; PendingCount++;
+                        if (entry.Presented) VisibleCount++;
+                        continue;
+                    }
+                    if (entry.NeedsRefresh) { pending = true; PendingCount++; }
+                }
+                if (discontinuity) entry.Visual?.InvalidatePose();
+                bool nativeIdle = frame.IdleAnimation != null;
+                bool resetIdle = discontinuity || !entry.IdlePresented || !ReferenceEquals(entry.IdlePose, frame.Pose) || !ReferenceEquals(entry.IdleFrame, frame.IdleAnimation);
+                if (entry.IdlePresented && (!nativeIdle || resetIdle)) entry.Visual?.InvalidatePose();
+                if (resetIdle) { entry.IdleRuntime?.Invalidate(); entry.RavenRuntime?.Invalidate(); }
+                entry.Visual?.Apply(frame.Pose, interpolate ? next!.Pose : null, frameMix);
+                if (entry.LineRoot)
+                {
+                    // Frog line points are sampled in world space, independent
+                    // of the ItemPlayback body's pool and lifetime.
+                    entry.LineRoot!.SetActive(frame.Pose.Active);
+                }
+                entry.Appearance?.ReapplyVisibility();
+                if (nativeIdle)
+                {
+                    if (RavenAnimationRuntime.IsRaven(frame.IdleAnimation!.Clip))
+                        entry.RavenRuntime!.Apply(frame.IdleAnimation, time);
+                    else
+                    {
+                        entry.IdleRuntime!.Apply(frame.IdleAnimation!, time);
+                        // The native idle clip moves the abdomen. Rebuild the silk
+                        // once from those cloned endpoints rather than writing the
+                        // held 40 points and then overwriting all 40 a second time.
+                        ApplyLineState(entry.Line, frame.Line, null, frameMix);
+                        if (!entry.IdleLine!.TryApply(frame.IdleAnimation!.RopePhase))
+                            ApplyLine(entry.Line, frame.Line, null, frameMix);
+                    }
+                }
+                else ApplyLine(entry.Line, frame.Line, interpolate ? next!.Line : null, frameMix);
+                entry.IdlePresented = nativeIdle; entry.IdlePose = frame.Pose; entry.IdleFrame = frame.IdleAnimation;
+                entry.Presented = frame.Pose.Active;
                 entry.Seen = serial; retry.Remove(frame.Key);
                 if (frame.Pose.Active) VisibleCount++;
             }
             catch (Exception e)
             {
-                entry?.Visual.Hide(); MissingCount++; retry[frame.Key] = now + 1;
+                entry?.Retire(); entries.Remove(frame.Key); MissingCount++; retry[frame.Key] = now + 1;
                 if (warned.Count < 128 && warned.Add(frame.Kind)) warning?.Invoke("生物视觉缺失：" + e.Message);
             }
         }
@@ -151,6 +339,11 @@ internal sealed class CreatureReplayPlayback : IDisposable
         removed.Clear(); foreach (var pair in retry) if (!current.Contains(pair.Key)) removed.Add(pair.Key);
         foreach (var key in removed) retry.Remove(key);
     }
+    // Capturing a foreach frame here would allocate even for ready creatures and
+    // static traps. Only a missing visual needs the pool predicates.
+    private Entry? TakePooledEntry(string template, string key) =>
+        pool.Take(template, candidate => candidate.Key == key, candidate => !current.Contains(candidate.Key));
+
     private void ApplyStatic(CreatureReplayFrame frame, float mix)
     {
         if (!statics.TryGetValue(frame.Key, out var entry) || !entry.Root || entry.Path != frame.SourcePath)
@@ -202,21 +395,27 @@ internal sealed class CreatureReplayPlayback : IDisposable
         // are activeSelf=true and their original meshes can be reused directly.
         bool parentActive = !entry.Root.parent || entry.Root.parent.gameObject.activeInHierarchy;
         entry.Visible = pose.Active && entry.Root.gameObject.activeSelf;
-        if (pose.Active && parentActive && !entry.Root.gameObject.activeSelf)
+        entry.FallbackRequested = pose.Active && parentActive && !entry.Root.gameObject.activeSelf;
+        if (entry.FallbackRequested)
         {
             if (fallbackUsed >= CreatureReplayRules.MaximumDynamicEntities)
                 throw new InvalidOperationException("已消耗陷阱的回拖视觉超过256个");
             if (entry.Fallback == null)
             {
+                if (!VisualReplica.CanStartBuild || !workBudget.Create()) { pending = true; PendingCount++; return; }
                 MakeFallbackRoom();
-                entry.Fallback = new VisualReplica(entry.Root.gameObject, true, CreatureReplayRules.MaximumNodes);
+                entry.Fallback = VisualReplica.BeginBuild(entry.Root.gameObject, true, CreatureReplayRules.MaximumNodes);
                 entry.Fallback.Root.name = "PEAK Replay Creature - static trap";
+                fallbackCount++;
+            }
+            if (!entry.Fallback.ContinueBuild(workBudget)) { pending = true; PendingCount++; return; }
+            if (!entry.Fallback.Root.transform.parent)
+            {
                 foreach (var renderer in entry.Renderers)
                     if (renderer && hidden.TryGetValue(renderer, out var original) && entry.Fallback.TryCloneRenderer(renderer, out var copy))
                         copy.forceRenderingOff = original.ForceOff;
                 // The parent's recorded biome activation still governs the inert model.
                 entry.Fallback.Root.transform.SetParent(entry.Root.parent, true);
-                fallbackCount++;
             }
             entry.Fallback.Apply(pose, blend ? next!.Pose : null, mix);
             // VisualReplica normally has no parent and interprets Scale as a
@@ -241,28 +440,40 @@ internal sealed class CreatureReplayPlayback : IDisposable
     {
         if (fallbackCount < CreatureReplayRules.MaximumDynamicEntities + 16) return;
         StaticEntry? oldest = null;
-        foreach (var candidate in statics.Values)
-            if (candidate.Fallback != null && !candidate.FallbackVisible && (oldest == null || candidate.Seen < oldest.Seen)) oldest = candidate;
+        foreach (var pair in statics)
+        {
+            var candidate = pair.Value;
+            if (candidate.Fallback != null && !current.Contains(pair.Key) && !candidate.FallbackVisible && (oldest == null || candidate.Seen < oldest.Seen)) oldest = candidate;
+        }
         if (oldest == null) throw new InvalidOperationException("静态陷阱回拖视觉池已满");
-        oldest.Fallback!.Dispose(); oldest.Fallback = null; fallbackCount--;
+        oldest.Fallback!.Retire(); oldest.Fallback = null; fallbackCount--;
     }
     private void ReclaimStaticFallbacks()
     {
         fallbackSleeping.Clear();
-        foreach (var entry in statics.Values) if (entry.Fallback != null && !entry.FallbackVisible) fallbackSleeping.Add(entry);
+        foreach (var entry in statics.Values) if (entry.Fallback != null && !entry.FallbackVisible)
+        {
+            if (entry.FallbackRequested) continue;
+            if (!entry.Fallback.IsReady) { entry.Fallback.Retire(); entry.Fallback = null; fallbackCount--; }
+            else fallbackSleeping.Add(entry);
+        }
         fallbackSleeping.Sort((a, b) => a.Seen.CompareTo(b.Seen));
         for (int i = 0; i < fallbackSleeping.Count - 16; i++)
-        { fallbackSleeping[i].Fallback!.Dispose(); fallbackSleeping[i].Fallback = null; fallbackCount--; }
+        { fallbackSleeping[i].Fallback!.Retire(); fallbackSleeping[i].Fallback = null; fallbackCount--; }
     }
     private static Vector3 V(float[] values) => new(values[0], values[1], values[2]);
     private static Quaternion Q(float[] values) => new(values[0], values[1], values[2], values[3]);
     private static float Divide(float value, float denominator) => Mathf.Abs(denominator) > .000001f ? value / denominator : value;
     private void Reclaim()
     {
-        sleeping.Clear();
-        foreach (var pair in entries) if (!current.Contains(pair.Key)) { pair.Value.Visual.Hide(); sleeping.Add(pair); }
-        sleeping.Sort((a, b) => a.Value.Seen.CompareTo(b.Value.Seen));
-        for (int i = 0; i < sleeping.Count - 16; i++) { sleeping[i].Value.Dispose(); entries.Remove(sleeping[i].Key); }
+        removed.Clear();
+        foreach (var pair in entries) if (!current.Contains(pair.Key))
+        {
+            pair.Value.Hide(); removed.Add(pair.Key);
+            if (pair.Value.Ready) pool.Return(pair.Value.Template, pair.Value, pair.Value.Visual?.RetainedCost ?? 4);
+            else pair.Value.Retire();
+        }
+        foreach (var key in removed) entries.Remove(key);
     }
     private static LineRenderer CloneLine(LineRenderer source, Transform target)
     {
@@ -276,13 +487,11 @@ internal sealed class CreatureReplayPlayback : IDisposable
     }
     private static void ApplyLine(LineRenderer? target, CreatureReplayLine? left, CreatureReplayLine? right, float mix)
     {
+        ApplyLineState(target, left, right, mix);
         if (!target) return;
         if (left == null) { target!.enabled = false; return; }
         bool blend = right != null && left.WorldSpace == right.WorldSpace && left.Points.Length == right.Points.Length && left.Enabled && right.Enabled;
-        target!.useWorldSpace = left.WorldSpace; target.enabled = left.Enabled;
-        target.widthMultiplier = blend ? Mathf.LerpUnclamped(left.Width, right!.Width, mix) : left.Width;
-        target.positionCount = left.Points.Length / 3;
-        for (int i = 0; i < target.positionCount; i++)
+        for (int i = 0; i < target!.positionCount; i++)
         {
             int at = i * 3;
             var a = new Vector3(left.Points[at], left.Points[at + 1], left.Points[at + 2]);
@@ -290,12 +499,24 @@ internal sealed class CreatureReplayPlayback : IDisposable
             target.SetPosition(i, Vector3.LerpUnclamped(a, b, mix));
         }
     }
+    private static void ApplyLineState(LineRenderer? target, CreatureReplayLine? left, CreatureReplayLine? right, float mix)
+    {
+        if (!target) return;
+        if (left == null) { target!.enabled = false; return; }
+        bool blend = right != null && left.WorldSpace == right.WorldSpace && left.Points.Length == right.Points.Length && left.Enabled && right.Enabled;
+        target!.useWorldSpace = left.WorldSpace; target.enabled = left.Enabled;
+        target.widthMultiplier = blend ? Mathf.LerpUnclamped(left.Width, right!.Width, mix) : left.Width;
+        target.positionCount = left.Points.Length / 3;
+    }
     public void Dispose()
     {
         if (disposed) return; disposed = true; observer.Dispose();
         foreach (var entry in entries.Values) entry.Dispose(); entries.Clear();
         foreach (var entry in statics.Values) entry.Restore(); statics.Clear();
         foreach (var pair in hidden) if (pair.Key) { pair.Key.forceRenderingOff = pair.Value.ForceOff; pair.Key.enabled = pair.Value.Enabled; }
+        foreach (var pair in suspendedCapyMotion) if (pair.Key) pair.Key.enabled = pair.Value;
+        suspendedCapyMotion.Clear();
         hidden.Clear(); staticOwners.Clear(); retry.Clear();
+        pool.Clear(); VisualReplica.FlushRetired();
     }
 }

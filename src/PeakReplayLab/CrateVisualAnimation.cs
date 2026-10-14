@@ -12,6 +12,8 @@ internal sealed class CrateVisualAnimation : IDisposable
 {
     private readonly GameObject root;
     private readonly Animator animator;
+    private readonly RuntimeAnimatorController controller;
+    private readonly AnimationClip[] catalogue;
     private readonly Dictionary<string, AnimationClip?> clips = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (AnimationClipPlayable Playable, int Port)> players = new(StringComparer.Ordinal);
     private readonly List<AnimationClip> ownedClips = new();
@@ -19,7 +21,12 @@ internal sealed class CrateVisualAnimation : IDisposable
     private AnimationMixerPlayable mixer;
     private string previousClip = "";
     private double previousTime = double.NaN;
+    private AnimationClip? preparedClip;
+    private string preparedKey = "";
+    private double preparedTime;
     private bool disposed;
+    private int catalogueIndex, buildStage;
+    public bool IsReady => buildStage == 4;
 
     public CrateVisualAnimation(Luggage source, GameObject root)
     {
@@ -33,32 +40,62 @@ internal sealed class CrateVisualAnimation : IDisposable
             var original = source.GetComponent<Animator>();
             if (!original || !original.runtimeAnimatorController) throw new InvalidOperationException("箱子的原生动画控制器未就绪。");
             animator.avatar = original.avatar;
-            foreach (var clip in original.runtimeAnimatorController.animationClips)
-            {
-                if (!clip) continue;
-                string key = Capture.ClipKey(clip, original.runtimeAnimatorController);
-                if (!clips.TryGetValue(key, out var existing)) clips.Add(key, clip);
-                else if (existing != clip) clips[key] = null;
-            }
-            graph = PlayableGraph.Create("PeakReplayLab.CrateVisual");
-            graph.SetTimeUpdateMode(DirectorUpdateMode.Manual);
-            mixer = AnimationMixerPlayable.Create(graph, 0);
-            AnimationPlayableOutput.Create(graph, "crate", animator).SetSourcePlayable(mixer);
-            graph.Play();
+            controller = original.runtimeAnimatorController;
+            catalogue = controller.animationClips;
         }
         catch { Dispose(); throw; }
     }
 
-    public void Sample(CrateAnimationFrame value, CrateAnimationFrame? next, float mix, double replayTime, bool force)
+    public bool ContinueBuild(PresentationWorkBudget budget)
     {
         if (disposed) throw new ObjectDisposedException(nameof(CrateVisualAnimation));
+        while (!IsReady && budget.Build())
+        {
+            if (catalogueIndex < catalogue.Length)
+            {
+                var clip = catalogue[catalogueIndex++];
+                if (!clip) continue;
+                string key = Capture.ClipKey(clip, controller);
+                if (!clips.TryGetValue(key, out var existing)) clips.Add(key, clip);
+                else if (existing != clip) clips[key] = null;
+                continue;
+            }
+            switch (buildStage++)
+            {
+                case 0: graph = PlayableGraph.Create("PeakReplayLab.CrateVisual"); graph.SetTimeUpdateMode(DirectorUpdateMode.Manual); break;
+                case 1: mixer = AnimationMixerPlayable.Create(graph, 0); break;
+                case 2: AnimationPlayableOutput.Create(graph, "crate", animator).SetSourcePlayable(mixer); break;
+                case 3: graph.Play(); break;
+            }
+        }
+        return IsReady;
+    }
+
+    // Admission precedes hierarchy checkpoint restoration. If another presentation
+    // track consumed the frame's budget, keep the last completed lid pose visible.
+    public bool TryPrepareSample(CrateAnimationFrame value, CrateAnimationFrame? next, float mix, double replayTime, bool force, PresentationWorkBudget budget)
+    {
+        if (disposed) throw new ObjectDisposedException(nameof(CrateVisualAnimation));
+        if (!IsReady) throw new InvalidOperationException("An unfinished chest animation cannot be sampled.");
+        preparedClip = null;
         if (!clips.TryGetValue(value.Clip, out var clip) || !clip)
             throw new InvalidOperationException("箱子原生动画资源不匹配：" + value.Clip);
         if (value.Anchored && Math.Abs(value.Duration - clip.length) > .01)
             throw new InvalidOperationException("箱子原生动画长度与录像不符：" + value.Clip);
         double cursor = CrateAnimationTimeline.Sample(value, replayTime, clip.length, clip.isLooping, next, mix);
-        if (!force && previousClip == value.Clip && previousTime == cursor) return; // Settled chests do no animation work.
-        if (!players.TryGetValue(value.Clip, out var player))
+        if (!force && previousClip == value.Clip && previousTime == cursor) return true; // Settled chests do no animation work.
+        if (!budget.Step()) return false;
+        preparedClip = clip; preparedKey = value.Clip; preparedTime = cursor;
+        return true;
+    }
+
+    public void ApplyPreparedSample()
+    {
+        if (disposed) throw new ObjectDisposedException(nameof(CrateVisualAnimation));
+        var clip = preparedClip;
+        if (!clip) return;
+        preparedClip = null;
+        if (!players.TryGetValue(preparedKey, out var player))
         {
             // Convert only a private copy if an older game asset was marked Legacy.
             // Never change the installed game's shared AnimationClip flags.
@@ -67,17 +104,17 @@ internal sealed class CrateVisualAnimation : IDisposable
             var playable = AnimationClipPlayable.Create(graph, clip);
             playable.SetApplyFootIK(false); playable.SetApplyPlayableIK(false); playable.SetSpeed(0);
             int port = mixer.GetInputCount(); mixer.SetInputCount(port + 1);
-            graph.Connect(playable, 0, mixer, port); players.Add(value.Clip, player = (playable, port));
+            graph.Connect(playable, 0, mixer, port); players.Add(preparedKey, player = (playable, port));
         }
         foreach (var channel in players.Values) mixer.SetInputWeight(channel.Port, channel.Port == player.Port ? 1 : 0);
-        player.Playable.SetTime(cursor);
+        player.Playable.SetTime(preparedTime);
         // World pose is authoritative; root motion in a curve must not move it a second time.
         var t = root.transform; Vector3 position = t.position, scale = t.localScale; Quaternion rotation = t.rotation;
         bool active = root.activeSelf;
         graph.Evaluate(0);
         t.SetPositionAndRotation(position, rotation); t.localScale = scale;
         if (root.activeSelf != active) root.SetActive(active);
-        previousClip = value.Clip; previousTime = cursor;
+        previousClip = preparedKey; previousTime = preparedTime;
     }
 
     public void Dispose()

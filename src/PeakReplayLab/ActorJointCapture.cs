@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using Photon.Pun;
 using UnityEngine;
 
 namespace PeakReplayLab;
@@ -36,6 +37,8 @@ internal sealed class ActorJointCapture
     private double nextCatalogue, origin, lastTime = double.NaN, lastDetail = double.NaN, lastAuxiliary = double.NaN, handDetailUntil;
     private Vector3 lastHip;
     private int lastState, lastItem, lastCarrier;
+    private bool lastLocal;
+    private readonly ActorNetworkSamplingPolicy networkCadence = new();
 
     public NodePose[] Sample(Character character, Vector3 hip, double time)
     {
@@ -49,16 +52,28 @@ internal sealed class ActorJointCapture
             origin = time; lastDetail = lastAuxiliary = double.NaN; handDetailUntil = time;
         }
         var data = character.data;
+        bool local = character.IsLocal;
         int state = (data.dead ? 1 : 0) | (data.passedOut || data.fullyPassedOut ? 2 : 0) |
             (data.currentRagdollControll < .5f ? 4 : 0) | (data.isClimbingAnything ? 8 : 0) |
-            (data.isGrounded ? 16 : 0) | (data.isSkeleton ? 32 : 0);
+            (data.isGrounded ? 16 : 0) | (data.isSkeleton ? 32 : 0) | (character.warping ? 64 : 0) |
+            (data.isRopeClimbing ? 128 : 0) | (data.isVineClimbing ? 256 : 0) |
+            (data.isCrouching ? 512 : 0) | (data.isReaching ? 1024 : 0);
         int item = data.currentItem ? data.currentItem.GetInstanceID() : 0;
         int carrier = data.carrier ? data.carrier.GetInstanceID() : 0;
         bool transition = !reset && (state != lastState || item != lastItem || carrier != lastCarrier);
-        bool force = reset || previous.Length == 0 || transition || time - lastTime >= ActorJointSamplingPolicy.LongGapSeconds ||
-            (hip - lastHip).sqrMagnitude > 4;
-        if (transition) handDetailUntil = time + ActorJointSamplingPolicy.HandTransitionSeconds;
         bool rebuild = root != character.transform || rig != character.refs.rigCreator.transform;
+        bool ownershipChanged = !reset && local != lastLocal;
+        float hipDisplacementSquared = (hip - lastHip).sqrMagnitude;
+        bool boundary = reset || previous.Length == 0 || transition || ownershipChanged || rebuild ||
+            hipDisplacementSquared > 400;
+        if (reset || ownershipChanged) networkCadence.Reset();
+        // Plugin runs at execution order 10000 in LateUpdate, after native
+        // Animator/IK. Never sample bones in CharacterSyncer.OnDataReceived:
+        // that packet does not contain bones and native smoothing is unfinished.
+        // Held arrays retain their real per-node SampleTime for seek/interpolation.
+        if (!local && !networkCadence.ShouldCapture(time, PhotonNetwork.SerializationRate, boundary)) return previous;
+        bool force = boundary || hipDisplacementSquared > 4 || time - lastTime >= ActorJointSamplingPolicy.LongGapSeconds;
+        if (transition) handDetailUntil = time + ActorJointSamplingPolicy.HandTransitionSeconds;
         if (rebuild || Time.unscaledTimeAsDouble >= nextCatalogue) force |= Rebuild(character);
         bool detailDue = ActorJointSamplingPolicy.Due(ActorJointSamplingPolicy.DetailHz, time, lastDetail, origin,
             force || time < handDetailUntil);
@@ -90,7 +105,7 @@ internal sealed class ActorJointCapture
         }
         if (detailDue) lastDetail = time;
         if (auxiliaryDue) lastAuxiliary = time;
-        lastTime = time; lastHip = hip; lastState = state; lastItem = item; lastCarrier = carrier;
+        lastTime = time; lastHip = hip; lastState = state; lastItem = item; lastCarrier = carrier; lastLocal = local;
         return previous = result;
     }
 

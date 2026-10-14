@@ -1,0 +1,5 @@
+# Machine-local recordings, diagnostics and protected save/config backups.
+/sessions/
+/launch-*/
+/retired-probes/
+/verify/net8.0/

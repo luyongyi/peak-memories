@@ -30,6 +30,16 @@ public sealed class AudioReplayFrame
 public static class AudioReplayRules
 {
     public const int MaxVoices = 128;
+    // Native SFX adds a random pitch offset without a +/-3 clamp; throw charge
+    // reaches 5 and rope motion can exceed that. This is a bounded recording
+    // format limit, not a claim that every game/mod source has a native cap.
+    public const float MaximumNativePitch = 32;
+    public static void ValidateVersion(AudioReplayFrame value, int schema)
+    {
+        if (schema < 15 && !Range(value.Pitch, -3, 3))
+            throw new InvalidDataException("Extended native audio pitch requires schema 15.");
+    }
+    public static float PlaybackPitch(float nativePitch, float speed) => nativePitch * speed;
     public static void Validate(AudioReplayFrame value)
     {
         if (value == null || string.IsNullOrWhiteSpace(value.Key) || value.Key.Length > 128 ||
@@ -41,7 +51,7 @@ public static class AudioReplayRules
             !Finite(value.Offset) || value.Offset < 0 || value.Offset > 86400 ||
             !Range(value.Duration, .000001f, 86400) || value.Offset > value.Duration + .01 ||
             value.Position == null || value.Position.Length != 3 ||
-            !Range(value.Volume, 0, 1) || !Range(value.Pitch, -3, 3) ||
+            !Range(value.Volume, 0, 1) || !Range(value.Pitch, -MaximumNativePitch, MaximumNativePitch) ||
             !Range(value.SpatialBlend, 0, 1) || !Range(value.MinDistance, 0, 100000) ||
             !Range(value.MaxDistance, value.MinDistance, 100000) || !Range(value.Doppler, 0, 5) ||
             value.Rolloff < 0 || value.Rolloff > 2)

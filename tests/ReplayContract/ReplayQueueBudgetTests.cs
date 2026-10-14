@@ -5,6 +5,7 @@ internal static class ReplayQueueBudgetTests
 {
     public static void Run(Action<string, Action> test)
     {
+        ReplayQueueTypedBudgetTests.Run(test);
         test("queue shared immutable creature directories do not grow by a full snapshot per frame", () =>
         {
             var shared = Creatures(); var frames = Enumerable.Range(0, 312).Select(i => Frame(i / 60d, shared)).ToArray();
@@ -168,7 +169,10 @@ internal static class ReplayQueueBudgetTests
                 var segmented = full ? null : new ContinuousReplayWriter(root, Header(), options, open);
                 try
                 {
-                    Check(full ? single!.TryEnqueue(Frame(0, shared)) : segmented!.TryEnqueue(Frame(0, shared)));
+                    // Shared static baselines are tiny in v3. Use a genuine
+                    // uncached event payload to block while the worker still
+                    // owns its frame reservation, before the idle flush path.
+                    Check(full ? single!.TryEnqueue(PayloadFrame(0, shared)) : segmented!.TryEnqueue(PayloadFrame(0, shared)));
                     Check(entered.Wait(TimeSpan.FromSeconds(10)));
                     var before = full ? single!.Stats : segmented!.Stats;
                     Check(before.QueuedFrames == 1 && before.QueuedBytes > 0 && before.WrittenFrames == 0);
@@ -185,7 +189,7 @@ internal static class ReplayQueueBudgetTests
             foreach (bool full in new[] { true, false })
             {
                 using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
-                int writes = 0; var first = Frame(0, Creatures()); var measure = new ReplayQueueBudget();
+                int writes = 0; var first = PayloadFrame(0, Creatures()); var measure = new ReplayQueueBudget();
                 Check(measure.TryReserve(first, long.MaxValue, 2, out var sample, out _));
                 long limit = measure.Current.Bytes + 8192; sample!.Dispose(); measure.ClearBaseline();
                 Func<string, Stream> open = path =>
@@ -200,7 +204,7 @@ internal static class ReplayQueueBudgetTests
                 {
                     Check(full ? single!.TryEnqueue(first) : segmented!.TryEnqueue(first));
                     Check(entered.Wait(TimeSpan.FromSeconds(10)));
-                    Check(!(full ? single!.TryEnqueue(Frame(.1, Creatures())) : segmented!.TryEnqueue(Frame(.1, Creatures()))));
+                    Check(!(full ? single!.TryEnqueue(PayloadFrame(.1, Creatures())) : segmented!.TryEnqueue(PayloadFrame(.1, Creatures()))));
                     var stats = full ? single!.Stats : segmented!.Stats;
                     Check(stats.QueuedFrames == 1 && stats.QueuedBytes > 0 && stats.QueuedBytes <= limit);
                 }
@@ -241,6 +245,13 @@ internal static class ReplayQueueBudgetTests
     }
     private static ReplayHeader Header() => new() { Scene = "Level_QueueBudgetTest" };
     private static ReplayFrame Frame(double time, CreatureReplayFrame[] creatures) => new() { T = time, Creatures = creatures };
+    private static ReplayFrame PayloadFrame(double time, CreatureReplayFrame[] creatures)
+    {
+        var frame = Frame(time, creatures);
+        frame.Events = Enumerable.Range(0, 768).Select(i => new ItemEvent { Sequence = i, T = time, Kind = "use",
+            ItemKey = "item-" + i, Name = new string('x', 128) }).ToArray();
+        return frame;
+    }
     private static CreatureReplayFrame[] Creatures(int count = 256) => Enumerable.Range(0, count).Select(i => new CreatureReplayFrame
     {
         Key = "spider:" + i, Kind = "spider", Resource = "spider",

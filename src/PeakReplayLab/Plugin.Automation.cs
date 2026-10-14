@@ -46,6 +46,10 @@ public sealed class ReplayAutomationStatus
     public string OutputRoot { get; internal set; } = "";
     public ReplayRecordingMode RecordingMode { get; internal set; }
     public bool CaptureReady { get; internal set; }
+    public bool BootstrapReady { get; internal set; }
+    public int BootstrapPending { get; internal set; }
+    public string BootstrapFailure { get; internal set; } = "";
+    public bool BootstrapObservedActorPrefix { get; internal set; }
     public bool Recording { get; internal set; }
     public bool Sealing { get; internal set; }
     public int ChapterIndex { get; internal set; }
@@ -63,6 +67,7 @@ public sealed class ReplayAutomationStatus
     public int CapturedSpawned { get; internal set; }
     public int CapturedBalloons { get; internal set; }
     public int CapturedCreatures { get; internal set; }
+    public int CapturedInteractions { get; internal set; }
     public long CapturedEvents { get; internal set; }
     public bool PlaybackBusy { get; internal set; }
     public bool PlaybackReady { get; internal set; }
@@ -133,6 +138,7 @@ public sealed partial class Plugin
         saving == null && !LibraryManagementBusy;
 
     private bool AutomationCaptureReady => capture != null && captureScene == SceneManager.GetActiveScene().handle &&
+        capture.BootstrapReady && !BootstrapSceneFailed &&
         GameHandler.IsOnIslandAndInitialized && Character.localCharacter && !Character.localCharacter.inAirport &&
         !ReplaySafety.Active && theatre?.Busy != true;
 
@@ -149,6 +155,9 @@ public sealed partial class Plugin
             SessionActive = automationOutputRoot != null, Ending = automationEnding,
             Scene = SceneManager.GetActiveScene().name, OutputRoot = automationOutputRoot ?? automationLastOutputRoot,
             RecordingMode = activeRecordingMode, CaptureReady = AutomationCaptureReady,
+            BootstrapReady = capture?.BootstrapReady ?? false,
+            BootstrapPending = capture?.BootstrapPendingCount ?? 0, BootstrapFailure = bootstrapGate?.Failure ?? "",
+            BootstrapObservedActorPrefix = capture?.BootstrapHasObservedActors ?? false,
             Recording = fullRun != null, Sealing = closingFullRun != null, ChapterIndex = automationChapter,
             RecordingFile = fullRun?.FilePath ?? closingFullRunWriter?.FilePath ?? "",
             AcceptedFrames = stats?.AcceptedFrames ?? 0, WrittenFrames = stats?.WrittenFrames ?? 0,
@@ -157,7 +166,7 @@ public sealed partial class Plugin
             CapturedItems = capture?.ItemCount ?? 0, CapturedCrates = capture?.CrateCount ?? 0,
             CapturedRopes = capture?.RopeCount ?? 0, CapturedEffects = capture?.EffectCount ?? 0,
             CapturedSounds = capture?.AudioCount ?? 0, CapturedSpawned = capture?.SpawnedCount ?? 0,
-            CapturedBalloons = capture?.BalloonCount ?? 0, CapturedCreatures = capture?.CreatureCount ?? 0,
+            CapturedBalloons = capture?.BalloonCount ?? 0, CapturedCreatures = capture?.CreatureCount ?? 0, CapturedInteractions = capture?.InteractionCount ?? 0,
             CapturedEvents = capture?.EventCount ?? 0,
             PlaybackBusy = theatre?.Busy == true, PlaybackReady = playback != null,
             PlaybackBuffering = playback?.Buffering == true, PlaybackPaused = playback?.Paused == true,
@@ -213,6 +222,7 @@ public sealed partial class Plugin
             SetRecordingMode(ReplayRecordingMode.Continuous, persist: false);
             CloseLibrary();
             capture?.Dispose(); capture = null; captureScene = int.MinValue;
+            ResetCaptureBootstrap();
             stoppedFullRunScene = int.MinValue; nextCaptureRetry = 0;
         }
         catch (Exception error)
@@ -228,8 +238,9 @@ public sealed partial class Plugin
             throw new InvalidOperationException("Seal the existing recording and wait for completion before starting another chapter.");
         if (!AutomationCaptureReady)
             throw new InvalidOperationException("The live island and native player must be initialized before starting a chapter.");
-        // The normal F4 path starts from the next complete live sample while
-        // preserving the rolling history captured between full recordings.
+        // Explicit chapters keep the normal F4 semantics: open the writer now,
+        // then append the next accepted live sample without clearing rolling
+        // history. Automatic island recording waits for its first valid frame.
         ToggleFullRun();
         if (fullRun == null) throw new InvalidOperationException("The native continuous recording did not start.");
     });
@@ -286,6 +297,7 @@ public sealed partial class Plugin
         if (!automationEnding || automationOutputRoot == null || !AutomationTitleIdle) return;
         SetRecordingMode(automationOriginalMode, persist: false);
         capture?.Dispose(); capture = null; captureScene = int.MinValue;
+        ResetCaptureBootstrap();
         RestoreAutomationOverride();
         Logger.LogInfo("Replay automation session ended; recording mode and normal output directories restored.");
     }

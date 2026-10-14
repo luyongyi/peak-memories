@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/ItemPlayback.cs" Link="ItemPlayback.cs" />
+    <Compile Include="../../src/PeakReplayLab/BackpackAttachmentPolicy.cs" Link="BackpackAttachmentPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/PresentationResourcePolicy.cs" Link="PresentationResourcePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/PresentationTemplatePool.cs" Link="PresentationTemplatePool.cs" />
+  </ItemGroup>
+</Project>

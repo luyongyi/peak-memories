@@ -202,7 +202,8 @@ internal static class ActorJointCodecTests
         {
             var before = Joints(2); var after = Clone(before);
             foreach (var node in after) node.SampleTime = .1;
-            var payload = Convert.FromBase64String(ActorJointCodec.Encode(after, before));
+            // These mutations target the original per-node version 1 layout.
+            var payload = Convert.FromBase64String(ActorJointCodec.Encode(after, before, 16));
             foreach (Action<byte[]> mutate in new Action<byte[]>[] {
                 bytes => bytes[28] = 0, bytes => bytes[25] = 2,
                 bytes => bytes[26] = 0, bytes => bytes[26] = 64,

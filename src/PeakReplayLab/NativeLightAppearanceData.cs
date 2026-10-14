@@ -32,26 +32,31 @@ public sealed class NativeLightFrame
 
 public static class NativeLightRules
 {
+    [ThreadStatic] private static HashSet<(string Path, int Index)>? validationIdentities;
     public const int MaximumLights = 32;
     public static bool Validate(NativeLightFrame[]? frames)
     {
         if (frames == null) return true;
         if (frames.Length > MaximumLights) return false;
-        var identities = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var frame in frames)
+        var identities = validationIdentities ??= new HashSet<(string Path, int Index)>();
+        try
         {
-            if (frame == null || frame.Path == null || frame.Path.Length == 0 || frame.Path.Length > 512 || frame.Index < 0 || frame.Index >= MaximumLights ||
-                frame.Type < 0 || frame.Type > 4 || frame.Shadows < 0 || frame.Shadows > 2 || frame.RenderMode < 0 || frame.RenderMode > 2 ||
-                frame.Color == null || frame.Color.Length != 4 || frame.CookieSize2D == null || frame.CookieSize2D.Length != 2 ||
-                frame.Cookie == null || frame.Cookie.Length > 256 || !identities.Add(frame.Path + "\n" + frame.Index)) return false;
-            foreach (float value in frame.Color) if (!Bounded(value, -65536, 65536)) return false;
-            foreach (float value in frame.CookieSize2D) if (!Bounded(value, 0, 65536)) return false;
-            if (!Bounded(frame.Intensity, 0, 65536) || !Bounded(frame.Range, 0, 100000) || !Bounded(frame.SpotAngle, 0, 179) ||
-                !Bounded(frame.InnerSpotAngle, 0, frame.SpotAngle) || !Bounded(frame.BounceIntensity, 0, 65536) || !Bounded(frame.ShadowStrength, 0, 1) ||
-                !Bounded(frame.ShadowBias, 0, 100) || !Bounded(frame.ShadowNormalBias, 0, 100) || !Bounded(frame.ShadowNearPlane, 0, 100000) ||
-                !Bounded(frame.CookieSize, 0, 65536) || !Bounded(frame.ColorTemperature, 1000, 20000)) return false;
+            foreach (var frame in frames)
+            {
+                if (frame == null || frame.Path == null || frame.Path.Length == 0 || frame.Path.Length > 512 || frame.Index < 0 || frame.Index >= MaximumLights ||
+                    frame.Type < 0 || frame.Type > 4 || frame.Shadows < 0 || frame.Shadows > 2 || frame.RenderMode < 0 || frame.RenderMode > 2 ||
+                    frame.Color == null || frame.Color.Length != 4 || frame.CookieSize2D == null || frame.CookieSize2D.Length != 2 ||
+                    frame.Cookie == null || frame.Cookie.Length > 256 || !identities.Add((frame.Path, frame.Index))) return false;
+                foreach (float value in frame.Color) if (!Bounded(value, -65536, 65536)) return false;
+                foreach (float value in frame.CookieSize2D) if (!Bounded(value, 0, 65536)) return false;
+                if (!Bounded(frame.Intensity, 0, 65536) || !Bounded(frame.Range, 0, 100000) || !Bounded(frame.SpotAngle, 0, 179) ||
+                    !Bounded(frame.InnerSpotAngle, 0, frame.SpotAngle) || !Bounded(frame.BounceIntensity, 0, 65536) || !Bounded(frame.ShadowStrength, 0, 1) ||
+                    !Bounded(frame.ShadowBias, 0, 100) || !Bounded(frame.ShadowNormalBias, 0, 100) || !Bounded(frame.ShadowNearPlane, 0, 100000) ||
+                    !Bounded(frame.CookieSize, 0, 65536) || !Bounded(frame.ColorTemperature, 1000, 20000)) return false;
+            }
+            return true;
         }
-        return true;
+        finally { identities.Clear(); }
     }
     private static bool Bounded(float value, float min, float max) => !float.IsNaN(value) && !float.IsInfinity(value) && value >= min && value <= max;
     public static long Estimate(NativeLightFrame[]? frames)

@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace PeakReplayLab;
 
-internal enum LuggageEventKind { Discovered, Destroyed, Unclasp, Open, Reclasp }
+internal enum LuggageEventKind { Discovered, Destroyed, Unclasp, Open, Reclasp, Appearance }
 internal readonly struct LuggageEvent
 {
     public readonly Luggage Source;
@@ -33,15 +33,19 @@ internal sealed class LuggageEventObserver : IDisposable
         {
             Post("Awake", nameof(Discovered)); Post("OnDestroy", nameof(Destroyed));
             Post("Interact", nameof(Unclasp)); Post("CancelCast", nameof(Reclasp));
+            Post(typeof(RespawnChest), "RemoveSkeletonRPC", nameof(AppearanceChanged));
+            Post(typeof(MirageLuggage), "OnEnable", nameof(ChildAppearanceChanged));
+            Post(typeof(MirageLuggage), "OnDisable", nameof(ChildAppearanceChanged));
             var open = AccessTools.DeclaredMethod(typeof(Luggage), "OpenLuggageRPC") ?? throw new MissingMethodException("Luggage.OpenLuggageRPC");
             harmony.Patch(open, prefix: new HarmonyMethod(typeof(LuggageEventObserver), nameof(BeforeOpen)),
                 postfix: new HarmonyMethod(typeof(LuggageEventObserver), nameof(Opened)));
         }
         catch { listener = null; harmony.UnpatchSelf(); throw; }
     }
-    private void Post(string method, string observer)
+    private void Post(string method, string observer) => Post(typeof(Luggage), method, observer);
+    private void Post(Type type, string method, string observer)
     {
-        var target = AccessTools.DeclaredMethod(typeof(Luggage), method) ?? throw new MissingMethodException("Luggage." + method);
+        var target = AccessTools.DeclaredMethod(type, method) ?? throw new MissingMethodException(type.Name + "." + method);
         harmony.Patch(target, postfix: new HarmonyMethod(typeof(LuggageEventObserver), observer));
     }
     private static void Emit(Luggage source, LuggageEventKind kind, double delay = 0)
@@ -51,6 +55,21 @@ internal sealed class LuggageEventObserver : IDisposable
     }
     private static void Discovered(Luggage __instance) => Emit(__instance, LuggageEventKind.Discovered);
     private static void Destroyed(Luggage __instance) => Emit(__instance, LuggageEventKind.Destroyed);
+    private static void AppearanceChanged(Luggage __instance) => Emit(__instance, LuggageEventKind.Appearance);
+    private static void ChildAppearanceChanged(MirageLuggage __instance)
+    {
+        try
+        {
+            // MirageLuggage also decorates creature-owned fake chests. Only a
+            // genuine luggage ancestor belongs to this track, even when inactive.
+            if (!ReplaySafety.Active && __instance)
+            {
+                var source = __instance.GetComponentInParent<Luggage>(true);
+                if (source) Emit(source!, LuggageEventKind.Appearance);
+            }
+        }
+        catch { /* Observers never interrupt real gameplay. */ }
+    }
     private static void Unclasp(Luggage __instance)
     { if (__instance && !__instance.IsOpen) Emit(__instance, LuggageEventKind.Unclasp); }
     private static void Reclasp(Luggage __instance)

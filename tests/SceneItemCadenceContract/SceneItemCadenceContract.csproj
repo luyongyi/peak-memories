@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/SampleClock.cs" Link="SampleClock.cs" />
+    <Compile Include="../../src/PeakReplayLab/SceneCaptureSchedule.cs" Link="SceneCaptureSchedule.cs" />
+    <Compile Include="../../src/PeakReplayLab/ItemActivityPolicy.cs" Link="ItemActivityPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/ItemSamplingPolicy.cs" Link="ItemSamplingPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeCapturePolicy.cs" Link="NativeCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeCaptureAnimationActivity.cs" Link="NativeCaptureAnimationActivity.cs" />
+  </ItemGroup>
+</Project>

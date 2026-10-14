@@ -3,5 +3,9 @@
   <ItemGroup>
     <Compile Include="../../src/PeakReplayLab/NativeVisualAppearanceData.cs" Link="NativeVisualAppearanceData.cs" />
     <Compile Include="../../src/PeakReplayLab/NativeLightAppearanceData.cs" Link="NativeLightAppearanceData.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeVisualResourceCatalog.cs" Link="NativeVisualResourceCatalog.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeRendererVisibilityPolicy.cs" Link="NativeRendererVisibilityPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeAnimatedAppearancePolicy.cs" Link="NativeAnimatedAppearancePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureEpochValue.cs" Link="CaptureEpochValue.cs" />
   </ItemGroup>
 </Project>

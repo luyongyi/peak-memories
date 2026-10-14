@@ -4,6 +4,8 @@ internal static class NativeCapturePolicyTests
 {
     public static void Run(Action<string, Action> test)
     {
+        CrateAppearanceCapturePolicyTests.Run(test);
+        StaticCaptureDirectoryTests.Run(test);
         test("native material metadata is cold while motion continues and dirty revisions bypass deadline", () =>
         {
             var schedule = new NativeCapturePolicy(0);
@@ -29,26 +31,6 @@ internal static class NativeCapturePolicyTests
             Check(slow.FullDue(.75, true, false));
             var negative = new NativeCapturePolicy(int.MinValue); negative.FullObserved(0);
             Check(negative.FullDue(.75, true, false));
-        });
-        test("registered static trap explosion dirties immediate snapshot without waiting for integrity poll", () =>
-        {
-            var schedule = new StaticCreatureCapturePolicy(0);
-            Check(schedule.Due(0, false)); schedule.Observed(0);
-            for (int i = 1; i < 60; i++) Check(!schedule.Due(i / 60d, true));
-            schedule.Changed(); Check(schedule.Due(.2, true)); schedule.Observed(.2);
-            Check(!schedule.Due(.21, true)); Check(schedule.Due(1.2, true));
-        });
-        test("static trap integrity probes are staggered and retain immutable explosion seek states", () =>
-        {
-            var first = new StaticCreatureCapturePolicy(0); var last = new StaticCreatureCapturePolicy(66);
-            first.Observed(0); last.Observed(0);
-            Check(first.Due(1, true) && !last.Due(1, true)); Check(last.Due(1.5, true));
-            float[] trs = { 1, 2, 3, 0, 0, 0, 1, 1, 1, 1 };
-            var alive = CreatureDirectoryRules.StaticPose(null, true, trs);
-            last.Changed(); Check(last.Due(.1, true));
-            var exploded = CreatureDirectoryRules.StaticPose(alive, false, trs); last.Observed(.1);
-            Check(alive.Active && !exploded.Active && ReferenceEquals(alive.Position, exploded.Position));
-            Check(!last.Due(.2, true)); Check(CreatureDirectoryRules.StaticPose(exploded, true, trs).Active);
         });
         test("dormant future biome creature keeps baseline until activity changes immediately", () =>
         {

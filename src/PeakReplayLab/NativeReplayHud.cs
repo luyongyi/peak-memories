@@ -28,6 +28,8 @@ internal sealed class NativeReplayHud : IDisposable
     private string resourcesWarning = "";
     private InputScheme? inputScheme;
     private bool disposed;
+    private bool? warningHasActor, warningStateKnown, warningInventoryKnown;
+    private string warningResources = "";
     public bool BackpackExpanded { get; set; }
     public string Warning { get; private set; } = "";
     public string Diagnostic => "native-hud=" + root.activeInHierarchy + "; " + (bar?.Diagnostic ?? "bar-not-created") + "; " + Warning;
@@ -140,7 +142,7 @@ internal sealed class NativeReplayHud : IDisposable
         if (observedName)
         {
             observedName!.gameObject.SetActive(actor != null);
-            observedName.text = actor?.Name ?? "";
+            SetText(observedName, actor?.Name ?? "");
         }
         bool stateKnown = session.FocusHudState != null;
         bar?.Apply(session.FocusHudState);
@@ -174,9 +176,14 @@ internal sealed class NativeReplayHud : IDisposable
             }
         }
         else contentsRoot.gameObject.SetActive(false);
-        Warning = resourcesWarning;
-        if (actor != null && !stateKnown) Warning = Append(Warning, "此录像未记录完整状态条；不补画满体力或零寒冷");
-        if (actor != null && !inventoryKnown) Warning = Append(Warning, "库存尚未同步；未知不会显示成空背包");
+        bool hasActor = actor != null;
+        if (warningHasActor != hasActor || warningStateKnown != stateKnown || warningInventoryKnown != inventoryKnown || warningResources != resourcesWarning)
+        {
+            warningHasActor = hasActor; warningStateKnown = stateKnown; warningInventoryKnown = inventoryKnown; warningResources = resourcesWarning;
+            Warning = resourcesWarning;
+            if (hasActor && !stateKnown) Warning = Append(Warning, "此录像未记录完整状态条；不补画满体力或零寒冷");
+            if (hasActor && !inventoryKnown) Warning = Append(Warning, "库存尚未同步；未知不会显示成空背包");
+        }
     }
 
     private void ApplySlot(SlotView? view, InventoryFrame? entry, ItemFrame? held, int backpackCount, bool temporarySlot = false)
@@ -231,9 +238,13 @@ internal sealed class NativeReplayHud : IDisposable
     private static void SetNotice(TMP_Text? text, string message)
     {
         if (!text) return;
-        text!.text = message;
-        text.gameObject.SetActive(message.Length != 0);
+        SetText(text!, message);
+        bool visible = message.Length != 0;
+        if (text.gameObject.activeSelf != visible) text.gameObject.SetActive(visible);
     }
+
+    private static void SetText(TMP_Text text, string value)
+    { if (text.text != value) text.text = value; }
 
     private static TMP_Text NativeLabel(TMP_Text source, Transform parent, string name, Vector2 anchor, Vector2 position, Vector2 size)
     {
@@ -358,6 +369,9 @@ internal sealed class NativeReplayHud : IDisposable
         private readonly GameObject? counter, fuel;
         private readonly Image? fuelFill;
         private readonly TMP_Text? count;
+        private string labelName = "";
+        private int labelCooked = int.MinValue, displayedCount = int.MinValue, labelFallbackId = int.MinValue;
+        private bool labelNonempty;
         private readonly Vector2 size;
         private readonly Color fillColor, outlineColor;
         private readonly List<(TMP_Text Text, InputIcon Source)> inputs = new();
@@ -428,11 +442,17 @@ internal sealed class NativeReplayHud : IDisposable
             icon.transform.localScale = Vector3.one;
             int cooked = state != null && state.Cooked >= 0 ? state.Cooked : held != null ? Mathf.RoundToInt(held.Cooked) : -1;
             icon.color = cooked >= 0 ? ItemCooking.GetCookColor(cooked) : Color.white;
-            title.text = nonempty ? ItemLabel(name ?? "#" + state!.ItemId, cooked) : "";
+            int fallbackId = nonempty && name == null ? state!.ItemId : -1;
+            if (labelNonempty != nonempty || labelName != (name ?? "") || labelCooked != cooked || labelFallbackId != fallbackId)
+            {
+                labelNonempty = nonempty; labelName = name ?? ""; labelCooked = cooked; labelFallbackId = fallbackId;
+                SetText(title, nonempty ? ItemLabel(name ?? "#" + fallbackId, cooked) : "");
+            }
             title.enabled = selected;
             title.gameObject.SetActive(true);
             if (counter) counter!.SetActive(nonempty && filledCount > 0);
-            if (count) count!.text = filledCount.ToString();
+            if (count && displayedCount != filledCount)
+            { displayedCount = filledCount; SetText(count!, filledCount.ToString()); }
             // PEAK's native gauge reads UseRemainingPercentage, not raw Fuel.
             // Older recordings retain -1, so no full-fuel state is fabricated.
             bool showFuel = nonempty && !hideFuel && state!.UiFuel >= 0 && state.UiFuel <= 1 && fuelFill;

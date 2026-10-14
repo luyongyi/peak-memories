@@ -6,6 +6,26 @@ namespace PeakReplayLab;
 // A model called SporeShroom is a child mesh, never a trap root.
 public static class CreatureDirectoryRules
 {
+    // This is a protocol/resource whitelist, never a Resources.Load path from
+    // a recording. Scene variants resolve only inside the native typed directory.
+    public static bool IsKnownKind(string kind) => kind == "spider" || kind == "mushroom-zombie" ||
+        kind == "condor" || kind == "frog-tongue" || kind == "spore-trap" ||
+        kind == "beetle" || kind == "scoutmaster" || kind == "antlion" || kind == "venus-flytrap" ||
+        kind == "tumbleweed" || kind == "voice-thief" || kind == "skeleton" || kind == "scoutmaster-ghost" || kind == "capybara" ||
+        kind == "ghost-ball" || kind == "player-ghost";
+    public static bool IsLegacyKind(string kind) => kind == "spider" || kind == "mushroom-zombie" ||
+        kind == "condor" || kind == "frog-tongue" || kind == "spore-trap";
+    // Before schema 21 these independent bodies were absent from the recorder.
+    // Their particle/actor tracks did not own the corresponding native mesh.
+    public static bool BodyRequiresSchema21(string kind) => kind == "ghost-ball" || kind == "player-ghost";
+    public static bool ValidResource(string kind, string resource) => IsKnownKind(kind) &&
+        (resource == kind || kind == "spider" && (resource == "spider-normal" || resource == "spider-web") ||
+         kind == "mushroom-zombie" && (resource == "mushroom-zombie-npc" || resource == "mushroom-zombie-player"));
+    public static bool RequiresScenePath(string kind) => kind == "spore-trap" || kind == "antlion" ||
+        kind == "venus-flytrap" || kind == "capybara";
+    public static bool IsCapybaraName(string name)
+    { name = Normalize(name); return name == "Capybara" || name == "Capybara Void"; }
+    public static bool IsWebSpiderName(string name) => Normalize(name) == "SpiderDropper Web Variant";
     public static string TrapEffect(string rootName) => Normalize(rootName) switch
     {
         "Forest_SporeFungus" => "VFX_SporeExplo",
@@ -47,13 +67,12 @@ public static class CreatureDirectoryRules
         bool rotationSame = Same(previous?.Rotation, trs.Slice(3, 4));
         bool scaleSame = Same(previous?.Scale, trs.Slice(7, 3));
         if (previous != null && previous.Active == active && positionSame && rotationSame && scaleSame) return previous;
-        return new ObjectPose { Active = active, Position = positionSame ? previous!.Position : trs.Slice(0, 3).ToArray(),
-            Rotation = rotationSame ? previous!.Rotation : trs.Slice(3, 4).ToArray(),
-            Scale = scaleSame ? previous!.Scale : trs.Slice(7, 3).ToArray(), Nodes = Array.Empty<NodePose>() };
+        return new ObjectPose(positionSame ? previous!.Position : trs.Slice(0, 3).ToArray(),
+            rotationSame ? previous!.Rotation : trs.Slice(3, 4).ToArray(),
+            scaleSame ? previous!.Scale : trs.Slice(7, 3).ToArray(), active);
     }
     public static ObjectPose StaticActive(ObjectPose previous, bool active) => previous.Active == active ? previous :
-        new ObjectPose { Active = active, Position = previous.Position, Rotation = previous.Rotation,
-            Scale = previous.Scale, Nodes = previous.Nodes };
+        new ObjectPose(previous.Position, previous.Rotation, previous.Scale, active, previous.Nodes);
     private static bool Same(float[]? previous, ReadOnlySpan<float> values)
     {
         if (previous == null || previous.Length != values.Length) return false;

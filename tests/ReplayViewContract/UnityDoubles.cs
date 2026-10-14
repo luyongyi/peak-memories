@@ -17,8 +17,15 @@ namespace UnityEngine
     }
 
     public enum FindObjectsSortMode { None }
+    public readonly record struct Vector2(float X, float Y)
+    {
+        public static Vector2 zero => new(0, 0);
+        public static Vector2 one => new(1, 1);
+    }
     public readonly record struct Vector3(float X, float Y, float Z);
     public readonly record struct Quaternion(float X, float Y, float Z, float W);
+    public readonly record struct Color(float R, float G, float B, float A);
+    public enum RenderMode { ScreenSpaceOverlay }
 
     public sealed class Transform
     {
@@ -35,7 +42,17 @@ namespace UnityEngine
         public bool activeSelf = true;
         public bool activeInHierarchy => activeSelf && (parent?.activeInHierarchy ?? true);
         public Transform transform { get; } = new();
-        public GameObject(string name) => this.name = name;
+        public GameObject(string name, params Type[] initialComponents)
+        {
+            this.name = name;
+            foreach (var type in initialComponents)
+            {
+                var component = (Component)Activator.CreateInstance(type)!;
+                component.gameObject = this; component.name = name;
+                components.Add(component);
+            }
+        }
+        public void SetActive(bool active) => activeSelf = active;
         public T AddComponent<T>() where T : Component, new()
         {
             var component = new T { gameObject = this, name = name };
@@ -81,6 +98,15 @@ namespace UnityEngine
 
     public class MonoBehaviour : Behaviour { }
     public class ScriptableObject : Object { }
+    public sealed class RectTransform : Component
+    {
+        public Vector2 anchorMin, anchorMax, offsetMin, offsetMax;
+    }
+    public sealed class Canvas : Behaviour
+    {
+        public RenderMode renderMode;
+        public int sortingOrder;
+    }
     public sealed class CanvasGroup : Behaviour
     {
         public float alpha = 1;
@@ -130,6 +156,15 @@ namespace UnityEngine
         public bool HasProperty(string key) => floats.ContainsKey(key);
         public float GetFloat(string key) => floats[key];
         public void SetFloat(string key, float value) => floats[key] = value;
+    }
+}
+
+namespace UnityEngine.UI
+{
+    public sealed class Image : UnityEngine.Behaviour
+    {
+        public UnityEngine.Color color;
+        public bool raycastTarget = true;
     }
 }
 

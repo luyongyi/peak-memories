@@ -112,7 +112,7 @@ internal static class ReplayRegionSummaryTests
             var info = FullReplayArchive.ReadInfo(task.Result.FilePath);
             Check(info.Header.RegionSummary == null);
             Check(ReplayRegionCovers.Keys(info.RegionSummary, true).SequenceEqual(new[] { "shore", "roots", "temple", "nadir" }));
-            Check(FullReplayArchive.ReadPage(task.Result.FilePath, info, 0).Frames.Count == 4);
+            Check(info.Pages.SelectMany(page => FullReplayArchive.ReadPage(task.Result.FilePath, info, page.Index).Frames).Select(frame => frame.T).Distinct().Count() == 4);
             var card = MemoriesLibraryItem.FromFullRun(task.Result.FilePath, info, new FileInfo(task.Result.FilePath).Length, "");
             Check(card.IsFullRun && card.CoverKeys.Length == 4 && !card.CoverKeys.Contains("peak"));
         }));

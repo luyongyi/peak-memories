@@ -98,6 +98,61 @@ internal static class MemoriesLibraryModelTests
             Check(!item.Details.Contains("segment-") && !item.Details.Contains("内部页"));
             Check(item.Details.Contains("Alice · Bob") && item.Details.Contains("60 Hz"));
         });
+        test("memories library offers the actual current writer output after archive metadata validation", () => InRoot(root =>
+        {
+            var header = Header(); header.Duration = 0; header.FrameCount = 0;
+            var writer = new FullReplayWriter(root, header);
+            try
+            {
+                Check(writer.TryEnqueue(new ReplayFrame { T = 0, Actors = new[] { new ActorFrame { Id = "actor-a" } } }));
+                Check(writer.TryEnqueue(new ReplayFrame { T = .05, Actors = new[] { new ActorFrame { Id = "actor-a" } } }));
+            }
+            finally
+            {
+                Check(writer.CompleteAsync().Wait(TimeSpan.FromSeconds(20)));
+            }
+            var result = writer.Completion.GetAwaiter().GetResult();
+            Check(result.Status == "completed");
+            var info = FullReplayArchive.ReadInfo(result.FilePath);
+            Check(info.Version == 4 && info.Header.Schema == ReplayRules.CurrentSchema && info.Complete && info.FrameCount == 2);
+            var item = MemoriesLibraryItem.FromFullRun(result.FilePath, info, new FileInfo(result.FilePath).Length, "");
+            Check(item.Playable && item.IsFullRun && !item.Subtitle.Contains("不可播放") && !item.Details.Contains("不可播放"));
+            var page = FullReplayArchive.ReadPage(result.FilePath, info, 0);
+            Check(page.Complete && page.Frames.Count == 2 && page.Frames[1].T == .05);
+
+            // Both entry points must still reject a future container even when
+            // it otherwise has the exact metadata of a valid current recording.
+            info.Version = 5;
+            Check(!MemoriesLibraryItem.FromFullRun(result.FilePath, info, new FileInfo(result.FilePath).Length, "").Playable);
+            bool rejected = false;
+            try { FullReplayArchive.ReadPage(result.FilePath, info, 0); }
+            catch (InvalidDataException) { rejected = true; }
+            Check(rejected);
+        }));
+        test("memories library recognizes all four supported full recording containers", () =>
+        {
+            foreach (int version in new[] { 1, 2, 3, 4 })
+            {
+                var info = Full(); info.Version = version;
+                info.Header.Schema = version >= 3 ? version + 13 : 15;
+                info.SharedBlocks = version >= 3 ? Array.Empty<FullReplaySharedBlock>() : null;
+                var item = MemoriesLibraryModel.FromFullRun("run.peakrun", info, 1000, "");
+                Check(item.Playable && !item.Subtitle.Contains("不可播放"));
+                info.Complete = false;
+                Check(!MemoriesLibraryModel.FromFullRun("run.peakrun", info, 1000, "").Playable);
+                info.Complete = true; info.FaultCode = "capture-error";
+                Check(!MemoriesLibraryModel.FromFullRun("run.peakrun", info, 1000, "").Playable);
+            }
+        });
+        test("memories library rejects unknown full recording container versions", () =>
+        {
+            foreach (int version in new[] { int.MinValue, -1, 0, 5, int.MaxValue })
+            {
+                var info = Full(); info.Version = version;
+                var item = MemoriesLibraryModel.FromFullRun("run.peakrun", info, 1000, "");
+                Check(!item.Playable && item.Subtitle.Contains("不可播放"));
+            }
+        });
         test("memories library incomplete invalid or faulted full recordings remain visibly unavailable", () =>
         {
             foreach (Action<FullReplayInfo> change in new Action<FullReplayInfo>[]
@@ -161,6 +216,13 @@ internal static class MemoriesLibraryModelTests
             else if (char.IsLowSurrogate(text[i])) return false;
         }
         return true;
+    }
+    private static void InRoot(Action<string> action)
+    {
+        string root = Path.Combine(Path.GetTempPath(), "peak-library-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try { action(root); }
+        finally { Directory.Delete(root, true); }
     }
     private static void Check(bool value) { if (!value) throw new Exception("Assertion failed."); }
 }

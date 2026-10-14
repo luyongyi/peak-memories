@@ -94,7 +94,7 @@ internal static class WorldTrack
         };
     }
 
-    public static Action<WorldFrame> Player(ReplayHeader header)
+    public static WorldReplayPlayer Player(ReplayHeader header)
     {
         // A file may only address the game's known map switches, never arbitrary scene
         // objects such as UI, network services or another mod's GameObject.
@@ -118,50 +118,187 @@ internal static class WorldTrack
             throw new InvalidOperationException("Nadir presentation root is outside the replay scene.");
         var voidActiveSetter = HarmonyLib.AccessTools.PropertySetter(typeof(Peak.VoidBiome), nameof(Peak.VoidBiome.isActive))
             ?? throw new MissingMemberException("VoidBiome.isActive");
-        var environment = new WorldEnvironmentState(mountain && mountain.gameObject.activeSelf, voidBiome && voidBiome.isActive);
-        int previousSegment = -1;
-        WorldFrame? previousWorld = null;
-        float previousTime = float.NaN;
-        int previousDay = -1;
-        return frame =>
+        return new WorldReplayPlayer(map, nodes, segmentField, mountain, voidBiome, voidActiveSetter);
+    }
+}
+
+// Only the validated native map nodes are ever addressed. A seek first resolves
+// its scene page, then applies at most one expensive native world switch per
+// rendered frame while the replay clock and 3D scene remain covered. Ordinary
+// playback and same-segment seeks retain the original synchronous path.
+internal sealed class WorldReplayPlayer
+{
+    private readonly MapHandler map;
+    private readonly Transform[] nodes;
+    private readonly System.Reflection.FieldInfo segmentField;
+    private readonly Transform? mountain;
+    private readonly Peak.VoidBiome? voidBiome;
+    private readonly System.Reflection.MethodInfo voidActiveSetter;
+    private readonly bool initialMountainActive, initialVoidActive;
+    private readonly WorldSeekPreparationBatch batch = new();
+    private WorldFrame? previousWorld, preparedWorld;
+    private int previousSegment = -1, previousDay = -1, preparedSequence = -1;
+    private float previousTime = float.NaN;
+    private bool dirty, preparing;
+
+    public WorldReplayPlayer(MapHandler map, Transform[] nodes, System.Reflection.FieldInfo segmentField,
+        Transform? mountain, Peak.VoidBiome? voidBiome, System.Reflection.MethodInfo voidActiveSetter)
+    {
+        this.map = map; this.nodes = nodes; this.segmentField = segmentField;
+        this.mountain = mountain; this.voidBiome = voidBiome; this.voidActiveSetter = voidActiveSetter;
+        initialMountainActive = mountain && mountain.gameObject.activeSelf;
+        initialVoidActive = voidBiome && voidBiome.isActive;
+    }
+
+    private int Validate(WorldFrame frame)
+    {
+        int mapSegment = WorldSegmentIndex.Resolve(frame.Segment, map.segments.Length);
+        if (frame.ActiveMapObjects.Length != nodes.Length)
+            throw new InvalidOperationException("Recorded map state no longer matches this scene.");
+        if (frame.Segment == (int)Segment.Void && (!mountain || !voidBiome || map.segments[mapSegment].biome != Biome.BiomeType.Void))
+            throw new InvalidOperationException("Nadir presentation is not present in this scene.");
+        return mapSegment;
+    }
+
+    private bool DesiredMountain(int segment) => segment == (int)Segment.Void ? false : initialMountainActive;
+    private bool DesiredVoid(int segment) => segment == (int)Segment.Void || initialVoidActive;
+
+    public bool NeedsSceneShield(WorldFrame frame)
+    {
+        Validate(frame);
+        if (!dirty && frame.Segment == previousSegment) return false;
+        if (mountain && mountain.gameObject.activeSelf != DesiredMountain(frame.Segment)) return true;
+        if (voidBiome && voidBiome.isActive != DesiredVoid(frame.Segment)) return true;
+        for (int i = 0; i < nodes.Length; i++)
+            if (nodes[i] && nodes[i].gameObject.activeSelf != frame.ActiveMapObjects[i]) return true;
+        return false;
+    }
+
+    public void Cancel()
+    {
+        // A superseding cursor must rebuild from actual native activeSelf values,
+        // never resume a plan which may have switched only part of the map.
+        if (preparing)
         {
-            if (ReferenceEquals(previousWorld, frame)) return;
-            int mapSegment = WorldSegmentIndex.Resolve(frame.Segment, map.segments.Length);
-            if (frame.ActiveMapObjects.Length != nodes.Length) throw new InvalidOperationException("Recorded map state no longer matches this scene.");
-            if (frame.Segment == (int)Segment.Void && (!mountain || !voidBiome || map.segments[mapSegment].biome != Biome.BiomeType.Void))
-                throw new InvalidOperationException("Nadir presentation is not present in this scene.");
-            bool segmentChanged = frame.Segment != previousSegment;
-            if (segmentChanged) segmentField.SetValue(map, mapSegment);
-            if (environment.Transition(frame.Segment, out bool mountainActive, out bool voidActive))
+            dirty = true;
+            previousWorld = null;
+            previousSegment = -1;
+            previousTime = float.NaN;
+            previousDay = -1;
+        }
+        preparing = false; preparedWorld = null; preparedSequence = -1;
+        batch.Clear();
+    }
+
+    public bool Prepare(WorldFrame frame, int seekSequence, int renderedFrame)
+    {
+        // Same-segment cursor changes keep their immediate state semantics and
+        // do not obscure the image. A partially switched prior seek is dirty.
+        if (!dirty && !preparing && frame.Segment == previousSegment) return true;
+        if (!preparing || preparedSequence != seekSequence || !SameTarget(preparedWorld, frame))
+        {
+            Cancel();
+            BuildPlan(frame, seekSequence);
+        }
+        if (!preparing) return true;
+        if (!batch.Advance(renderedFrame)) return false;
+        Commit(frame);
+        preparing = false; batch.Clear();
+        // Even a synchronous last switch gets its own rendered frame before
+        // actors, audio and effects for the destination are admitted.
+        return false;
+    }
+
+    private static bool SameTarget(WorldFrame? left, WorldFrame right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        return left != null && left.Segment == right.Segment && left.TimeOfDay == right.TimeOfDay && left.Day == right.Day &&
+            left.ActiveMapObjects.SequenceEqual(right.ActiveMapObjects);
+    }
+
+    private void BuildPlan(WorldFrame frame, int sequence)
+    {
+        int mapSegment = Validate(frame);
+        bool segmentChanged = frame.Segment != previousSegment || dirty;
+        preparedWorld = frame; preparedSequence = sequence; preparing = true;
+        if (segmentChanged) batch.Add(() => segmentField.SetValue(map, mapSegment), false);
+        bool voidActive = DesiredVoid(frame.Segment);
+        if (voidBiome && voidBiome.isActive != voidActive)
+            batch.Add(() => { if (voidBiome && voidBiome.isActive != voidActive) voidActiveSetter.Invoke(voidBiome, new object[] { voidActive }); }, true);
+        bool mountainActive = DesiredMountain(frame.Segment);
+        if (mountain && mountain.gameObject.activeSelf != mountainActive)
+            batch.Add(() => { if (mountain && mountain.gameObject.activeSelf != mountainActive) mountain.gameObject.SetActive(mountainActive); }, true);
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            var node = nodes[i]; bool active = frame.ActiveMapObjects[i];
+            if (node && node.gameObject.activeSelf != active)
+                batch.Add(() => { if (node && node.gameObject.activeSelf != active) node.gameObject.SetActive(active); }, true);
+        }
+        var light = DayNightManager.instance;
+        if (light && (segmentChanged || frame.TimeOfDay != previousTime || frame.Day != previousDay))
+        {
+            var profile = segmentChanged ? map.segments[mapSegment].dayNightProfile : null;
+            batch.Add(() =>
             {
-                if (voidBiome && voidBiome.isActive != voidActive) voidActiveSetter.Invoke(voidBiome, new object[] { voidActive });
-                if (mountain && mountain.gameObject.activeSelf != mountainActive) mountain.gameObject.SetActive(mountainActive);
+                if (!light) return;
+                light.timeOfDay = frame.TimeOfDay; light.dayCount = frame.Day;
+                if (!profile) return;
+                light.StopAllCoroutines(); light.clearAllShaderParams();
+                light.currentProfile = profile; light.newProfile = profile;
+            }, true);
+            if (profile)
+            {
+                foreach (var parameter in profile.globalShaderFloats ?? Array.Empty<ShaderParameters>())
+                { var p = parameter; batch.Add(() => { if (light) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue); }, false); }
+                foreach (var parameter in profile.globalStaticShaderFloats ?? Array.Empty<ShaderParameters>())
+                { var p = parameter; batch.Add(() => { if (light) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue); }, false); }
+                foreach (var parameter in profile.globalStaticShaderColors ?? Array.Empty<ShaderParametersColors>())
+                { var p = parameter; batch.Add(() => { if (light) Shader.SetGlobalColor(light.getShaderValue(p.parameter), p.paramValue); }, false); }
             }
-            for (int i = 0; i < nodes.Length; i++)
-                if (nodes[i] && nodes[i].gameObject.activeSelf != frame.ActiveMapObjects[i]) nodes[i].gameObject.SetActive(frame.ActiveMapObjects[i]);
-            var light = DayNightManager.instance;
-            if (light && (segmentChanged || frame.TimeOfDay != previousTime || frame.Day != previousDay))
+            batch.Add(() => { if (light) light.UpdateCycle(); }, true);
+        }
+        if (batch.Count == 0)
+        { Commit(frame); preparing = false; }
+    }
+
+    private void Commit(WorldFrame frame)
+    {
+        previousWorld = frame; previousSegment = frame.Segment;
+        previousTime = frame.TimeOfDay; previousDay = frame.Day;
+        dirty = false;
+    }
+
+    public void Apply(WorldFrame frame)
+    {
+        if (ReferenceEquals(previousWorld, frame) && !dirty) return;
+        if (preparing) Cancel();
+        int mapSegment = Validate(frame);
+        bool segmentChanged = frame.Segment != previousSegment || dirty;
+        if (segmentChanged) segmentField.SetValue(map, mapSegment);
+        bool voidActive = DesiredVoid(frame.Segment);
+        if (voidBiome && voidBiome.isActive != voidActive) voidActiveSetter.Invoke(voidBiome, new object[] { voidActive });
+        bool mountainActive = DesiredMountain(frame.Segment);
+        if (mountain && mountain.gameObject.activeSelf != mountainActive) mountain.gameObject.SetActive(mountainActive);
+        for (int i = 0; i < nodes.Length; i++)
+            if (nodes[i] && nodes[i].gameObject.activeSelf != frame.ActiveMapObjects[i]) nodes[i].gameObject.SetActive(frame.ActiveMapObjects[i]);
+        var light = DayNightManager.instance;
+        if (light && (segmentChanged || frame.TimeOfDay != previousTime || frame.Day != previousDay))
+        {
+            light.timeOfDay = frame.TimeOfDay; light.dayCount = frame.Day;
+            if (segmentChanged)
             {
-                light.timeOfDay = frame.TimeOfDay;
-                light.dayCount = frame.Day;
-                if (segmentChanged)
+                var profile = map.segments[mapSegment].dayNightProfile;
+                if (profile)
                 {
-                    var profile = map.segments[mapSegment].dayNightProfile;
-                    if (profile)
-                    {
-                        light.StopAllCoroutines();
-                        light.clearAllShaderParams();
-                        light.currentProfile = profile; light.newProfile = profile;
-                        foreach (var p in profile.globalShaderFloats ?? Array.Empty<ShaderParameters>()) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue);
-                        foreach (var p in profile.globalStaticShaderFloats ?? Array.Empty<ShaderParameters>()) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue);
-                        foreach (var p in profile.globalStaticShaderColors ?? Array.Empty<ShaderParametersColors>()) Shader.SetGlobalColor(light.getShaderValue(p.parameter), p.paramValue);
-                    }
+                    light.StopAllCoroutines(); light.clearAllShaderParams();
+                    light.currentProfile = profile; light.newProfile = profile;
+                    foreach (var p in profile.globalShaderFloats ?? Array.Empty<ShaderParameters>()) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue);
+                    foreach (var p in profile.globalStaticShaderFloats ?? Array.Empty<ShaderParameters>()) Shader.SetGlobalFloat(light.getShaderValue(p.parameter), p.paramValue);
+                    foreach (var p in profile.globalStaticShaderColors ?? Array.Empty<ShaderParametersColors>()) Shader.SetGlobalColor(light.getShaderValue(p.parameter), p.paramValue);
                 }
-                light.UpdateCycle();
-                previousTime = frame.TimeOfDay; previousDay = frame.Day;
             }
-            previousSegment = frame.Segment;
-            previousWorld = frame;
-        };
+            light.UpdateCycle();
+        }
+        Commit(frame);
     }
 }

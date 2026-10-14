@@ -69,20 +69,20 @@ internal sealed class ReplayNotice : IDisposable
     private Label? loadingHint, toast;
     private GameObject? overlay;
     private CanvasGroup? overlayGroup;
-    private double nextScan, toastUntil;
-    private string message = "";
-    private bool isError;
+    private double nextScan;
+    private readonly ReplayNoticeState state = new();
 
     public void Show(string text, double seconds = 7, bool error = false)
     {
-        message = text ?? "";
-        toastUntil = Time.realtimeSinceStartupAsDouble + Math.Max(1, seconds);
-        isError = error;
+        state.Show(text, Time.realtimeSinceStartupAsDouble, seconds, error);
     }
+    public void Dismiss(string text) => state.Dismiss(text);
 
     // No permanent tutorial or recording banner on the title/game screen.
-    // Instructions live in Memories; only explicit F9 diagnostics may persist.
-    public void Tick(bool overlayOpen, bool playback = false, string? stats = null, string? replayLoading = null)
+    // Instructions live in Memories. Recorder failures remain visible until an
+    // explicit recording action or a new run clears their independent state.
+    public void Tick(bool overlayOpen, bool playback = false, string? stats = null, string? replayLoading = null,
+        string? recordingFailure = null)
     {
         double now = Time.realtimeSinceStartupAsDouble;
         // Do not search the entire live island four times/second for a loading UI
@@ -104,22 +104,15 @@ internal sealed class ReplayNotice : IDisposable
             }
         }
 
-        bool hasToast = now < toastUntil && message.Length != 0;
-        bool hasStats = !string.IsNullOrWhiteSpace(stats);
-        bool showOverlay = !nativeLoading && !overlayOpen && !playback && (hasToast || hasStats);
+        var presentation = state.Present(now, recordingFailure, stats);
+        bool showOverlay = !nativeLoading && !overlayOpen && !playback && presentation.Visible;
         if (!showOverlay) { if (overlay) overlay!.SetActive(false); return; }
         EnsureOverlay();
         overlay!.SetActive(true);
-        toast!.Root.SetActive(hasToast || hasStats);
-        if (hasToast || hasStats)
-        {
-            string text = hasToast ? message : "";
-            if (hasStats) text += (text.Length > 0 ? "\n" : "") + stats;
-            float alpha = hasStats ? 1 : Mathf.Clamp01((float)(toastUntil - now) / .5f);
-            Color color = isError && hasToast ? new Color(1f, .8f, .65f, alpha) : new Color(1f, .97f, .88f, alpha);
-            toast.Set(text, color);
-            toast.Rect.sizeDelta = new Vector2(1100, hasStats ? 200 : 92);
-        }
+        toast!.Root.SetActive(true);
+        Color color = presentation.Error ? new Color(1f, .8f, .65f, presentation.Alpha) : new Color(1f, .97f, .88f, presentation.Alpha);
+        toast.Set(presentation.Text, color);
+        toast.Rect.sizeDelta = new Vector2(1100, presentation.HasStats ? 240 : presentation.Persistent ? 132 : 92);
         overlayGroup!.alpha = 1;
     }
 

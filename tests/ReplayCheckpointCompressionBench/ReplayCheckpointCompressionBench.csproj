@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <!-- Frozen, previously validated .25 pure .NET archive reader. The live
+         production checkpoint codec is being edited concurrently. -->
+    <Reference Include="ReplayContract" Condition="'$(UseCurrentCheckpointCodec)' != 'true'"><HintPath>../../artifacts/bin/ReplayContract/release/ReplayContract.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="Newtonsoft.Json" Condition="'$(UseCurrentCheckpointCodec)' != 'true'"><HintPath>../../artifacts/bin/ReplayContract/release/Newtonsoft.Json.dll</HintPath><Private>true</Private></Reference>
+    <ProjectReference Include="../ReplayContract/ReplayContract.csproj" Condition="'$(UseCurrentCheckpointCodec)' == 'true'" />
+  </ItemGroup>
+</Project>

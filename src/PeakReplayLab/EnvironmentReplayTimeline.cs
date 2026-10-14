@@ -24,11 +24,13 @@ internal sealed class EnvironmentReplayTimeline
         private double previousTime = double.NegativeInfinity;
         private int previousSegment;
         private EnvironmentReplayFrame? previous;
+        private double observedStart = double.NaN;
 
         public void Observe(ReplayFrame frame)
         {
             if (!ReplayRules.Finite(frame.T) || frame.T < previousTime) throw new InvalidDataException("环境时间轴没有排序。");
             if (frame.T == previousTime) return;
+            if (double.IsNaN(observedStart)) observedStart = frame.T;
             bool cut = keys.Count == 0 || frame.T - previousTime > .5 || previousSegment != frame.World.Segment ||
                 !EnvironmentSnapshotEquality.SameEvent(previous, frame.World.Environment);
             var state = frame.World.Environment;
@@ -50,22 +52,27 @@ internal sealed class EnvironmentReplayTimeline
             previous = state; previousTime = frame.T; previousSegment = frame.World.Segment;
         }
 
-        public EnvironmentReplayTimeline Build(bool knownEnd) => new(keys.ToArray(), previousTime, knownEnd);
+        public EnvironmentReplayTimeline Build(bool knownEnd) => new(keys.ToArray(), observedStart, previousTime, knownEnd);
     }
 
     private readonly Key[] keys;
     private readonly double observedEnd;
+    private readonly double observedStart;
     private readonly bool knownEnd;
     public int KeyCount => keys.Length;
-    private EnvironmentReplayTimeline(Key[] keys, double observedEnd, bool knownEnd)
-    { this.keys = keys; this.observedEnd = observedEnd; this.knownEnd = knownEnd; }
+    internal long EstimatedIndexBytes => 128 + keys.Length * 32L;
+    private EnvironmentReplayTimeline(Key[] keys, double observedStart, double observedEnd, bool knownEnd)
+    { this.keys = keys; this.observedStart = observedStart; this.observedEnd = observedEnd; this.knownEnd = knownEnd; }
 
     public EnvironmentReplayTimeline(IEnumerable<ReplayFrame> frames, bool knownEnd, CancellationToken cancellation = default)
     {
         var builder = new Builder();
         foreach (var frame in frames) { cancellation.ThrowIfCancellationRequested(); builder.Observe(frame); }
-        var built = builder.Build(knownEnd); keys = built.keys; observedEnd = built.observedEnd; this.knownEnd = knownEnd;
+        var built = builder.Build(knownEnd); keys = built.keys; observedStart = built.observedStart; observedEnd = built.observedEnd; this.knownEnd = knownEnd;
     }
+
+    internal bool RequiresPredecessor(double time) => keys.Length != 0 && keys[0].Time < observedStart - .000001 &&
+        time >= observedStart && (keys.Length == 1 || time < keys[1].Time);
 
     public bool TrySample(double time, out EnvironmentReplayBracket sample)
     {

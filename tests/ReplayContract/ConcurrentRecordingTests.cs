@@ -245,13 +245,19 @@ internal static class ConcurrentRecordingTests
                 "A full writer failure can prevent rolling insertion.");
             string plugin = Source("Plugin.cs");
             string update = Method(plugin, "private void LateUpdate(");
-            Check(Regex.Matches(update, @"\bcapture\.Tick\s*\(").Count == 1 && update.Contains("capture.Tick(fullRun != null ? fullRunSink : null)"),
+            Check(Regex.Matches(update, @"\bcapture\.Tick\s*\(").Count == 1 && update.Contains("capture.Tick(fullRunSink)"),
                 "A second capture path was introduced or full recording now gates all capture.");
+            Check(!update.Contains("StartAutomaticFullRun("), "Automatic recording starts before the first accepted live frame.");
             Check(!update.Contains("IsContinuous"), "Turning full recording off disables the rolling update.");
             string save = Method(plugin, "private void SaveHighlight(");
             Check(save.Contains("PrepareSnapshot") && !save.Contains("IsContinuous") && !save.Contains("recordingMode"),
                 "F6 is still mutually exclusive with full recording.");
             string full = Source("Plugin.FullRun.cs");
+            string accepted = Method(full, "private void AcceptFullRunFrame(");
+            Check(accepted.Contains("StartAutomaticFullRun();") &&
+                accepted.IndexOf("StartAutomaticFullRun();", StringComparison.Ordinal) < accepted.IndexOf("var writer = fullRun", StringComparison.Ordinal) &&
+                accepted.Contains("writer.TryEnqueue(frame, estimatedBytes)"),
+                "The accepted first frame must start the writer and be delivered to that same writer.");
             foreach (string signature in new[] { "private void ToggleFullRun(", "private void StopFullRun(", "private void SetRecordingMode(" })
             {
                 string action = Method(full, signature);

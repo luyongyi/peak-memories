@@ -166,6 +166,15 @@ internal sealed class ReplayQueueBudget
                 own = checked(32 + array.LongLength * 8);
             }
         }
+        // These sealed hot models have fixed property layouts. Preserve the
+        // reflective Shape accounting exactly, while avoiding GetValue, a List,
+        // and its backing array for every newly observed bone transform.
+        else if (value is NodePose node)
+        { own = 32 + 6 * 8L; children = References(node.Path, node.Position, node.Rotation, node.Scale); }
+        else if (value is ObjectPose pose)
+        { own = 32 + 5 * 8L; children = References(pose.Position, pose.Rotation, pose.Scale, pose.Nodes); }
+        else if (value is CreatureReplayFrame creature)
+        { own = 32 + 13 * 8L; children = References(creature.Key, creature.Kind, creature.Resource, creature.SourcePath, creature.Pose, creature.Line, creature.Visuals, creature.IdleAnimation); }
         else
         {
             var shape = shapes.GetOrAdd(value.GetType(), type => new Shape(type));
@@ -176,5 +185,23 @@ internal sealed class ReplayQueueBudget
         // Include the reference table, node and cached child-edge array itself,
         // so memoization remains part of the bounded retained-memory estimate.
         return new Node(checked(own + 160 + children.Length * 8L), children);
+    }
+    // Keep null filtering and reference order identical to Shape. Apart from
+    // preserving the estimate, this also preserves partial-retain rollback.
+    private static object[] References(object? a, object? b, object? c, object? d, object? e = null, object? f = null, object? g = null, object? h = null)
+    {
+        int count = (a != null ? 1 : 0) + (b != null ? 1 : 0) + (c != null ? 1 : 0) + (d != null ? 1 : 0) +
+            (e != null ? 1 : 0) + (f != null ? 1 : 0) + (g != null ? 1 : 0) + (h != null ? 1 : 0);
+        if (count == 0) return Array.Empty<object>();
+        var children = new object[count]; int index = 0;
+        if (a != null) children[index++] = a;
+        if (b != null) children[index++] = b;
+        if (c != null) children[index++] = c;
+        if (d != null) children[index++] = d;
+        if (e != null) children[index++] = e;
+        if (f != null) children[index++] = f;
+        if (g != null) children[index++] = g;
+        if (h != null) children[index] = h;
+        return children;
     }
 }

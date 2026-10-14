@@ -1,0 +1,8 @@
+<Project>
+  <!-- Reuse the maintained production-only source list, not the parent test
+       executable or its Program. Both projects are at the same directory depth. -->
+  <Import Project="../ReplayContract/ReplayContract.csproj" />
+  <ItemGroup>
+    <Compile Include="../ReplayContract/ReplayTimelineTests.cs" Link="ReplayTimelineTests.cs" />
+  </ItemGroup>
+</Project>

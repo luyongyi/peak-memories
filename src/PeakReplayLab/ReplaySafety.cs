@@ -86,12 +86,43 @@ internal sealed class ReplaySafety : IDisposable
             Patch(typeof(Spider), "FixedUpdate", nameof(AllowPresentationUpdate));
             Patch(typeof(SpiderManager), "Update", nameof(AllowPresentationUpdate));
             Patch(typeof(ZombieManager), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Condor), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(FrogTongue), "LateUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(FrogTongue), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Mob), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(MobManager), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Mob), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Mob), "LateUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Scoutmaster), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Scoutmaster), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Antlion), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(VenusFlyTrap), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(TumbleWeed), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.Island.VoiceThief), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Skelleton), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.ScoutmasterGhostOrbiter), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.GhostBall), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.GhostBall), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.GhostBallSpawner), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(PlayerGhost), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(BeeSwarm), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(BeeSwarm), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.ScoutStatue), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(BreakableBridge), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(BreakableBridge), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.TurtleShell), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.InfiniteStamSphere), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(ArrowShooter), "FixedUpdate", nameof(AllowPresentationUpdate));
+            Patch(typeof(LineTest), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(BezierRenderer), "LateUpdate", nameof(AllowPresentationUpdate));
             // Placed native templates remain in the scene behind passive replay
             // meshes. Their updates can rotate without deltaTime, break/RPC a
             // piton, or change campfire afflictions even while timeScale is zero.
             Patch(typeof(MagicBeanVine), "Update", nameof(AllowPresentationUpdate));
             Patch(typeof(ShittyPiton), "Update", nameof(AllowPresentationUpdate));
             Patch(typeof(Campfire), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(Peak.PeakGatePortal), "Update", nameof(AllowPresentationUpdate));
+            Patch(typeof(WarpCompassVFX), "Update", nameof(AllowPresentationUpdate));
             Patch(typeof(Peak.GrowOverTime), "Update", nameof(AllowPresentationUpdate));
             Patch(typeof(Peak.AntiSphere), "FixedUpdate", nameof(AllowPresentationUpdate));
         }

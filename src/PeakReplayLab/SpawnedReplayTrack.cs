@@ -113,9 +113,18 @@ internal sealed class SpawnedReplayCapture : IDisposable
         public SpawnedReplayResources.Resource Resource = null!;
         public string Key = "";
         public SpawnedReplayFrame? Last;
-        public double WatchUntil, NextProbe, RetryAfter;
+        public double RetryAfter;
         public bool Dirty = true;
+        public bool InitialUrgent;
+        public bool EventOnlyAppearance;
+        public double AnimationWatchSeconds = SpawnedReplayRules.AnimationWatchSeconds;
+        public IDisposable? RootLifecycle;
         public CannonReplayCapture? Cannon;
+        public Transform Root = null!;
+        public readonly ItemActivityPolicy Activity = new();
+        // All non-player periodic work is capped by the shared scene clock.
+        // Idle geometry still has no poll; events retain their final checkpoint.
+        public readonly SpawnedCaptureLifecycle Lifecycle = new(30, followSceneClock: true);
     }
     private readonly Dictionary<int, Entry> entries = new();
     private readonly List<int> destroyed = new();
@@ -125,15 +134,26 @@ internal sealed class SpawnedReplayCapture : IDisposable
     private readonly Action<string>? warning;
     private readonly SpawnedReplayObserver observer;
     private readonly NativePlacementObserver placementObserver;
+    private readonly SegmentCaptureClient? segments;
     private readonly int scene = SceneManager.GetActiveScene().handle;
     private long serial;
     private bool disposed;
+    public long GeometryReads { get; private set; }
+    public long LightReads { get; private set; }
+    public long AppearanceReads { get; private set; }
+    public long SleepingGeometrySkips { get; private set; }
+    internal bool InitialBaselineReady
+    { get { foreach (var entry in entries.Values) if (entry.Source && entry.Last == null) return false; return true; } }
     public SpawnedReplayCapture(Action<string>? warning = null)
     {
         this.warning = warning;
-        observer = new SpawnedReplayObserver(Register, Remove, Bounce, Changed);
-        try { placementObserver = new NativePlacementObserver(Register, Remove, Changed); }
-        catch { observer.Dispose(); throw; }
+        segments = CaptureSegmentScope.Active?.CreateClient(source => Register(source, false), Retire);
+        try { observer = new SpawnedReplayObserver(ObservedBirth, Remove, Bounce, Changed); }
+        catch { segments?.Dispose(); throw; }
+        // Placement Awake/Start is also a region activation discovery. Actual
+        // initialization, growth, breaking and interaction call Changed next.
+        try { placementObserver = new NativePlacementObserver((source, _) => Register(source, false), Remove, Changed); }
+        catch { observer.Dispose(); segments?.Dispose(); throw; }
         try
         {
             // One initialization pass only. Afterwards native birth/destruction
@@ -144,11 +164,20 @@ internal sealed class SpawnedReplayCapture : IDisposable
                 if (source) Register(source.gameObject, false);
             foreach (var source in NativePlacementResources.InitialSources()) if (source) Register(source, false);
         }
-        catch { placementObserver.Dispose(); observer.Dispose(); throw; }
+        catch { Dispose(); throw; }
+    }
+    private void ObservedBirth(GameObject source, bool born)
+    {
+        if (!source) return;
+        // Cannon Awake can come from map activation; Photon instantiations of
+        // short-lived player-created terrain keep their immediate admission.
+        bool cannon = source.name.StartsWith("ScoutCannon_Placed", StringComparison.Ordinal);
+        Register(source, born && !cannon);
     }
     private void Register(GameObject source, bool born)
     {
         if (disposed || ReplaySafety.Active || !source || source.scene.handle != scene) return;
+        if (!(segments?.Admit(source, born) ?? true)) return;
         if (entries.TryGetValue(source.GetInstanceID(), out var existing))
         {
             if (existing.Source == source) return;
@@ -156,24 +185,55 @@ internal sealed class SpawnedReplayCapture : IDisposable
         }
         var resource = SpawnedReplayResources.Match(source); if (resource == null) return;
         if (entries.Count >= SpawnedReplayRules.MaximumEntities) { Warn("limit", "生成地形超过256个，超出部分未录制。"); return; }
-        entries.Add(source.GetInstanceID(), new Entry { Source = source, Resource = resource,
+        var entry = new Entry { Source = source, Root = source.transform, Resource = resource,
             Key = "spawn:" + source.GetInstanceID() + ":" + (++serial),
-            WatchUntil = born ? Time.timeAsDouble + SpawnedReplayRules.AnimationWatchSeconds : double.NegativeInfinity,
-            Cannon = resource.Kind == "scout-cannon" ? new CannonReplayCapture(source.GetComponent<ScoutCannon>()) : null });
+            InitialUrgent = born,
+            EventOnlyAppearance = NativeStaticVisualCapability.SpawnedEventOnly(source, resource.Kind),
+            Cannon = resource.Kind == "scout-cannon" ? new CannonReplayCapture(source.GetComponent<ScoutCannon>()) : null };
+        entries.Add(source.GetInstanceID(), entry);
+        if (entry.EventOnlyAppearance)
+        {
+            entry.AnimationWatchSeconds = NativeStaticVisualCapability.BindAnimationWindow(source, out bool advancing);
+            if (advancing) entry.Lifecycle.NativeEvent(Time.timeAsDouble, entry.AnimationWatchSeconds);
+        }
+        entry.RootLifecycle = CaptureRootLifecycleObserver.Bind(source, () => Changed(source));
+        if (born) entry.Lifecycle.NativeEvent(Time.timeAsDouble, entry.AnimationWatchSeconds);
     }
-    private void Remove(GameObject source) { if (source) entries.Remove(source.GetInstanceID()); }
+    private void Retire(int id)
+    {
+        if (!entries.TryGetValue(id, out var entry)) return;
+        entry.RootLifecycle?.Dispose();
+        VisualReplica.ReleaseCapture(entry.Root);
+        NativePlacementResources.InvalidateCapture(entry.Source);
+        entries.Remove(id); previous = Array.Empty<SpawnedReplayFrame>();
+    }
+    private void Remove(GameObject source)
+    { if (source) { int id = source.GetInstanceID(); segments?.Forget(id); Retire(id); } }
     private void Changed(GameObject source)
     {
+        if (!source || !(segments?.Admit(source, true) ?? true)) return;
         NativePlacementResources.InvalidateCapture(source);
-        Register(source, false);
+        Register(source, true);
         if (entries.TryGetValue(source.GetInstanceID(), out var entry))
-        { entry.Dirty = true; entry.RetryAfter = 0; entry.Cannon?.Changed(); }
+        { entry.Dirty = true; entry.InitialUrgent = true; entry.RetryAfter = 0; entry.Lifecycle.NativeEvent(Time.timeAsDouble, entry.AnimationWatchSeconds); entry.Cannon?.Changed(); }
     }
     private void Bounce(Transform source)
     {
         for (var node = source; node; node = node.parent)
-            if (entries.TryGetValue(node.gameObject.GetInstanceID(), out var entry))
-            { entry.Dirty = true; entry.RetryAfter = 0; entry.WatchUntil = Time.timeAsDouble + SpawnedReplayRules.AnimationWatchSeconds; return; }
+        {
+            int id = node.gameObject.GetInstanceID();
+            if (!entries.TryGetValue(id, out var entry))
+            {
+                // A real bounce may precede its budgeted region baseline. The
+                // cheap name/type match avoids registering every ancestor as a
+                // candidate; Register still gates all rig/appearance binding.
+                if (SpawnedReplayResources.Match(node.gameObject) == null) continue;
+                Register(node.gameObject, true);
+                if (!entries.TryGetValue(id, out entry)) return;
+            }
+            if (entry != null)
+            { entry.Dirty = true; entry.InitialUrgent = true; entry.RetryAfter = 0; entry.Lifecycle.NativeEvent(Time.timeAsDouble, entry.AnimationWatchSeconds); return; }
+        }
     }
     public SpawnedReplayFrame[] Capture(double now)
     {
@@ -184,6 +244,11 @@ internal sealed class SpawnedReplayCapture : IDisposable
             var entry = pair.Value;
             if (!entry.Source) { destroyed.Add(pair.Key); continue; }
             if (now < entry.RetryAfter) { if (entry.Last != null) frames.Add(entry.Last); continue; }
+            if (CaptureBootstrapWorkBudget.InitialOnly && entry.Last != null && !entry.InitialUrgent && !entry.Dirty &&
+                !entry.Lifecycle.IsObserving(now, false))
+            { frames.Add(entry.Last); continue; }
+            if (entry.Last == null && !entry.InitialUrgent && !CaptureBootstrapWorkBudget.TryBeginRead()) continue;
+            entry.InitialUrgent = false;
             try { frames.Add(Sample(entry, now)); }
             catch (Exception e)
             {
@@ -193,173 +258,64 @@ internal sealed class SpawnedReplayCapture : IDisposable
                 entry.RetryAfter = now + 1; Warn(entry.Resource.Path, "生成地形采集暂不可用：" + e.Message);
             }
         }
-        foreach (int id in destroyed) entries.Remove(id);
+        foreach (int id in destroyed) { segments?.Forget(id); Retire(id); }
         bool same = frames.Count == previous.Length;
         if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previous[i])) { same = false; break; }
         return same ? previous : previous = frames.ToArray();
     }
-    private static SpawnedReplayFrame Sample(Entry entry, double now)
+    private SpawnedReplayFrame Sample(Entry entry, double now)
     {
-        // Light controllers may flicker while an otherwise static model is
-        // sleeping. Sample light values at recorder cadence independently of
-        // the cheaper geometry probe and retain the immutable array when equal.
-        var lights = NativeLightAppearance.Capture(entry.Source.transform, entry.Last?.Lights);
+        // Capability was bound once at admission. A constant Light/material is
+        // event-only; unknown controllers keep their independent 30 Hz reader.
+        bool visibilityChanged = !entry.EventOnlyAppearance && entry.Last != null && entry.Last.Pose.Active != entry.Source.activeInHierarchy;
+        bool animating = !entry.EventOnlyAppearance && NativePlacementResources.IsAnimating(entry.Source, now, entry.Dirty, followSceneClock: true);
+        bool animatedAppearance = entry.Lifecycle.IsObserving(now, animating);
+        bool geometryDue = entry.Dirty || entry.Lifecycle.ShouldRead(now, entry.Last != null, visibilityChanged, animating);
+        var lights = entry.Last?.Lights;
+        bool lightDue = lights == null || entry.Dirty || (entry.EventOnlyAppearance ? geometryDue : lights.Length > 0);
+        if (lightDue && entry.Activity.LightDue(now, entry.Dirty, followSceneClock: true))
+        {
+            LightReads++;
+            lights = NativeLightAppearance.Capture(entry.Root, lights);
+            entry.Activity.LightObserved(now);
+        }
         if (entry.Cannon != null)
         {
             var value = entry.Cannon.Sample(entry.Key, entry.Resource.Path, now, entry.Dirty);
-            var visuals = NativeVisualAppearance.CaptureAtTime(entry.Source.transform, entry.Last?.Visuals, now, entry.Dirty, allowAnimated: true);
+            var visuals = NativeVisualAppearance.CaptureAtTime(entry.Source.transform, entry.Last?.Visuals, now, entry.Dirty, allowAnimated: true, followSceneClock: true);
             entry.Dirty = false;
             if (entry.Last != null && ReferenceEquals(entry.Last.Pose, value.Pose) && ReferenceEquals(entry.Last.Animation, value.Animation) && ReferenceEquals(entry.Last.Visuals, visuals) && ReferenceEquals(entry.Last.Lights, lights)) return entry.Last;
             return entry.Last = new SpawnedReplayFrame { Key = value.Key, Resource = value.Resource, Kind = value.Kind, Pose = value.Pose, Animation = value.Animation, Visuals = visuals, Lights = lights };
         }
-        bool visibilityChanged = entry.Last != null && entry.Last.Pose.Active != entry.Source.activeInHierarchy;
-        bool animating = NativePlacementResources.IsAnimating(entry.Source);
-        bool animatedAppearance = animating || now <= entry.WatchUntil;
-        bool appearanceDue = entry.Last != null && NativeVisualAppearance.NeedsCaptureAtTime(entry.Source.transform, entry.Last.Visuals, now, entry.Last.Pose.Active, animatedAppearance);
-        if (entry.Last != null && !visibilityChanged && !animating && !appearanceDue && !SpawnedReplayRules.ShouldProbe(now, entry.NextProbe, entry.WatchUntil, entry.Dirty))
+        bool appearanceDue = !entry.EventOnlyAppearance && entry.Last != null && NativeVisualAppearance.NeedsCaptureAtTime(entry.Root, entry.Last.Visuals, now, entry.Last.Pose.Active, animatedAppearance, followSceneClock: true);
+        if (!geometryDue && !appearanceDue && entry.Last != null)
         {
+            SleepingGeometrySkips++;
             if (ReferenceEquals(entry.Last.Lights, lights)) return entry.Last;
             return entry.Last = new SpawnedReplayFrame { Key = entry.Last.Key, Resource = entry.Last.Resource, Kind = entry.Last.Kind,
                 Pose = entry.Last.Pose, Animation = entry.Last.Animation, Visuals = entry.Last.Visuals, Lights = lights };
         }
         // The real short spawn/bounce result includes Unity's native transitions.
         // No controller, collision handler or rerandomized spawn is replayed.
-        var pose = VisualReplica.Capture(entry.Source.transform, entry.Last == null || entry.Dirty || visibilityChanged || animating || now <= entry.WatchUntil);
-        var appearance = NativeVisualAppearance.CaptureAtTime(entry.Source.transform, entry.Last?.Visuals, now, entry.Dirty || visibilityChanged, allowAnimated: animatedAppearance);
-        entry.NextProbe = now + .5 + (entry.Source.GetInstanceID() & 3) * .03;
+        var pose = entry.Last?.Pose;
+        if (geometryDue)
+        { GeometryReads++; pose = VisualReplica.Capture(entry.Root, true); entry.Lifecycle.Observed(now, animating); }
+        var appearance = entry.Last?.Visuals;
+        if (entry.Last == null || entry.Dirty || visibilityChanged || appearanceDue || animatedAppearance || entry.EventOnlyAppearance && geometryDue)
+        {
+            AppearanceReads++;
+            appearance = entry.EventOnlyAppearance ? NativeVisualAppearance.Capture(entry.Root, appearance) :
+                NativeVisualAppearance.CaptureAtTime(entry.Root, appearance, now, entry.Dirty || visibilityChanged, allowAnimated: animatedAppearance, followSceneClock: true);
+        }
         entry.Dirty = false;
         if (entry.Last != null && ReferenceEquals(entry.Last.Pose, pose) && ReferenceEquals(entry.Last.Visuals, appearance) && ReferenceEquals(entry.Last.Lights, lights)) return entry.Last;
-        return entry.Last = new SpawnedReplayFrame { Key = entry.Key, Resource = entry.Resource.Path, Kind = entry.Resource.Kind, Pose = pose, Visuals = appearance, Lights = lights };
+        return entry.Last = new SpawnedReplayFrame { Key = entry.Key, Resource = entry.Resource.Path, Kind = entry.Resource.Kind, Pose = pose!, Visuals = appearance, Lights = lights };
     }
     private void Warn(string key, string message) { if (warned.Count < 128 && warned.Add(key)) try { warning?.Invoke(message); } catch { } }
     public void Dispose()
-    { if (disposed) return; disposed = true; placementObserver.Dispose(); observer.Dispose(); entries.Clear(); frames.Clear(); destroyed.Clear(); previous = Array.Empty<SpawnedReplayFrame>(); }
-}
-
-internal sealed class SpawnedReplayPlayback : IDisposable
-{
-    private sealed class Entry
     {
-        public string Resource = "", Kind = "";
-        public VisualReplica Visual = null!;
-        public CannonReplayVisual? Cannon;
-        public NativeVisualAppearance.Playback? Appearance;
-        public NativeLightAppearance.Playback? Lights;
-        public void Dispose() { Cannon?.Dispose(); Lights?.Dispose(); Appearance?.Dispose(); Visual.Dispose(); }
-        public int Seen;
-    }
-    private readonly Dictionary<string, Entry> entries = new(StringComparer.Ordinal);
-    private readonly Dictionary<Renderer, bool> hidden = new();
-    private readonly NativeLightAppearance.Originals originalLights = new();
-    private readonly Dictionary<string, SpawnedReplayFrame> following = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, double> retry = new(StringComparer.Ordinal);
-    private readonly HashSet<string> current = new(StringComparer.Ordinal), warned = new(StringComparer.Ordinal);
-    private readonly List<string> removed = new();
-    private readonly List<KeyValuePair<string, Entry>> sleeping = new();
-    private readonly Action<string>? warning;
-    private readonly SpawnedReplayObserver observer;
-    private readonly NativePlacementObserver placementObserver;
-    private int serial, enforcedFrame = -1;
-    private bool disposed;
-    public int MissingCount { get; private set; }
-    public int VisibleCount { get; private set; }
-    public SpawnedReplayPlayback(Action<string>? warning = null)
-    {
-        this.warning = warning;
-        observer = new SpawnedReplayObserver((go, _) => Hide(go), _ => { }, _ => { });
-        try { placementObserver = new NativePlacementObserver((go, _) => Hide(go), _ => { }, Hide); }
-        catch { observer.Dispose(); throw; }
-        try
-        {
-            foreach (var source in Object.FindObjectsByType<Peak.PhotonCleanupHelper>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-                if (source) Hide(source.gameObject);
-            foreach (var source in Object.FindObjectsByType<ScoutCannon>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-                if (source) Hide(source.gameObject);
-            foreach (var source in NativePlacementResources.InitialSources()) if (source) Hide(source);
-        }
-        catch { Dispose(); throw; }
-    }
-    private void Hide(GameObject source)
-    {
-        if (SpawnedReplayResources.Match(source) == null) return;
-        foreach (var renderer in source.GetComponentsInChildren<Renderer>(true))
-        {
-            // Particles are separately hidden/replayed by the effect track.
-            if (!(renderer is MeshRenderer || renderer is SkinnedMeshRenderer) || hidden.ContainsKey(renderer)) continue;
-            hidden.Add(renderer, renderer.forceRenderingOff); renderer.forceRenderingOff = true;
-        }
-        originalLights.Hide(source);
-    }
-    public void Enforce()
-    {
-        if (disposed || enforcedFrame == Time.frameCount) return; enforcedFrame = Time.frameCount;
-        foreach (var pair in hidden) if (pair.Key && !pair.Key.forceRenderingOff) pair.Key.forceRenderingOff = true;
-        originalLights.Enforce();
-    }
-    public void Apply(SpawnedReplayFrame[] left, SpawnedReplayFrame[] right, float mix, double time, bool discontinuity)
-    {
-        if (disposed) throw new ObjectDisposedException(nameof(SpawnedReplayPlayback));
-        serial++; MissingCount = 0; VisibleCount = 0; current.Clear(); following.Clear();
-        foreach (var frame in right) following[frame.Key] = frame;
-        foreach (var frame in left) current.Add(frame.Key);
-        // Reclaim obsolete seek checkpoints before creating this cursor's set.
-        // Otherwise 256 old + 24 sleeping entries could block valid new objects.
-        sleeping.Clear();
-        foreach (var pair in entries) if (!current.Contains(pair.Key)) { pair.Value.Visual.Hide(); sleeping.Add(pair); }
-        sleeping.Sort((a, b) => a.Value.Seen.CompareTo(b.Value.Seen));
-        for (int i = 0; i < sleeping.Count - 24; i++) { sleeping[i].Value.Dispose(); entries.Remove(sleeping[i].Key); }
-        double now = Time.realtimeSinceStartupAsDouble;
-        foreach (var frame in left)
-        {
-            if (retry.TryGetValue(frame.Key, out double after) && now < after) { MissingCount++; continue; }
-            entries.TryGetValue(frame.Key, out var entry);
-            try
-            {
-                if (entry != null && (entry.Resource != frame.Resource || entry.Kind != frame.Kind))
-                { entry.Dispose(); entries.Remove(frame.Key); entry = null; }
-                if (entry == null)
-                {
-                    var source = SpawnedReplayResources.Find(frame.Resource);
-                    if (source == null || source.Kind != frame.Kind || !source.Source) throw new InvalidOperationException("Native spawned terrain resource unavailable: " + frame.Resource);
-                    if (entries.Count >= SpawnedReplayRules.MaximumEntities + 24) throw new InvalidOperationException("Spawned terrain visual pool is full.");
-                    entry = new Entry { Resource = frame.Resource, Kind = frame.Kind, Visual = new VisualReplica(source.Source!, true) };
-                    try
-                    {
-                        if (frame.Kind == "scout-cannon") entry.Cannon = new CannonReplayVisual(source.Source!, entry.Visual);
-                        entry.Appearance = new NativeVisualAppearance.Playback(entry.Visual, source.Source!);
-                        entry.Lights = new NativeLightAppearance.Playback(entry.Visual, source.Source!);
-                        entry.Visual.Root.name = "PEAK Replay Spawned - " + source.Name; entries.Add(frame.Key, entry);
-                    }
-                    catch { entry.Dispose(); entry = null; throw; }
-                }
-                following.TryGetValue(frame.Key, out var next);
-                if (discontinuity) entry.Visual.InvalidatePose();
-                if (entry.Cannon != null) entry.Cannon.Apply(frame, next, mix, time, discontinuity);
-                else entry.Visual.Apply(frame.Pose, next != null && SpawnedReplayRules.CanInterpolate(frame, next) ? next.Pose : null, mix);
-                entry.Appearance?.Apply(frame.Visuals);
-                entry.Lights?.Apply(frame.Lights);
-                entry.Seen = serial; retry.Remove(frame.Key);
-                if (frame.Pose.Active) VisibleCount++;
-            }
-            catch (Exception e)
-            {
-                entry?.Visual.Hide(); MissingCount++; retry[frame.Key] = now + 1;
-                if (warned.Count < 128 && warned.Add(frame.Resource)) try { warning?.Invoke("生成地形缺失：" + e.Message); } catch { }
-            }
-        }
-        sleeping.Clear();
-        foreach (var pair in entries) if (pair.Value.Seen != serial) { pair.Value.Visual.Hide(); sleeping.Add(pair); }
-        sleeping.Sort((a, b) => a.Value.Seen.CompareTo(b.Value.Seen));
-        for (int i = 0; i < sleeping.Count - 24; i++) { sleeping[i].Value.Dispose(); entries.Remove(sleeping[i].Key); }
-        removed.Clear(); foreach (var pair in retry) if (!current.Contains(pair.Key)) removed.Add(pair.Key);
-        foreach (string key in removed) retry.Remove(key);
-    }
-    public void Dispose()
-    {
-        if (disposed) return; disposed = true; placementObserver.Dispose(); observer.Dispose();
-        foreach (var pair in hidden) try { if (pair.Key) pair.Key.forceRenderingOff = pair.Value; } catch { }
-        originalLights.Dispose();
-        foreach (var entry in entries.Values) try { entry.Dispose(); } catch { }
-        hidden.Clear(); entries.Clear(); retry.Clear();
+        if (disposed) return; disposed = true; placementObserver.Dispose(); observer.Dispose(); segments?.Dispose();
+        foreach (var entry in entries.Values) { entry.RootLifecycle?.Dispose(); VisualReplica.ReleaseCapture(entry.Root); NativePlacementResources.InvalidateCapture(entry.Source); }
+        entries.Clear(); frames.Clear(); destroyed.Clear(); previous = Array.Empty<SpawnedReplayFrame>();
     }
 }

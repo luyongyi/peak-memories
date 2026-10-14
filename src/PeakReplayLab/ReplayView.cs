@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.UI;
 
 namespace PeakReplayLab;
 
@@ -19,6 +20,7 @@ internal sealed class ReplayView : IDisposable
     private readonly int cullingMask;
     private readonly float nearClip, fieldOfView;
     private readonly bool enabled;
+    private GameObject? worldPreparationShield;
     private bool disposed;
     public Camera Camera { get; }
 
@@ -83,6 +85,30 @@ internal sealed class ReplayView : IDisposable
         Camera.enabled = true;
     }
 
+    // An opaque scene-only cover prevents a partly switched native map from
+    // flashing behind the frozen actor pose. The replay controls and read
+    // notice are higher ScreenSpaceOverlay canvases and remain interactive.
+    public void CoverWorldPreparation(bool covered)
+    {
+        if (disposed) return;
+        if (covered && !worldPreparationShield)
+        {
+            worldPreparationShield = new GameObject("PEAK Memories - world preparation", typeof(RectTransform));
+            var canvas = worldPreparationShield.AddComponent<Canvas>();
+            canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+            canvas.sortingOrder = 1009;
+            var rect = worldPreparationShield.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero; rect.anchorMax = Vector2.one;
+            rect.offsetMin = Vector2.zero; rect.offsetMax = Vector2.zero;
+            var image = worldPreparationShield.AddComponent<Image>();
+            image.color = new Color(.075f, .067f, .058f, 1);
+            image.raycastTarget = false;
+        }
+        var shield = worldPreparationShield;
+        if (shield is not null && shield && shield.activeSelf != covered)
+            shield.SetActive(covered);
+    }
+
     public string Describe()
     {
         var urp = Camera.GetComponent<UniversalAdditionalCameraData>();
@@ -104,6 +130,7 @@ internal sealed class ReplayView : IDisposable
             Camera.cullingMask = cullingMask; Camera.nearClipPlane = nearClip;
             Camera.fieldOfView = fieldOfView; Camera.enabled = enabled;
         });
+        Restore(() => { var shield = worldPreparationShield; if (shield is not null && shield) UnityEngine.Object.Destroy(shield); worldPreparationShield = null; });
         foreach (var saved in behaviours) Restore(() => { if (saved.Component) saved.Component.enabled = saved.Enabled; });
         foreach (var pair in eyeMaterials) Restore(() => { if (pair.Key) pair.Key.SetFloat("_EyeOpen", pair.Value); });
         foreach (var pair in eyeFeatures) Restore(() => { if (pair.Key) pair.Key.SetActive(pair.Value); });

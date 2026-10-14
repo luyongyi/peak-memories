@@ -12,19 +12,24 @@ namespace PeakReplayLab;
 
 // One file, with independently decodable internal pages. Opening the catalogue
 // reads only bounded metadata; seeking decompresses only the requested page.
-public static class FullReplayArchive
+public static partial class FullReplayArchive
 {
     public const long MaximumFileBytes = 4L * 1024 * 1024 * 1024;
     public const long MaximumPageRawBytes = 128L * 1024 * 1024;
     public const long MaximumPageDecodedBytes = 64L * 1024 * 1024;
     public const int MaximumHeaderBytes = 64 * 1024;
-    public const int MaximumIndexBytes = 4 * 1024 * 1024;
-    public const int MaximumPages = 8192;
+    // One-second pages need at least 14,400 entries for a four-hour run.
+    public const int MaximumIndexBytes = 16 * 1024 * 1024;
+    public const int MaximumPages = 32768;
     public const double MaximumDuration = 4 * 60 * 60;
     private const long MaximumFrames = 4 * 60 * 60 * 60 + 1;
     private static readonly UTF8Encoding Utf8 = new(false, true);
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("PEAKRUN1");
     private static readonly byte[] Footer = Encoding.ASCII.GetBytes("PEAKEND1");
+
+    // Keep catalogue eligibility aligned with the archive reader when a new
+    // container layout is added; replay schema compatibility is checked separately.
+    public static bool SupportsContainerVersion(int version) => version is 1 or 2 or 3 or 4;
 
     public static FullReplayInfo ReadInfo(string path, CancellationToken cancellation = default)
     {
@@ -58,6 +63,22 @@ public static class FullReplayArchive
         {
             if (token is not JObject pageJson) throw Invalid("Invalid full replay page index.");
             Require(pageJson, "Index", "Start", "End", "Offset", "Length", "RawBytes", "DecodedBytes", "FrameCount", "FirstFrameIndex", "Overlap");
+            if ((int?)indexJson["Version"] >= 2)
+            {
+                if (pageJson["EffectHistory"] is not JObject historyJson) throw Invalid("Missing full replay effect history index.");
+                Require(historyJson, "Offset", "Length", "RawBytes", "DecodedBytes");
+            }
+            if ((int?)indexJson["Version"] >= 3 && pageJson["SharedThrough"] != null) Require(pageJson, "SharedThrough");
+        }
+        if ((int?)indexJson["Version"] >= 3)
+        {
+            if (indexJson["SharedBlocks"] is not JArray blocksJson || blocksJson.Count > MaximumSharedBlocks)
+                throw Invalid("Invalid full replay shared snapshot index.");
+            foreach (JToken token in blocksJson)
+            {
+                if (token is not JObject blockJson) throw Invalid("Invalid full replay shared snapshot index.");
+                Require(blockJson, "Kind", "Offset", "Length", "RawBytes", "Hash");
+            }
         }
         var info = Convert<FullReplayInfo>(indexJson);
         info.FileLength = length; info.HeaderEnd = headerEnd; info.IndexOffset = indexOffset; info.Path = fullPath;
@@ -76,6 +97,47 @@ public static class FullReplayArchive
         string fullPath = System.IO.Path.GetFullPath(path);
         if (!string.Equals(fullPath, info.Path, StringComparison.OrdinalIgnoreCase)) throw Invalid("Full replay index belongs to another file.");
         ValidateIndex(info);
+        return ReadPageCore(fullPath, info, JObject.FromObject(info.Header), new HashSet<string>(info.ActorIds, StringComparer.Ordinal), pageIndex, cancellation);
+    }
+
+    // Playback owns an immutable index snapshot. Validate it once when opening
+    // the recording instead of walking thousands of unrelated page entries on
+    // every seek. Public ReadPage still validates caller-mutable metadata.
+    internal static Func<int, CancellationToken, ReplayClip> CreatePageLoader(string path, FullReplayInfo info, CancellationToken cancellation = default,
+        ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null)
+    {
+        if (info == null) throw new ArgumentNullException(nameof(info));
+        cancellation.ThrowIfCancellationRequested();
+        string fullPath = System.IO.Path.GetFullPath(path);
+        if (!string.Equals(fullPath, info.Path, StringComparison.OrdinalIgnoreCase)) throw Invalid("Full replay index belongs to another file.");
+        var snapshot = Convert<FullReplayInfo>(JObject.FromObject(info));
+        snapshot.FileLength = info.FileLength; snapshot.HeaderEnd = info.HeaderEnd;
+        snapshot.IndexOffset = info.IndexOffset; snapshot.Path = fullPath;
+        ValidateIndex(snapshot);
+        var header = JObject.FromObject(snapshot.Header);
+        var actorIds = new HashSet<string>(snapshot.ActorIds, StringComparer.Ordinal);
+        cancellation.ThrowIfCancellationRequested();
+        buffers ??= new ReplayLineBufferPool();
+        sharedBuffers ??= new FullReplaySharedScratchPool();
+        return (index, token) => ReadPageCore(fullPath, snapshot, header, actorIds, index, token, buffers: buffers, sharedBuffers: sharedBuffers);
+    }
+
+    // The playback source already owns immutable validated metadata. Legacy
+    // history needs only effects and map-cut witnesses, not actor/item trees.
+    internal static Func<int, CancellationToken, ReplayClip> CreateEffectPageLoader(FullReplayInfo snapshot, ReplayLineBufferPool? buffers = null)
+    {
+        var header = JObject.FromObject(snapshot.Header);
+        var actorIds = new HashSet<string>(snapshot.ActorIds, StringComparer.Ordinal);
+        buffers ??= new ReplayLineBufferPool();
+        return (index, token) => snapshot.Pages[index].EffectHistory != null
+            ? ReadEffectHistory(snapshot.Path, snapshot, index, token, buffers)
+            : ReadPageCore(snapshot.Path, snapshot, header, actorIds, index, token, effectsOnly: true, buffers: buffers);
+    }
+
+    private static ReplayClip ReadPageCore(string fullPath, FullReplayInfo info, JObject expectedHeader, HashSet<string> actorIds,
+        int pageIndex, CancellationToken cancellation, bool effectsOnly = false, ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null)
+    {
+        cancellation.ThrowIfCancellationRequested();
         if (pageIndex < 0 || pageIndex >= info.Pages.Length) throw new ArgumentOutOfRangeException(nameof(pageIndex));
         FullReplayPage page = info.Pages[pageIndex];
         using var file = Open(fullPath);
@@ -91,15 +153,19 @@ public static class FullReplayArchive
         using var gzip = new GZipStream(slice, CompressionMode.Decompress, true);
         using var raw = new CheckedRawStream(gzip, page.RawBytes, cancellation);
         using var reader = new StreamReader(raw, Utf8, false, 8192, true);
-        var clip = ReplayFiles.Read(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes,
-            maximumStoredTime: MaximumDuration);
+        using var shared = info.Version >= 3 && page.SharedThrough > 0 && !effectsOnly ? new SharedSnapshotReader(fullPath, info, page.SharedThrough, cancellation, sharedBuffers) : null;
+        var clip = buffers != null || shared != null
+            ? ReplayFiles.ReadBuffered(reader, buffers ?? new ReplayLineBufferPool(), cancellation, effectsOnly, MaximumPageDecodedBytes, MaximumDuration,
+                shared == null ? null : new Func<Type, int, object>(shared.Resolve))
+            : effectsOnly
+            ? ReplayFiles.ReadEffects(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration)
+            : ReplayFiles.Read(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration);
         if (raw.BytesRead != page.RawBytes || raw.Crc != expectedCrc || slice.Remaining != 0)
             throw Invalid("Full replay page bytes do not match its index.");
         if (!clip.Complete || clip.Frames.Count != page.FrameCount || Math.Abs(clip.Frames[0].T - page.Start) > .000001 ||
             Math.Abs(clip.Duration - page.End) > .000001)
             throw Invalid("Full replay page timeline does not match its index.");
-        if (!Equivalent(clip.Header, info.Header)) throw Invalid("Full replay page header disagrees with the recording.");
-        var actorIds = new HashSet<string>(info.ActorIds, StringComparer.Ordinal);
+        if (!JToken.DeepEquals(JObject.FromObject(clip.Header), expectedHeader)) throw Invalid("Full replay page header disagrees with the recording.");
         var budget = new ContinuousReplayBudget();
         foreach (var frame in clip.Frames)
         {
@@ -119,7 +185,7 @@ public static class FullReplayArchive
     private static void ValidateIndex(FullReplayInfo info)
     {
         if (!ReplayRegionCovers.Valid(info.RegionSummary)) throw Invalid("Invalid full replay region summary.");
-        if (info.Version != 1 || info.Header == null || info.Pages == null || info.Pages.Length < 1 || info.Pages.Length > MaximumPages ||
+        if (!SupportsContainerVersion(info.Version) || info.Header == null || info.Pages == null || info.Pages.Length < 1 || info.Pages.Length > MaximumPages ||
             !ReplayRules.Finite(info.Duration) || info.Duration <= 0 || info.Duration > MaximumDuration ||
             info.FrameCount < 2 || info.FrameCount > MaximumFrames || info.ActorIds == null ||
             info.ActorIds.Any(x => string.IsNullOrWhiteSpace(x) || x.Length > 256) ||
@@ -133,7 +199,10 @@ public static class FullReplayArchive
             info.LargestGapSeconds < 0 || info.LargestGapSeconds > info.Duration + .000001)
             throw Invalid("Invalid full replay index metadata.");
         ValidateHeader(info.Header);
+        if (info.Version >= 3 ? info.Header.Schema < (info.Version == 4 ? 17 : 16) || info.SharedBlocks == null || info.SharedBlocks.Length > MaximumSharedBlocks
+            : info.SharedBlocks != null) throw Invalid("Invalid shared snapshot container version.");
         long expectedOffset = info.HeaderEnd, uniqueFrames = 0;
+        int sharedThrough = 0;
         double lastEnd = 0;
         for (int i = 0; i < info.Pages.Length; i++)
         {
@@ -160,10 +229,38 @@ public static class FullReplayArchive
             uniqueFrames += page.FrameCount - (page.Overlap ? 1 : 0);
             if (uniqueFrames > info.FrameCount) throw Invalid("Full replay frame count exceeds its index.");
             expectedOffset += page.Length;
+            if (info.Version >= 2)
+            {
+                ValidateEffectHistory(page.EffectHistory, expectedOffset, info.IndexOffset, page.DecodedBytes);
+                expectedOffset += page.EffectHistory!.Length;
+            }
+            else if (page.EffectHistory != null) throw Invalid("Legacy full replay has unexpected effect history metadata.");
+            if (info.Version >= 3)
+            {
+                if (page.SharedThrough < sharedThrough || page.SharedThrough > info.SharedBlocks!.Length)
+                    throw Invalid("Invalid full replay shared snapshot boundary.");
+                while (sharedThrough < page.SharedThrough)
+                {
+                    var block = info.SharedBlocks[sharedThrough++];
+                    ValidateSharedBlock(block, expectedOffset, info.IndexOffset);
+                    if (info.Version == 3 && block.Kind >= 6) throw Invalid("Legacy shared container has unsupported leaf blocks.");
+                    expectedOffset += block.Length;
+                }
+            }
+            else if (page.SharedThrough != 0) throw Invalid("Legacy full replay has shared snapshot references.");
             lastEnd = page.End;
         }
-        if (expectedOffset != info.IndexOffset || uniqueFrames != info.FrameCount || Math.Abs(lastEnd - info.Duration) > .000001)
+        if (expectedOffset != info.IndexOffset || uniqueFrames != info.FrameCount || Math.Abs(lastEnd - info.Duration) > .000001 ||
+            info.Version >= 3 && sharedThrough != info.SharedBlocks!.Length)
             throw Invalid("Full replay index does not cover its entire recording.");
+    }
+
+    private static void ValidateEffectHistory(FullReplayEffectHistory? history, long expectedOffset, long indexOffset, long mainDecodedBytes)
+    {
+        if (history == null || history.Offset != expectedOffset || history.Length < 18 || history.Length > indexOffset - history.Offset ||
+            history.RawBytes < 1 || history.RawBytes > MaximumPageRawBytes || history.DecodedBytes < 1 ||
+            history.DecodedBytes > mainDecodedBytes || history.DecodedBytes > MaximumPageDecodedBytes)
+            throw Invalid("Invalid full replay effect history bounds.");
     }
 
     private static void ValidateHeader(ReplayHeader header)
@@ -208,19 +305,34 @@ public static class FullReplayArchive
     private static int Int32(byte[] bytes, int start) => unchecked((int)UInt32(bytes, start));
     private static long Int64(byte[] bytes, int start) => unchecked((long)((ulong)UInt32(bytes, start) | (ulong)UInt32(bytes, start + 4) << 32));
 
-    private sealed class PageSlice : Stream
+    internal sealed class PageSlice : Stream
     {
         private readonly Stream source;
         private readonly CancellationToken cancellation;
+        private readonly byte[]? footer;
+        private int footerLength;
         public long Remaining { get; private set; }
-        public PageSlice(Stream source, long length, CancellationToken cancellation)
-        { this.source = source; Remaining = length; this.cancellation = cancellation; }
+        public PageSlice(Stream source, long length, CancellationToken cancellation, byte[]? footer = null)
+        {
+            if (footer != null && footer.Length != 8) throw new ArgumentException("Gzip trailer buffer must contain eight bytes.", nameof(footer));
+            this.source = source; Remaining = length; this.cancellation = cancellation; this.footer = footer;
+        }
         public override int Read(byte[] buffer, int offset, int count)
         {
             cancellation.ThrowIfCancellationRequested();
             if (Remaining == 0 || count == 0) return 0;
             int read = source.Read(buffer, offset, (int)Math.Min(count, Remaining));
             if (read == 0) throw Invalid("Truncated full replay page.");
+            if (footer != null)
+            {
+                // A member may arrive in reads shorter than its trailer. Keep
+                // exactly the last eight compressed bytes across every split,
+                // including nonzero caller offsets and reused reader scratch.
+                int take = Math.Min(read, 8), keep = Math.Min(footerLength, 8 - take);
+                if (keep != 0) Buffer.BlockCopy(footer, footerLength - keep, footer, 0, keep);
+                Buffer.BlockCopy(buffer, offset + read - take, footer, keep, take);
+                footerLength = keep + take;
+            }
             Remaining -= read;
             return read;
         }

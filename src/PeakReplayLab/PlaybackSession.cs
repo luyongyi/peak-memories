@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using Photon.Pun;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
 using UnityEngine.SceneManagement;
 
@@ -31,6 +32,7 @@ internal sealed class PlaybackSession : IDisposable
     private readonly int sceneHandle;
     private readonly Action<Exception> reportRestoreError;
     private readonly Action<WorldFrame>? applyWorld;
+    private readonly WorldReplayPlayer? stagedWorld;
     private Camera camera = null!;
     private ReplayView? view;
     private ItemPlayback? items;
@@ -41,14 +43,29 @@ internal sealed class PlaybackSession : IDisposable
     private SpawnedReplayPlayback? spawned;
     private BalloonReplayPlayback? balloons;
     private CreatureReplayPlayback? creatures;
+    private InteractionReplayPlayback? interactions;
     private EnvironmentReplayPlayer? environment;
+    private readonly PresentationWorkBudget workBudget = new();
+    private bool seekPending;
+    public bool PreparingAudio { get; private set; }
+    public bool PreparingWorld { get; private set; }
     private ReplayNameplates? nameplates;
     private double audioScrubMuteUntil;
     private bool AudioPaused => Paused || Buffering || UnityEngine.Time.unscaledTimeAsDouble < audioScrubMuteUntil;
-    private bool historyWarning;
+    private Vector3 constructionPosition;
+    private Quaternion constructionRotation;
+    private long seekStarted;
+    private double lastSeekMilliseconds;
+    private string historyWarning = "";
+    private readonly ReplaySeekDiagnostics seekDiagnostics = new();
+    public ReplaySeekDiagnostics SeekDiagnostics => seekDiagnostics;
+    public ReplayAudioStartDiagnostics.Entry[] SlowAudioStarts => audio?.SlowStartSnapshot ?? Array.Empty<ReplayAudioStartDiagnostics.Entry>();
+    public int SeekSequence { get; private set; }
+    public double LastSeekRequestedAt { get; private set; }
     private ReplayFrame? currentFrame;
     private ReplayFrame? hudRightFrame;
     private float hudMix;
+    private readonly ReplayHudState presentationHud = new();
     public ReplayHudState? FocusHudState { get; private set; }
     public string ObjectWarning { get; private set; } = "";
     public int RecordedJointCount => currentFrame?.Actors.Sum(actor => actor.JointPose.Length) ?? 0;
@@ -62,8 +79,8 @@ internal sealed class PlaybackSession : IDisposable
     public int UiRevision { get; private set; }
     public string PresentationDiagnostic => (view?.Describe() ?? "view-not-ready") +
         $"; schema={timeline.Header.Schema}; items={RecordedItemCount}; renderedItems={VisibleItemCount}; missingItems={MissingItemCount}; crates={RecordedCrateCount}; cachedEvents={timeline.CachedEventCount}; cachedPages={timeline.CachedPageCount}" +
-        $"; actorJoints={RecordedJointCount}; missingActorJoints={MissingJointCount}" +
-        $"; ropes={currentFrame?.Ropes.Length ?? 0}; effects={currentFrame?.Effects.Length ?? 0}; renderedEffects={effects?.VisibleCount ?? 0}; incompleteEffects={effects?.MissingCount ?? 0}; gameSounds={currentFrame?.Audio.Length ?? 0}; spawnedTerrain={currentFrame?.Spawned.Length ?? 0}; balloons={currentFrame?.Balloons.Length ?? 0}; renderedBalloons={balloons?.VisibleCount ?? 0}; missingBalloons={balloons?.MissingCount ?? 0}; creatures={currentFrame?.Creatures.Length ?? 0}; renderedCreatures={creatures?.VisibleCount ?? 0}; missingCreatures={creatures?.MissingCount ?? 0}; environmentKnown={currentFrame?.World.Environment != null}; windSources={currentFrame?.World.Environment?.Winds.Length ?? 0}; lavaSources={currentFrame?.World.Environment?.Lava.Length ?? 0}; {audio?.Diagnostic ?? "no-recorded-audio-track"}";
+        $"; actorJoints={RecordedJointCount}; missingActorJoints={MissingJointCount}; seekPoseMs={lastSeekMilliseconds:F1}; paused={Paused}; buffering={Buffering}; preparingAudio={PreparingAudio}; preparingWorld={PreparingWorld}; cursor={Time:F3}; requested={RequestedTime:F3}; seekSequence={SeekSequence}; {timeline.LoadingDiagnostic}" +
+        $"; ropes={currentFrame?.Ropes.Length ?? 0}; effects={currentFrame?.Effects.Length ?? 0}; renderedEffects={effects?.VisibleCount ?? 0}; incompleteEffects={effects?.MissingCount ?? 0}; laggingEffects={effects?.LaggingCount ?? 0}; gameSounds={currentFrame?.Audio.Length ?? 0}; spawnedTerrain={currentFrame?.Spawned.Length ?? 0}; balloons={currentFrame?.Balloons.Length ?? 0}; renderedBalloons={balloons?.VisibleCount ?? 0}; missingBalloons={balloons?.MissingCount ?? 0}; creatures={currentFrame?.Creatures.Length ?? 0}; renderedCreatures={creatures?.VisibleCount ?? 0}; missingCreatures={creatures?.MissingCount ?? 0}; interactions={currentFrame?.Interactions.Length ?? 0}; renderedInteractions={interactions?.VisibleCount ?? 0}; missingInteractions={interactions?.MissingCount ?? 0}; environmentKnown={currentFrame?.World.Environment != null}; windSources={currentFrame?.World.Environment?.Winds.Length ?? 0}; lavaSources={currentFrame?.World.Environment?.Lava.Length ?? 0}; {audio?.Diagnostic ?? "no-recorded-audio-track"}";
     private bool disposed;
     private float yaw, pitch = 15, distance = 5;
     private static readonly FieldInfo[] InputFlags = typeof(CharacterInput).GetFields(BindingFlags.Public | BindingFlags.Instance)
@@ -74,7 +91,7 @@ internal sealed class PlaybackSession : IDisposable
     public double Duration => timeline.Duration;
     public bool Buffering { get; private set; }
     public double RequestedTime { get; private set; }
-    public string BufferingLabel => Buffering ? $"正在读取 {TimeSpan.FromSeconds(RequestedTime):hh\\:mm\\:ss} 附近的录像，播放时钟已暂停…" : "";
+    public string BufferingLabel => Buffering ? PreparingWorld ? "正在重建目标关卡，播放时钟已暂停…" : PreparingAudio ? "正在准备声音资源，播放时钟已暂停…" : $"正在读取 {TimeSpan.FromSeconds(RequestedTime):hh\\:mm\\:ss} 附近的录像，播放时钟已暂停…" : "";
     public bool Paused { get; set; }
     public float Speed { get; set; } = 1;
     public bool FreeCamera { get; private set; }
@@ -84,15 +101,16 @@ internal sealed class PlaybackSession : IDisposable
     public int VisibleActors { get; private set; }
     public static bool IsSolo => !PhotonNetwork.InRoom || PhotonNetwork.CurrentRoom.PlayerCount <= 1;
 
-    public PlaybackSession(ReplayClip clip, Dictionary<string, VisualActor> actors, Action<Exception> reportRestoreError, Action<WorldFrame>? applyWorld = null, Action<string>? warning = null)
-        : this(new MemoryReplayTimeline(clip), actors, reportRestoreError, applyWorld, warning) { }
+    public PlaybackSession(ReplayClip clip, Dictionary<string, VisualActor> actors, Action<Exception> reportRestoreError, Action<WorldFrame>? applyWorld = null, Action<string>? warning = null, WorldReplayPlayer? stagedWorld = null)
+        : this(new MemoryReplayTimeline(clip), actors, reportRestoreError, applyWorld, warning, stagedWorld) { }
 
-    public PlaybackSession(IReplayTimeline timeline, Dictionary<string, VisualActor> actors, Action<Exception> reportRestoreError, Action<WorldFrame>? applyWorld = null, Action<string>? warning = null)
+    public PlaybackSession(IReplayTimeline timeline, Dictionary<string, VisualActor> actors, Action<Exception> reportRestoreError, Action<WorldFrame>? applyWorld = null, Action<string>? warning = null, WorldReplayPlayer? stagedWorld = null)
     {
         this.timeline = timeline;
         this.actors = actors;
         this.reportRestoreError = reportRestoreError;
         this.applyWorld = applyWorld;
+        this.stagedWorld = stagedWorld;
         if (!ReplayRules.SupportedSchema(timeline.Header.Schema)) throw new InvalidOperationException("此录像格式不受支持，请重新录制。");
         if (!IsSolo) throw new InvalidOperationException("Playback is solo-only. Recording with friends is supported.");
         if (timeline.FrameCount < 2) throw new InvalidOperationException("Record at least two frames first.");
@@ -110,25 +128,28 @@ internal sealed class PlaybackSession : IDisposable
             camera = view.Camera;
             nameplates = new ReplayNameplates(reportRestoreError);
             void Warn(string text) { ObjectWarning = text; warning?.Invoke(text); }
-            environment = new EnvironmentReplayPlayer(Warn);
-            items = new ItemPlayback(Warn, actors);
-            crates = new LuggagePlayback(Warn);
-            spawned = new SpawnedReplayPlayback(Warn);
-            balloons = new BalloonReplayPlayback(actors, Warn);
-            creatures = new CreatureReplayPlayback(Warn);
-            ropes = new RopeReplayPlayback(Warn);
-            effects = new EffectReplayPlayback(Warn);
+            environment = new EnvironmentReplayPlayer(Warn, workBudget);
+            items = new ItemPlayback(Warn, actors, workBudget, ConstructionPriority);
+            crates = new LuggagePlayback(Warn, workBudget);
+            spawned = new SpawnedReplayPlayback(Warn, workBudget, ConstructionPriority);
+            balloons = new BalloonReplayPlayback(actors, Warn, workBudget, ConstructionPriority);
+            creatures = new CreatureReplayPlayback(Warn, workBudget, ConstructionPriority, includeExtended: timeline.Header.Schema >= 15, includeNativeBodies: timeline.Header.Schema >= 21);
+            interactions = new InteractionReplayPlayback(Warn, workBudget);
+            ropes = new RopeReplayPlayback(Warn, workBudget);
+            effects = new EffectReplayPlayback(Warn, workBudget, includeSceneEvents: timeline.Header.Schema >= 22);
             effects.SetTimeline(t =>
             {
-                if (this.timeline.TryHistory(t, out var history)) return history.Left.Effects;
-                if (!historyWarning)
-                {
-                    historyWarning = true;
-                    Warn("长特效的部分历史位于当前读取范围之外；该特效预热将近似呈现，人物和物品时间不受影响。");
-                }
-                return Array.Empty<EffectReplayFrame>();
+                // The birth resolver biases a boundary by a few microseconds;
+                // never turn an already-loaded final frame into pending IO.
+                t = Math.Max(0, Math.Min(this.timeline.Duration, t));
+                if (this.timeline.TryHistory(t, out var history))
+                    return new EffectReplayHistorySample(history.Scene.Left.Effects, history.Scene.Right.Effects, history.Scene.LeftTime, history.Scene.RightTime);
+                this.timeline.RequestHistory(t);
+                if (this.timeline.HistoryWarning.Length != 0 && historyWarning != this.timeline.HistoryWarning)
+                { historyWarning = this.timeline.HistoryWarning; Warn(historyWarning); }
+                return null;
             });
-            audio = new AudioReplayPlayback(Warn);
+            audio = new AudioReplayPlayback(Warn, includeSceneEvents: timeline.Header.Schema >= 22);
             foreach (var c in Capture.Players())
             {
                 foreach (var r in c.GetComponentsInChildren<Renderer>(true)) renderers.Add((r, r.enabled));
@@ -159,6 +180,9 @@ internal sealed class PlaybackSession : IDisposable
 
     public void Tick(float delta)
     {
+        long tickStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        workBudget.BeginFrame(UnityEngine.Time.frameCount);
+        timeline.SetLookAhead(!Paused, Speed);
         using var timing = ReplayPerformance.Measure(ReplayStage.Playback);
         if (!IsSolo) throw new InvalidOperationException("A player joined. Playback stopped and live controls restored.");
         if (SceneManager.GetActiveScene().handle != sceneHandle) throw new InvalidOperationException("Scene changed. Playback stopped.");
@@ -168,26 +192,46 @@ internal sealed class PlaybackSession : IDisposable
         ClearInputs();
         foreach (var saved in renderers) if (saved.Renderer && saved.Renderer.enabled) saved.Renderer.enabled = false;
         view!.Enforce();
-        items?.Enforce();
         crates?.Enforce();
         using (ReplayPerformance.Measure(ReplayStage.PlaybackRopes)) ropes?.Enforce();
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackEffects)) effects?.Enforce();
         using (ReplayPerformance.Measure(ReplayStage.PlaybackAudio)) audio?.Enforce();
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackSpawned)) spawned?.Enforce();
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackBalloons)) balloons?.Enforce();
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackCreatures)) creatures?.Enforce();
         environment?.Enforce();
         audio?.SetClock(AudioPaused, Speed);
-        if (Buffering) ApplyTime(RequestedTime, false);
+        if (seekPending)
+        {
+            seekPending = false;
+            ApplyTime(RequestedTime, true);
+        }
+        else if (Buffering) ApplyTime(RequestedTime, false);
         else if (!Paused)
         {
             ApplyTime(Time + delta * Speed, false);
             if (Time >= Duration) { Paused = true; audio?.SetClock(true, Speed); }
         }
-        ApplyCamera(delta);
+        // Complete only the latest cursor, including while paused. A new seek
+        // must replace pending work before any old cursor is warmed or allocated.
+        using (ReplayPerformance.Measure(ReplayStage.PlaybackCamera)) ApplyCamera(delta);
+        constructionPosition = camera.transform.position;
+        constructionRotation = camera.transform.rotation;
         environment?.UpdateCamera(camera.transform.position);
         environment?.UpdateVisualClock(Time);
+        for (int turn = 0; turn < 9; turn++)
+            switch ((UnityEngine.Time.frameCount + turn) % 9)
+            {
+                case 0: using (ReplayPerformance.Measure(ReplayStage.PlaybackItems)) items?.Enforce(!Buffering); break;
+                case 1: using (ReplayPerformance.Measure(ReplayStage.PlaybackBalloons)) balloons?.Enforce(!Buffering); break;
+                case 2: using (ReplayPerformance.Measure(ReplayStage.PlaybackCreatures)) creatures?.Enforce(!Buffering); break;
+                case 3: using (ReplayPerformance.Measure(ReplayStage.PlaybackSpawned)) spawned?.Enforce(!Buffering); break;
+                case 4: using (ReplayPerformance.Measure(ReplayStage.PlaybackCrates)) crates?.Enforce(!Buffering); break;
+                case 5: using (ReplayPerformance.Measure(ReplayStage.PlaybackRopes)) ropes?.Enforce(!Buffering); break;
+                case 6: using (ReplayPerformance.Measure(ReplayStage.PlaybackEffects)) effects?.Enforce(!Buffering); break;
+                case 7: using (ReplayPerformance.Measure(ReplayStage.PlaybackEnvironment)) environment?.EnforcePresentation(!Buffering); break;
+                case 8: using (ReplayPerformance.Measure(ReplayStage.PlaybackInteractions)) interactions?.Enforce(!Buffering); break;
+            }
         nameplates?.Apply(camera, actors);
+        seekDiagnostics.Observe(UnityEngine.Time.realtimeSinceStartupAsDouble, Time, Buffering, Paused,
+            (System.Diagnostics.Stopwatch.GetTimestamp() - tickStarted) * 1000d / System.Diagnostics.Stopwatch.Frequency,
+            UnityEngine.Time.unscaledDeltaTime * 1000d);
     }
 
     private void ClearInputs()
@@ -204,11 +248,21 @@ internal sealed class PlaybackSession : IDisposable
 
     public void Seek(double time)
     {
+        if (!ReplayRules.Finite(time)) return;
         // GUI dragging can alternate seek and normal ticks. Debounce sound so a
         // moving slider cannot restart the same short explosion every render frame.
         audioScrubMuteUntil = UnityEngine.Time.unscaledTimeAsDouble + .15;
         audio?.SetClock(true, Speed);
-        ApplyTime(time, true);
+        RequestedTime = Math.Max(0, Math.Min(Duration, time));
+        SeekSequence++;
+        LastSeekRequestedAt = UnityEngine.Time.realtimeSinceStartupAsDouble;
+        seekDiagnostics.Request(RequestedTime, Paused, LastSeekRequestedAt);
+        stagedWorld?.Cancel();
+        environment?.InvalidatePresentation();
+        seekStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        historyWarning = "";
+        Buffering = true; seekPending = true;
+        PreparingAudio = false; PreparingWorld = false;
     }
 
     private void ApplyTime(double time, bool explicitSeek)
@@ -217,35 +271,65 @@ internal sealed class PlaybackSession : IDisposable
         double previousTime = Time;
         RequestedTime = Math.Max(0, Math.Min(Duration, time));
         if (explicitSeek) UiRevision++;
-        if (!timeline.TrySample(RequestedTime, out var sample))
+        ReplayTimelineSample sample;
+        bool ready;
+        using (ReplayPerformance.Measure(ReplayStage.PlaybackSample)) ready = timeline.TrySample(RequestedTime, out sample);
+        if (!ready)
         {
             Buffering = true;
+            PreparingAudio = false; PreparingWorld = false;
             audio?.SetClock(true, Speed);
             return;
         }
         bool wasBuffering = Buffering;
+        if ((explicitSeek || wasBuffering) && audio != null &&
+            !audio.PrepareSeek(sample.Scene.Left.Audio, sample.Scene.Right.Audio, RequestedTime,
+                sample.Scene.LeftTime, sample.Scene.RightTime, SeekSequence))
+        {
+            Buffering = true; PreparingAudio = true; PreparingWorld = false;
+            audio.SetClock(true, Speed);
+            return;
+        }
+        PreparingAudio = false;
+        if ((explicitSeek || wasBuffering) && stagedWorld != null)
+        {
+            var targetWorld = sample.Scene.Left.World;
+            if (stagedWorld.NeedsSceneShield(targetWorld)) view!.CoverWorldPreparation(true);
+            bool worldReady;
+            using (ReplayPerformance.Measure(ReplayStage.PlaybackWorldPrepare))
+                worldReady = stagedWorld.Prepare(targetWorld, SeekSequence, UnityEngine.Time.frameCount);
+            if (!worldReady)
+            {
+                Buffering = true; PreparingWorld = true;
+                audio?.SetClock(true, Speed);
+                return;
+            }
+        }
+        PreparingWorld = false;
         Buffering = false;
         Time = RequestedTime;
         if (currentFrame != null && Time == previousTime && !wasBuffering) return;
         bool discontinuity = currentFrame == null || explicitSeek || wasBuffering || Time < previousTime || Time - previousTime > .25;
         var left = sample.Left; var right = sample.Right; float mix = sample.Mix;
+        var sceneLeft = sample.Scene.Left; var sceneRight = sample.Scene.Right; float sceneMix = sample.Scene.Mix;
         currentFrame = left;
         hudRightFrame = right; hudMix = mix;
-        applyWorld?.Invoke(left.World);
+        using (ReplayPerformance.Measure(ReplayStage.PlaybackWorld))
+        {
+            stagedWorld?.Apply(sceneLeft.World);
+            applyWorld?.Invoke(sceneLeft.World);
+        }
         using (ReplayPerformance.Measure(ReplayStage.PlaybackEnvironment))
             environment?.Apply(sample.Environment.Left, sample.Environment.Right, sample.Environment.Mix, Time, camera.transform.position);
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackCreatures)) creatures?.Apply(left.Creatures, right.Creatures, mix, Time, discontinuity);
-        crates?.Apply(left.Crates, right.Crates, mix, Time);
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackRopes)) ropes?.Apply(left.Ropes, right.Ropes, mix, Time, discontinuity);
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackEffects)) effects?.Apply(left.Effects, right.Effects, mix, Time, discontinuity);
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackSpawned)) spawned?.Apply(left.Spawned, right.Spawned, mix, Time, discontinuity);
         using (ReplayPerformance.Measure(ReplayStage.PlaybackAudio))
         {
             audio?.SetClock(AudioPaused, Speed);
-            audio?.Apply(left.Audio, right.Audio, mix, Time, discontinuity);
+            audio?.Apply(sceneLeft.Audio, sceneRight.Audio, sceneMix, Time, discontinuity, sample.Scene.LeftTime, sample.Scene.RightTime);
         }
         // Recorded local joints drive this visual hierarchy. Hide only actors
         // absent at the current recorded timestamp.
+        using (ReplayPerformance.Measure(ReplayStage.PlaybackActors))
+        {
         presentActors.Clear();
         foreach (var state in left.Actors) presentActors.Add(state.Id);
         foreach (var pair in actors) if (!presentActors.Contains(pair.Key)) pair.Value.Hide();
@@ -258,12 +342,63 @@ internal sealed class PlaybackSession : IDisposable
             actor.Pose(state, joints);
             if (actor.Visible) VisibleActors++;
         }
+        }
+        // Rank construction using the destination camera, before allocating
+        // objects at that cursor. Mouse input is still consumed once in Tick.
+        constructionRotation = Quaternion.Euler(pitch, yaw, 0);
+        constructionPosition = camera.transform.position;
+        if (!FreeCamera && actors.TryGetValue(FocusId, out var focused) && focused.Visible)
+            constructionPosition = focused.Position + Vector3.up * .65f + constructionRotation * Vector3.back * distance;
+        environment?.UpdateCamera(constructionPosition);
+        if (discontinuity)
+        {
+            double historyStart = Time;
+            foreach (var effect in sceneLeft.Effects)
+                if (effect.Kind == 0)
+                {
+                    double phase = EffectReplayRules.PhaseAt(effect, Time);
+                    double startPhase = Math.Max(0, phase - 12 * Math.Max(effect.Rate, 1));
+                    historyStart = Math.Min(historyStart, Math.Max(0, EffectReplayRules.TimeAtPhase(effect, startPhase)));
+                }
+            if (historyStart < Time) timeline.RequestHistory(historyStart);
+        }
         // Slot attachments must follow the current actor pose, not last frame's
         // backpack transform or the original physics-driven item's world position.
-        items?.Apply(left.Items, right.Items, mix);
-        using (ReplayPerformance.Measure(ReplayStage.PlaybackBalloons)) balloons?.Apply(left.Balloons, right.Balloons, mix, Time, discontinuity);
+        // All tracks that build or simulate share the same rotating admission
+        // order here and in Tick, so later completion work cannot be starved by
+        // the earlier Apply calls. Pose and world state above remain immediate.
+        for (int turn = 0; turn < 9; turn++)
+            switch ((UnityEngine.Time.frameCount + turn) % 9)
+            {
+                case 0: using (ReplayPerformance.Measure(ReplayStage.PlaybackItems)) items?.Apply(sceneLeft.Items, sceneRight.Items, sceneMix, discontinuity, Time, sample.Joints?.Items); break;
+                case 1: using (ReplayPerformance.Measure(ReplayStage.PlaybackBalloons)) balloons?.Apply(sceneLeft.Balloons, sceneRight.Balloons, sceneMix, Time, discontinuity); break;
+                case 2: using (ReplayPerformance.Measure(ReplayStage.PlaybackCreatures)) creatures?.Apply(sceneLeft.Creatures, sceneRight.Creatures, sceneMix, Time, discontinuity, sample.Joints?.Creatures); break;
+                case 3: using (ReplayPerformance.Measure(ReplayStage.PlaybackSpawned)) spawned?.Apply(sceneLeft.Spawned, sceneRight.Spawned, sceneMix, Time, discontinuity); break;
+                case 4: using (ReplayPerformance.Measure(ReplayStage.PlaybackCrates)) crates?.Apply(sceneLeft.Crates, sceneRight.Crates, sceneMix, Time, discontinuity); break;
+                case 5: using (ReplayPerformance.Measure(ReplayStage.PlaybackRopes)) ropes?.Apply(sceneLeft.Ropes, sceneRight.Ropes, sceneMix, Time, discontinuity, sample.Joints?.Ropes); break;
+                case 6: using (ReplayPerformance.Measure(ReplayStage.PlaybackEffects)) effects?.Apply(sceneLeft.Effects, sceneRight.Effects, sceneMix, Time, discontinuity, sample.Scene.LeftTime, sample.Scene.RightTime); break;
+                case 7: using (ReplayPerformance.Measure(ReplayStage.PlaybackEnvironment)) environment?.EnforcePresentation(); break;
+                case 8: using (ReplayPerformance.Measure(ReplayStage.PlaybackInteractions)) interactions?.Apply(sceneLeft.Interactions, sceneRight.Interactions, sceneMix, Time, discontinuity); break;
+            }
         RefreshHeldItem();
         RefreshFocusedHud();
+        view?.CoverWorldPreparation(false);
+        if (seekStarted != 0)
+        {
+            lastSeekMilliseconds = (System.Diagnostics.Stopwatch.GetTimestamp() - seekStarted) * 1000d / System.Diagnostics.Stopwatch.Frequency;
+            seekStarted = 0;
+        }
+    }
+
+    private float ConstructionPriority(Vector3 position)
+    {
+        Vector3 offset = position - constructionPosition;
+        float squared = offset.sqrMagnitude;
+        if (squared < 4) return squared;
+        // A conservative cone includes objects close to the screen edges.
+        // Offscreen objects remain queued; camera motion reprioritizes them.
+        float facing = Vector3.Dot(constructionRotation * Vector3.forward, offset.normalized);
+        return squared + (facing < .25f ? 1000000 : 0);
     }
 
     public IReadOnlyList<ItemEvent> RecentEvents()
@@ -287,7 +422,7 @@ internal sealed class PlaybackSession : IDisposable
         if (hudRightFrame != null)
             foreach (var actor in hudRightFrame.Actors)
                 if (actor.Id == FocusId) { right = actor.HudState; break; }
-        FocusHudState = ReplayHudState.Interpolate(FocusState?.HudState, right, hudMix);
+        FocusHudState = ReplayHudState.InterpolateForPresentation(FocusState?.HudState, right, hudMix, presentationHud);
     }
 
     private void RefreshHeldItem()
@@ -333,7 +468,16 @@ internal sealed class PlaybackSession : IDisposable
         }
         else if (actors.TryGetValue(FocusId, out var focused) && focused.Visible)
         {
-            if (mouse != null && looking) distance = Mathf.Clamp(distance - mouse.scroll.ReadValue().y * .015f, 1, 35);
+            if (mouse != null && Application.isFocused)
+            {
+                float scroll = mouse.scroll.ReadValue().y;
+                // Wheel zoom works without capturing the cursor. Let scrollable
+                // replay controls consume their own wheel input instead.
+                if (scroll != 0 && (looking ||
+                    new Rect(0, 0, Screen.width, Screen.height).Contains(mouse.position.ReadValue()) &&
+                    (!EventSystem.current || !EventSystem.current.IsPointerOverGameObject())))
+                    distance = Mathf.Clamp(distance - scroll * .015f, 1, 35);
+            }
             Vector3 target = focused.Position + Vector3.up * .65f;
             Vector3 offset = rotation * Vector3.back;
             float actualDistance = distance;
@@ -375,6 +519,7 @@ internal sealed class PlaybackSession : IDisposable
         Restore(() => spawned?.Dispose());
         Restore(() => balloons?.Dispose());
         Restore(() => creatures?.Dispose());
+        Restore(() => interactions?.Dispose());
         Restore(() => environment?.Dispose());
         Restore(() => nameplates?.Dispose());
         Restore(() => view?.Dispose());

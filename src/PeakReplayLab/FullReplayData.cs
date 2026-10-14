@@ -16,6 +16,31 @@ public sealed class FullReplayPage
     public int FrameCount { get; set; }
     public long FirstFrameIndex { get; set; }
     public bool Overlap { get; set; }
+    [Newtonsoft.Json.JsonProperty(NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public FullReplayEffectHistory? EffectHistory { get; set; }
+    // Versions 3/4 may reference any immutable snapshot below this exclusive
+    // boundary. Its new blocks follow this page's particle-history member.
+    [Newtonsoft.Json.JsonProperty(DefaultValueHandling = Newtonsoft.Json.DefaultValueHandling.Ignore)]
+    public int SharedThrough { get; set; }
+}
+
+public sealed class FullReplaySharedBlock
+{
+    public int Kind { get; set; }
+    public long Offset { get; set; }
+    public long Length { get; set; }
+    public int RawBytes { get; set; }
+    public string Hash { get; set; } = "";
+}
+
+// Version 2 stores a separate tiny stream for particle pre-roll. It carries
+// the same real frame times and effects, without actor/object pose payloads.
+public sealed class FullReplayEffectHistory
+{
+    public long Offset { get; set; }
+    public long Length { get; set; }
+    public long RawBytes { get; set; }
+    public long DecodedBytes { get; set; }
 }
 
 public class FullReplayIndex
@@ -31,6 +56,8 @@ public class FullReplayIndex
     public string? FaultCode { get; set; }
     public string? Fault { get; set; }
     public FullReplayPage[] Pages { get; set; } = Array.Empty<FullReplayPage>();
+    [Newtonsoft.Json.JsonProperty(NullValueHandling = Newtonsoft.Json.NullValueHandling.Ignore)]
+    public FullReplaySharedBlock[]? SharedBlocks { get; set; }
     public long GapOver100ms { get; set; }
     public long GapOver500ms { get; set; }
     public double LargestGapSeconds { get; set; }

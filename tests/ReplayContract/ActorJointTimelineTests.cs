@@ -40,12 +40,48 @@ internal static class ActorJointTimelineTests
             Check(!new ActorJointTimeline(frames, false).TryActor("actor", .025, out _));
             Check(new ActorJointTimeline(frames, true).TryActor("actor", .025, out var actor)); Close(Value(actor.At(1)), 1);
         });
+        test("joint readiness uses the oldest node observation even when the other nodes have future keys", () =>
+        {
+            var initial = Enumerable.Range(0, 256).Select(i => Node("./node" + i.ToString("D3"), 0, i)).ToArray();
+            var future = initial.Select((node, i) => Node(node.Path, i == 127 ? .05 : .1, i + 10)).ToArray();
+            var frames = new[]
+            {
+                new ReplayFrame { T = 0, Actors = new[] { new ActorFrame { Id = "actor", JointPose = initial } } },
+                new ReplayFrame { T = .04, Actors = new[] { new ActorFrame { Id = "actor", JointPose = initial } } },
+                new ReplayFrame { T = .1, Actors = new[] { new ActorFrame { Id = "actor", JointPose = future } } },
+                new ReplayFrame { T = .12, Actors = new[] { new ActorFrame { Id = "actor", JointPose = future } } }
+            };
+            var timeline = new ActorJointTimeline(frames, false);
+            Check(timeline.TryActor("actor", .025, out var actor));
+            Close(actor.At(127).Mix, .5); Close(actor.At(126).Mix, .25);
+            Check(timeline.TryActor("actor", .05, out _));
+            Check(!timeline.TryActor("actor", .075, out _));
+            Check(!timeline.CanSample(frames[0].Actors, .075));
+            Check(new ActorJointTimeline(frames, true).TryActor("actor", .075, out _));
+        });
         test("page opening baseline can predate frame time without shifting its held sample clock", () =>
         {
             var held = Node("./cloth#0", .95, 0);
             var timeline = new ActorJointTimeline(new[] { Frame(1, held), Frame(1.01, held), Frame(1.05, Node("./cloth#0", 1.05, 10)) }, true);
             Check(timeline.TryActor("actor", 1, out var actor)); Close(Value(actor.At(1)), 5);
             Close(actor.At(1).LeftTime, .95); Close(actor.At(1).RightTime, 1.05);
+        });
+        test("predecessor readiness retains every stale node until its first real in-page observation", () =>
+        {
+            var frames = new[]
+            {
+                new ReplayFrame { T = 1, Actors = new[] { new ActorFrame { Id = "actor", JointPose = new[] { Node("./a#0", .9, 0), Node("./b#0", .95, 0) } } } },
+                new ReplayFrame { T = 1.05, Actors = new[] { new ActorFrame { Id = "actor", JointPose = new[] { Node("./a#0", .97, 1), Node("./b#0", .95, 0) } } } },
+                new ReplayFrame { T = 1.1, Actors = new[] { new ActorFrame { Id = "actor", JointPose = new[] { Node("./a#0", 1.1, 2), Node("./b#0", .99, 1) } } } },
+                new ReplayFrame { T = 1.2, Actors = new[] { new ActorFrame { Id = "actor", JointPose = new[] { Node("./a#0", 1.2, 3), Node("./b#0", 1.2, 2) } } } },
+            };
+            var timeline = new ActorJointTimeline(frames, true);
+            Check(timeline.RequiresPredecessor(frames[0].Actors, 1));
+            Check(timeline.RequiresPredecessor(frames[0].Actors, 1.1));
+            Check(timeline.RequiresPredecessor(frames[0].Actors, 1.199999));
+            Check(!timeline.RequiresPredecessor(frames[0].Actors, 1.2));
+            var onlyStale = new ActorJointTimeline(new[] { Frame(1, Node("./cloth#0", .95, 1)), Frame(1.1, Node("./cloth#0", .95, 1)) }, true);
+            Check(onlyStale.RequiresPredecessor(frames[0].Actors, 100), "A recording endpoint erased the opening cut witness requirement.");
         });
         test("duplicate overlapping page frames do not change joint interpolation", () =>
         {
@@ -131,6 +167,44 @@ internal static class ActorJointTimelineTests
             Check(sample.Joints!.TryActor("actor", sample.Time, out var actor)); Close(Value(actor.At(1)), 9.5);
             sample = Ready(timeline, .15); Check(sample.Joints!.TryActor("actor", sample.Time, out actor)); Close(Value(actor.At(1)), 15);
             sample = Ready(timeline, .095); Check(sample.Joints!.TryActor("actor", sample.Time, out actor)); Close(Value(actor.At(1)), 9.5);
+        });
+        test("a stale opening joint baseline waits only for its predecessor cut witness and reuses that index", () =>
+        {
+            using var initialStarted = new ManualResetEventSlim(); using var predecessorStarted = new ManualResetEventSlim();
+            using var releasePredecessor = new ManualResetEventSlim(); int zeroReads = 0;
+            var calls = new List<int>(); var gate = new object();
+            ReplayClip Load(int index, CancellationToken token)
+            {
+                if (index == 0)
+                {
+                    if (Interlocked.Increment(ref zeroReads) == 1)
+                    { initialStarted.Set(); token.WaitHandle.WaitOne(); token.ThrowIfCancellationRequested(); }
+                    else { predecessorStarted.Set(); releasePredecessor.Wait(token); }
+                }
+                lock (gate) calls.Add(index);
+                var clip = new ReplayClip { Complete = true };
+                for (int i = 0; i < 10; i++)
+                {
+                    double time = index + i / 10d;
+                    double stamp = index == 1 && i < 2 ? .9 : time;
+                    var frame = Frame(time, Node("./cloth#0", stamp, index == 1 && i < 2 ? 100 : (float)(time * 100)));
+                    frame.Actors[0].Position[0] = index == 0 ? 0 : 100;
+                    clip.Frames.Add(frame);
+                }
+                return clip;
+            }
+            using var timeline = new PagedReplayTimeline(new ReplayHeader(), 2.9, 30, new[] { "actor" },
+                new[] { new ReplayPageRange(0, .9), new ReplayPageRange(1, 1.9), new ReplayPageRange(2, 2.9) }, Load,
+                decodedPageBytes: Enumerable.Repeat(1024L * 1024, 3).ToArray());
+            Check(initialStarted.Wait(3000)); var watch = Stopwatch.StartNew();
+            while (!predecessorStarted.IsSet && watch.ElapsedMilliseconds < 3000)
+            { Check(!timeline.TrySample(1.05, out _)); Thread.Sleep(1); }
+            Check(predecessorStarted.IsSet && !timeline.TrySample(1.05, out _)); releasePredecessor.Set();
+            var sample = Ready(timeline, 1.05); Check(sample.Joints!.TryActor("actor", sample.Time, out var actor)); Close(Value(actor.At(1)), 105);
+            Check(calls.SequenceEqual(new[] { 1, 0 }), "A cut witness decoded unrelated historical pages.");
+            int builds = timeline.JointIndexBuildCount;
+            for (int i = 0; i < 6; i++) { Ready(timeline, .5); Ready(timeline, 1.05); }
+            Check(timeline.JointIndexBuildCount == builds && timeline.CachedJointWindowCount == 1);
         });
         test("single-frame twenty-millisecond pages look ahead until the real ten-Hz cloth sample", () =>
         {

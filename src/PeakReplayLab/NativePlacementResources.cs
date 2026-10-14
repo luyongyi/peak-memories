@@ -49,32 +49,71 @@ internal static class NativePlacementResources
         foreach (var source in Object.FindObjectsByType<Peak.AntiSphere>(FindObjectsInactive.Include, FindObjectsSortMode.None)) if (source) yield return source.gameObject;
     }
     private static readonly AccessTools.FieldRef<ShittyPiton, bool> pitonBreaking = AccessTools.FieldRefAccess<ShittyPiton, bool>("isBreaking");
+    private static readonly AccessTools.FieldRef<ShittyPiton, bool> pitonDisabled = AccessTools.FieldRefAccess<ShittyPiton, bool>("disabled");
+    private static readonly AccessTools.FieldRef<ShittyPiton, bool> pitonHung = AccessTools.FieldRefAccess<ShittyPiton, bool>("isHung");
+    private static readonly AccessTools.FieldRef<ShittyPiton, float> pitonCrackScale = AccessTools.FieldRefAccess<ShittyPiton, float>("crackScale");
+    private static readonly AccessTools.FieldRef<MagicBeanVine, bool> vineGrowing = AccessTools.FieldRefAccess<MagicBeanVine, bool>("_isGrowing");
+    private static readonly AccessTools.FieldRef<Peak.AntiSphere, bool> sphereDying = AccessTools.FieldRefAccess<Peak.AntiSphere, bool>("_dying");
     private sealed class AnimationComponents
     {
         public MagicBeanVine? Vine;
         public ShittyPiton? Piton;
+        public Transform? PitonCrack;
+        public readonly NativePitonCrackActivity PitonActivity = new();
         public Campfire? Stove;
         public CheckpointFlag? Flag;
-        public bool AntiSphere;
+        public Peak.AntiSphere? AntiSphere;
+        public Peak.GrowOverTime[] Growth;
+        public NativeCaptureAnimationActivity? FlagAnimation;
+        public double NextActivity;
+        public double LastActivity = double.NegativeInfinity;
+        public bool Animating;
         public AnimationComponents(GameObject source)
         {
             Vine = source.GetComponent<MagicBeanVine>(); Piton = source.GetComponent<ShittyPiton>();
+            if (Piton && Piton!.crack) PitonCrack = Piton.crack.transform;
             Stove = source.GetComponent<Campfire>(); Flag = source.GetComponent<CheckpointFlag>();
             AntiSphere = source.GetComponent<Peak.AntiSphere>();
+            Growth = source.GetComponentsInChildren<Peak.GrowOverTime>(true);
+            if (Flag && Flag!.anim) FlagAnimation = new NativeCaptureAnimationActivity(new[] { Flag.anim });
         }
     }
     private static readonly ConditionalWeakTable<GameObject, AnimationComponents> animations = new();
     internal static void InvalidateCapture(GameObject source) { if (source) animations.Remove(source); }
-    internal static bool IsAnimating(GameObject source)
+    internal static bool IsAnimating(GameObject source, double now, bool force = false, bool followSceneClock = false)
     {
         if (!source || !source.activeInHierarchy) return false;
         var components = animations.GetValue(source, value => new AnimationComponents(value));
-        if (components.Vine) return components.Vine!.vineOriginTransform && components.Vine.vineOriginTransform.localScale.y < components.Vine.maxLength;
-        if (components.Piton) return pitonBreaking(components.Piton!);
-        if (components.Stove) return components.Stove!.Lit;
-        if (components.Flag) return components.Flag!.anim && components.Flag.anim.enabled;
-        if (components.AntiSphere) return true; // Native growth/lifetime shrink, at most 12 seconds.
-        return false;
+        // Scene callers have already passed the shared 30 Hz clock. Retain
+        // same-tick deduplication and the standalone caller's local deadline.
+        if (!force && (followSceneClock ? now <= components.LastActivity + 1e-8 : now < components.NextActivity)) return components.Animating;
+        components.LastActivity = now;
+        components.NextActivity = now + 1d / 30;
+        components.Animating = components.Vine ? vineGrowing(components.Vine!) :
+            components.Piton ? PitonIsAnimating(components) :
+            components.FlagAnimation != null ? components.FlagAnimation.Read(now, force, followSceneClock) :
+            components.AntiSphere && sphereDying(components.AntiSphere!);
+        foreach (var growth in components.Growth)
+            if (growth && growth.isActiveAndEnabled) { components.Animating = true; break; }
+        // A lit stove is a light/emission lifecycle, not moving geometry.
+        return components.Animating;
+    }
+    private static bool PitonIsAnimating(AnimationComponents components)
+    {
+        var piton = components.Piton!;
+        bool breaking = pitonBreaking(piton), disabled = pitonDisabled(piton);
+        if (!breaking || disabled) return components.PitonActivity.Observe(breaking, disabled, false, 0, 0, 0, 0);
+        bool hung = pitonHung(piton);
+        float target = pitonCrackScale(piton);
+        // Once the native Lerp has stopped, only managed target/hang changes can
+        // restart it. A settled released piton no longer reads its Transform.
+        if (!components.PitonActivity.NeedsScale(target)) return hung;
+        var crack = components.PitonCrack;
+        if (!crack) return hung;
+        // Only the known crack Transform is read, at the enclosing 30 Hz clock;
+        // no hierarchy scan, reflection, or full geometry read is needed.
+        var scale = crack!.localScale;
+        return components.PitonActivity.Observe(true, false, hung, target, scale.x, scale.y, scale.z);
     }
 }
 
@@ -100,6 +139,7 @@ internal sealed class NativePlacementObserver : IDisposable
             {
                 Patch(typeof(ClimbHandle), "Start", nameof(Born));
                 Patch(typeof(Campfire), "Awake", nameof(Born));
+                Patch(typeof(Campfire), "UpdateLit", nameof(Changed));
                 Patch(typeof(Campfire), "OnDestroy", nameof(Destroyed), true);
                 Patch(typeof(AddScreenshake), "Start", nameof(Born));
                 Patch(typeof(Peak.GrowOverTime), "Awake", nameof(Born));

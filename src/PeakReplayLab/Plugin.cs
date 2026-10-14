@@ -10,13 +10,14 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.3")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.27")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {
     private sealed class Entry { public string Path = ""; public ReplayHeader? Header; public string Error = ""; }
     private ConfigEntry<int> sampleHz = null!;
     private ConfigEntry<int> budgetMiB = null!;
+    private ConfigEntry<float> itemCaptureDistance = null!;
     private ConfigEntry<Key> saveKey = null!;
     private ConfigEntry<bool> performanceMetrics = null!;
     private RollingCapture? capture;
@@ -48,10 +49,11 @@ public sealed partial class Plugin : BaseUnityPlugin
     private void Awake()
     {
         notice = new ReplayNotice();
-        sampleHz = Config.Bind("Recording", "SampleHz", 60, new ConfigDescription("Target capture Hz; limited by rendered FPS. One capture feeds the rolling highlight window and optional continuous recording.", new AcceptableValueRange<int>(5, 60)));
+        sampleHz = Config.Bind("Recording", "SampleHz", 60, new ConfigDescription("Local player model capture Hz, limited by rendered FPS. Non-player periodic tracks are capped at 30 Hz; teammate bones follow the native network serialization cadence. One capture feeds highlights and optional continuous recording.", new AcceptableValueRange<int>(5, 60)));
         budgetMiB = Config.Bind("Recording", "BufferBudgetMiB", 256, new ConfigDescription("Conservative rolling sample budget, not preallocated. Oldest frames are evicted when full; F9 shows actual duration.", new AcceptableValueRange<int>(32, 1024)));
+        itemCaptureDistance = Config.Bind("Recording", "ItemCaptureDistance", 40f, new ConfigDescription("Ordinary item capture radius in metres from the nearest recorded player. Record moving items until at least one second of confirmed rest outside the radius, then retain their final snapshots. Known fixed static items sleep until an event; unclassified or sleeping physics bodies keep bounded fallback probes. Creatures, animated items and active lights stay captured. Re-entering the radius refreshes state. 0 disables distance-based sleep.", new AcceptableValueRange<float>(0f, 1000f)));
         saveKey = Config.Bind("Controls", "SaveHighlightKey", Key.F6, "Save the previous 120 seconds without stopping capture.");
-        performanceMetrics = Config.Bind("Diagnostics", "PerformanceMetrics", true, "Bounded CPU timings and rendered-frame cadence; F9 or recording stop saves a diagnostic JSON under PeakReplayLab/Performance. Frame cadence excludes warmup and sealing; CPU timings include initial capture; no GPU attribution.");
+        performanceMetrics = Config.Bind("Diagnostics", "PerformanceMetrics", true, "Bounded CPU timings and rendered-frame cadence; seeks, replay close, F9 and recording stop save diagnostic JSON under PeakReplayLab/Performance. Frame cadence excludes warmup and sealing; CPU timings include initial capture; no GPU attribution.");
         ReplayPerformance.Enabled = performanceMetrics.Value;
         performanceMetrics.SettingChanged += (_, _) => ReplayPerformance.Enabled = performanceMetrics.Value;
         saveKeyLabel = saveKey.Value.ToString();
@@ -61,11 +63,13 @@ public sealed partial class Plugin : BaseUnityPlugin
         InitializeAutomation();
         try
         {
+            InitializeCaptureOrigins();
             InitializeLibraryManagement();
             safety = new ReplaySafety();
             itemEvents = new ItemEventCapture(message => Logger.LogWarning(message));
             if (itemEvents.HookFailures > 0) Logger.LogWarning($"Item event observers: {itemEvents.HookFailures} hooks unavailable; object snapshots remain enabled.");
             theatre = new ReplayTheatre(Note, e => { RecordAutomationError(e); Logger.LogError(e); }, message => Logger.LogInfo(message));
+            InitializeCaptureBootstrap();
             menu = new MemoriesMenu(OpenLibrary);
             nativeLibrary = new NativeMemoriesLibrary(CloseLibrary,
                 () => { if (fullRunLibrary) RefreshFullRuns(); else RefreshLibrary(); },
@@ -82,7 +86,7 @@ public sealed partial class Plugin : BaseUnityPlugin
         }
         catch (Exception e) { disabledByError = true; Logger.LogError(e); Note("回放保护未能安装，已停用新回放功能；原足迹 Mod 不受影响。"); }
         SceneManager.activeSceneChanged += SceneChanged;
-        Logger.LogInfo($"PEAK Memories 0.8.2: native replay HUD / {sampleHz.Value} Hz / mode={activeRecordingMode}. " + DirectoryPath);
+        Logger.LogInfo($"PEAK Memories 0.8.27: native replay HUD / player {sampleHz.Value} Hz / scene <=30 Hz / source-bound segments / shared native event resources / mode={activeRecordingMode}. " + DirectoryPath);
     }
 
     private void Update()
@@ -189,7 +193,12 @@ public sealed partial class Plugin : BaseUnityPlugin
         if (replayHud != null) Logger.LogInfo("Replay HUD: " + replayHud.Diagnostic);
     }
 
-    private void CloseTheatre() { DisposePlaybackUi(); theatre?.Close(); }
+    private void CloseTheatre()
+    {
+        try { if (theatre?.Playback != null) SavePerformanceReport("replay-close"); }
+        catch (Exception e) { Logger.LogWarning("Replay close diagnostic failed: " + e); }
+        DisposePlaybackUi(); theatre?.Close();
+    }
 
     private void DisposePlaybackUi()
     {
@@ -246,17 +255,24 @@ public sealed partial class Plugin : BaseUnityPlugin
             (itemEvents?.HookFailures > 0 ? $" · 事件入口缺失 {itemEvents.HookFailures}" : "") +
             (capture.Buffer.MemoryLimited ? "\n预算曾触顶，最旧数据已淘汰" : "") + "\n" + cachedPerformance + " · F9 隐藏" : cachedPerformance;
             string fullRunStats = FullRunStatus();
-            if (!string.IsNullOrWhiteSpace(fullRunStats)) cachedStats += "\n" + fullRunStats;
+            if (fullRunFailure.Length == 0 && !string.IsNullOrWhiteSpace(fullRunStats)) cachedStats += "\n" + fullRunStats;
         }
         try { notice?.Tick(library || nativeLibrary?.IsVisible == true,
             theatre?.Playback != null, showStats ? cachedStats : null,
-            theatre?.Loading == true ? theatre.Label : null); }
+            theatre?.Loading == true ? theatre.Label : null, fullRunFailure); }
         catch (Exception e) { Logger.LogError(e); }
     }
 
     private void LateUpdate()
     {
-        ObserveGameFrame();
+        ReplayPerformance.SetFrameContext(Time.frameCount, Time.realtimeSinceStartupAsDouble);
+        // Diagnostic failure must never prevent the playback clock or cleanup.
+        try { ObserveGameFrame(); }
+        catch (Exception e)
+        {
+            if (!performanceObservationWarned) Logger.LogWarning("Replay frame diagnostic failed: " + e);
+            performanceObservationWarned = true;
+        }
         if (disabledByError) return;
         theatre!.Tick(Mathf.Min(Time.unscaledDeltaTime, .1f));
         UpdatePlaybackUi();
@@ -265,15 +281,18 @@ public sealed partial class Plugin : BaseUnityPlugin
         if (automationEnding) { ItemEventCapture.Activate(false); return; }
         if (theatre.Busy || ReplaySafety.Active) { ItemEventCapture.Activate(false); return; }
         if (Time.realtimeSinceStartupAsDouble < nextCaptureRetry) return;
-        if (!GameHandler.IsOnIslandAndInitialized || !Character.localCharacter || Character.localCharacter.inAirport)
-        { ItemEventCapture.Activate(false); return; }
+        ProgressCaptureBootstrap();
+        if (BootstrapSceneFailed) return;
+        if (!CaptureBootstrapGate.AllowLiveCapture(GameHandler.IsOnIslandAndInitialized, Character.localCharacter,
+            Character.localCharacter && Character.localCharacter.inAirport, capture?.HasRecordableActors == true))
+        { if (capture == null || captureScene != SceneManager.GetActiveScene().handle) ItemEventCapture.Activate(false); return; }
         try
         {
             int scene = SceneManager.GetActiveScene().handle;
             if (capture == null || captureScene != scene)
             {
                 capture?.Dispose();
-                capture = new RollingCapture(sampleHz.Value, budgetMiB.Value * 1024L * 1024, message => Logger.LogWarning(message));
+                capture = new RollingCapture(sampleHz.Value, budgetMiB.Value * 1024L * 1024, message => Logger.LogWarning(message), () => itemCaptureDistance.Value);
                 captureScene = scene;
                 ReplayPerformance.Reset();
                 // The native loading/title hint teaches the shortcut. Do not flash a
@@ -281,9 +300,11 @@ public sealed partial class Plugin : BaseUnityPlugin
                 status = $"已启用 {sampleHz.Value} Hz · {ModeHelp}";
                 Logger.LogInfo(status);
             }
-            StartAutomaticFullRun();
             ItemEventCapture.Activate(true);
-            capture.Tick(fullRun != null ? fullRunSink : null);
+            // Automatic full recording starts inside this cached callback only
+            // after Tick has validated and added its first complete live frame.
+            RefreshAutomaticFileCheckpoint();
+            capture.Tick(fullRunSink);
         }
         catch (Exception e)
         {
@@ -373,6 +394,8 @@ public sealed partial class Plugin : BaseUnityPlugin
         CancelRouteUpload();
         StopFullRun("scene-change:" + before.name + "->" + after.name);
         frameCadence.Reset();
+        nativeSpawnOrigins?.ClearScene(before.handle);
+        ResetCaptureBootstrap();
         stoppedFullRunScene = int.MinValue; nextFullRunStatus = 0;
         nativeLibrary?.Hide(); menu?.Dispose(); capture?.Dispose(); captureScene = int.MinValue; ItemEventCapture.Activate(false); Capture.ClearCatalog(); library = false;
         WorldTrack.Reset();
@@ -386,13 +409,16 @@ public sealed partial class Plugin : BaseUnityPlugin
     private void Note(string message) => Note(message, true);
     private void Note(string message, bool notify)
     {
-        status = message; if (notify) notice?.Show(message); Logger.LogInfo(message);
+        status = fullRunFailure.Length != 0 ? fullRunFailure : message;
+        if (notify) notice?.Show(message); Logger.LogInfo(message);
     }
     private void OnApplicationQuit() { quitting = true; StopFullRun("application-quit"); WaitForFullRunShutdown(); }
-    private void OnDisable() { CancelRouteUpload(); DisposePlaybackUi(); StopFullRun("plugin-disabled"); RestoreAutomationOverride(); ItemEventCapture.Activate(false); capture?.Dispose(); captureScene = int.MinValue; if (!quitting) theatre?.Dispose(); nativeLibrary?.Dispose(); menu?.Dispose(); notice?.Dispose(); }
+    private void OnDisable() { CancelRouteUpload(); DisposePlaybackUi(); StopFullRun("plugin-disabled"); RestoreAutomationOverride(); ResetCaptureBootstrap(); bootstrapHooks?.Dispose(); DisposeCaptureOrigins(); ItemEventCapture.Activate(false); capture?.Dispose(); captureScene = int.MinValue; if (!quitting) theatre?.Dispose(); nativeLibrary?.Dispose(); menu?.Dispose(); notice?.Dispose(); }
     private void OnDestroy()
     {
         SceneManager.activeSceneChanged -= SceneChanged;
+        ResetCaptureBootstrap(); bootstrapHooks?.Dispose();
+        DisposeCaptureOrigins();
         CancelRouteUpload();
         DisposePlaybackUi();
         StopFullRun("plugin-destroyed");

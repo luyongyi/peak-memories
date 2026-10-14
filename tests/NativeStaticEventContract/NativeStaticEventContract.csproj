@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net472</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/PeakReplayLab/BalloonReplayCapture.cs" Link="BalloonReplayCapture.cs" />
+    <Compile Include="../../src/PeakReplayLab/LuggageTrack.cs" Link="LuggageTrack.cs" />
+    <Compile Include="../../src/PeakReplayLab/SpawnedReplayTrack.cs" Link="SpawnedReplayTrack.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureRootLifecycleObserver.cs" Link="CaptureRootLifecycleObserver.cs" />
+    <Compile Include="../../src/PeakReplayLab/NativeStaticVisualCapability.cs" Link="NativeStaticVisualCapability.cs" />
+    <Compile Include="../../src/PeakReplayLab/CrateAppearanceCapturePolicy.cs" Link="CrateAppearanceCapturePolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/SpawnedCaptureLifecycle.cs" Link="SpawnedCaptureLifecycle.cs" />
+    <Compile Include="../../src/PeakReplayLab/ItemActivityPolicy.cs" Link="ItemActivityPolicy.cs" />
+    <Compile Include="../../src/PeakReplayLab/CaptureBootstrapWorkBudget.cs" Link="CaptureBootstrapWorkBudget.cs" />
+    <Compile Include="../../src/PeakReplayLab/SampleClock.cs" Link="SampleClock.cs" />
+    <Compile Include="../ReplayContract/CrateAppearanceCapturePolicyTests.cs" Link="CrateAppearanceCapturePolicyTests.cs" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+  </ItemGroup>
+</Project>

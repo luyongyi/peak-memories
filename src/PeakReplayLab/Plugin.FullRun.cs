@@ -28,6 +28,7 @@ public sealed partial class Plugin
     private bool fullRunLibrary;
     private int stoppedFullRunScene = int.MinValue;
     private string cachedFullRunStatus = "";
+    private string fullRunFailure = "";
     private double nextFullRunStatus;
     private Task<FullRunEntry[]>? fullRunListing;
     private FullRunEntry[] fullRunEntries = Array.Empty<FullRunEntry>();
@@ -72,6 +73,7 @@ public sealed partial class Plugin
 
     private void ApplyFullRecordingSetting(bool enabled, bool persist)
     {
+        if (!enabled) ClearFullRunFailure();
         activeRecordingMode = enabled ? ReplayRecordingMode.Continuous : ReplayRecordingMode.Rolling120;
         if (persist) continuousRecordingEnabled.Value = enabled;
         nextStatsTick = nextFullRunStatus = 0;
@@ -80,15 +82,23 @@ public sealed partial class Plugin
 
     private void StartAutomaticFullRun()
     {
-        if (!IsContinuous || fullRun != null || closingFullRun != null || capture == null ||
-            stoppedFullRunScene == captureScene) return;
+        if (!CaptureBootstrapGate.AllowRecordingStart(BootstrapSceneFailed, bootstrapGate?.HostObserved == true,
+            capture?.BootstrapReady == true, capture?.BootstrapHasObservedActors == true)) return;
+        if (!AutomaticFullRunStartPolicy.TryClaim(IsContinuous, fullRun != null, closingFullRun != null,
+            capture != null, captureScene, ref stoppedFullRunScene)) return;
         // No per-frame retry on failed file creation. F4 permits an explicit retry.
-        stoppedFullRunScene = captureScene;
         StartFullRun();
+    }
+
+    private void RefreshAutomaticFileCheckpoint()
+    {
+        if (IsContinuous && fullRun == null && closingFullRun == null && stoppedFullRunScene != captureScene)
+            capture?.RefreshNextLiveCheckpoint();
     }
 
     private void ToggleFullRun()
     {
+        if (BootstrapSceneFailed) { Note(bootstrapGate?.Failure ?? "本关初态准备失败，自动录像已停止。"); return; }
         if (theatre?.Busy == true || ReplaySafety.Active) { Note("观看回放时不会再次录制。"); return; }
         if (closingFullRun != null) { Note("上一份录像正在封存，请等完成提示。"); return; }
         bool persist = automationOutputRoot == null;
@@ -117,11 +127,15 @@ public sealed partial class Plugin
 
     private void StartFullRun()
     {
+        if (!CaptureBootstrapGate.AllowRecordingStart(BootstrapSceneFailed, bootstrapGate?.HostObserved == true,
+            capture?.BootstrapReady == true, capture?.BootstrapHasObservedActors == true)) return;
         if (!IsContinuous || capture == null || fullRun != null || closingFullRun != null) return;
         // The capture can predate this file by minutes. Clip snapshots have
         // their own UTC window; update only the metadata for this new run.
         capture.Header.StartedUtc = DateTime.UtcNow.ToString("O");
+        capture.RefreshNextLiveCheckpoint();
         fullRun = new FullReplayWriter(FullRunDirectoryPath, capture.Header);
+        ClearFullRunFailure();
         AutomationRecordingStarted();
         nextFullRunStatus = 0;
         Logger.LogInfo("Continuous recording started: " + fullRun.FilePath);
@@ -130,6 +144,11 @@ public sealed partial class Plugin
 
     private void AcceptFullRunFrame(ReplayFrame frame, long estimatedBytes)
     {
+        // RollingCapture invokes this only after validation and Buffer.Add.
+        // A transient failure before the first accepted frame must not consume
+        // this scene's automatic recording attempt. Send that same first frame
+        // to the newly created writer rather than waiting for the next tick.
+        StartAutomaticFullRun();
         var writer = fullRun;
         if (writer != null && !writer.TryEnqueue(frame, estimatedBytes)) StopFullRun("writer-rejected-frame");
     }
@@ -168,12 +187,12 @@ public sealed partial class Plugin
                 if (result.Status != "completed")
                 {
                     Logger.LogWarning("Continuous recording fault: " + result.FaultCode + ": " + result.Fault);
-                    Note($"持续录制异常（{result.FaultCode}）· 已保留未完成文件供排查，请保留录像和日志。");
+                    NotifyFullRunFailure();
                 }
                 else Note($"完整录像已保存 · {ClockLabel(result.Duration)} · {result.BytesWritten / 1000000d:F1} MB · 回忆录 → 完整录像");
                 if (library && fullRunLibrary) RefreshFullRuns();
             }
-            catch (Exception e) { RecordAutomationError(e); Logger.LogError(e); Note("整局录像封存失败，请保留 Recordings 文件与日志：" + e.Message); }
+            catch (Exception e) { RecordAutomationError(e); Logger.LogError(e); NotifyFullRunFailure(); }
             finally { closingFullRun = null; closingFullRunWriter = null; nextFullRunStatus = 0; }
         }
         if (fullRunListing?.IsCompleted == true)
@@ -190,6 +209,7 @@ public sealed partial class Plugin
 
     private string FullRunStatus()
     {
+        if (fullRunFailure.Length != 0) return fullRunFailure;
         double now = Time.realtimeSinceStartupAsDouble;
         if (now < nextFullRunStatus) return cachedFullRunStatus;
         nextFullRunStatus = now + .5;
@@ -204,6 +224,19 @@ public sealed partial class Plugin
             ? $"持续录制已停止 · {fullRunKey.Value} 开始新录像" : "持续录制模式 · 进入关卡后自动开始 · 一个完整文件";
         else cachedFullRunStatus = $"完整录制已关闭 · {fullRunKey.Value} 开启 · {saveKeyLabel} 保存片段";
         return cachedFullRunStatus;
+    }
+
+    private void NotifyFullRunFailure()
+    {
+        fullRunFailure = $"完整录像已停止，未保存完整录像。\n{fullRunKey.Value} 重新开始录制 · 最近片段缓存仍保留";
+        nextFullRunStatus = 0;
+        Note(fullRunFailure);
+    }
+    private void ClearFullRunFailure()
+    {
+        if (fullRunFailure.Length == 0) return;
+        notice?.Dismiss(fullRunFailure);
+        fullRunFailure = ""; nextFullRunStatus = 0;
     }
 
     private void WaitForFullRunShutdown()

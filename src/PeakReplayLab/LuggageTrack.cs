@@ -11,28 +11,40 @@ internal sealed class LuggageCapture : IDisposable
     private sealed class Entry
     {
         public Luggage Source = null!;
+        public int ObjectId;
         public Animator? Animator;
         public string Key = "", Kind = "";
         public CrateFrame? Previous;
         public LuggageEvent? Pending;
         public bool OpenEffect, Skeleton, Initialized;
-        public double NextProbe, WatchFrom, WatchUntil;
+        public bool AppearanceDirty = true;
+        public bool InitialUrgent, Ambiguous;
+        public bool EventOnly;
+        public IDisposable? RootLifecycle;
+        public IDisposable? OpenEffectLifecycle;
+        public CrateAppearanceCapturePolicy AppearanceSchedule = null!;
+        public double NextProbe, WatchFrom = double.NegativeInfinity, WatchUntil = double.NegativeInfinity;
         public readonly List<AnimatorClipInfo> Clips = new(4);
     }
     private readonly int sceneHandle = SceneManager.GetActiveScene().handle;
     private readonly Action<string>? warning;
     private readonly HashSet<string> reported = new(StringComparer.Ordinal);
     private readonly Dictionary<int, Entry> entries = new();
+    private readonly Dictionary<int, int> segmentEntries = new();
+    private readonly SegmentCaptureClient? segments;
     private readonly Queue<LuggageEvent> signals = new();
     private readonly List<CrateFrame> frames = new();
     private readonly LuggageEventObserver observer;
     private Entry[] ordered = Array.Empty<Entry>();
     private CrateFrame[] previous = Array.Empty<CrateFrame>();
     private bool directoryDirty, disposed;
+    internal bool InitialBaselineReady => !directoryDirty && entries.Values.All(entry =>
+        !entry.Source || entry.Ambiguous || entry.Previous != null);
 
     public LuggageCapture(Action<string>? warning = null)
     {
         this.warning = warning;
+        segments = CaptureSegmentScope.Active?.CreateClient(AdmitSegmentCrate, RetireSegmentCrate);
         observer = new LuggageEventObserver(signal => { if (signals.Count < 4096) signals.Enqueue(signal); });
         try
         {
@@ -40,7 +52,20 @@ internal sealed class LuggageCapture : IDisposable
             // whole-scene search and no per-tick child-transform traversal.
             foreach (var source in UnityEngine.Object.FindObjectsByType<Luggage>(FindObjectsInactive.Include, FindObjectsSortMode.None)) Register(source);
         }
-        catch { observer.Dispose(); throw; }
+        catch { Dispose(); throw; }
+    }
+    private void AdmitSegmentCrate(GameObject source)
+    { var crate = source.GetComponent<Luggage>(); if (crate) Register(crate); }
+    private void RetireSegmentCrate(int objectId)
+    {
+        if (!segmentEntries.TryGetValue(objectId, out int id)) return;
+        segmentEntries.Remove(objectId);
+        if (!entries.TryGetValue(id, out var entry)) return;
+        entries.Remove(id); directoryDirty = true;
+        entry.RootLifecycle?.Dispose();
+        entry.OpenEffectLifecycle?.Dispose();
+        if (entry.Source) VisualReplica.ReleaseCapture(entry.Source.transform);
+        entry.Previous = null; entry.Pending = null; entry.Clips.Clear();
     }
     public CrateFrame[] Capture() => Capture(Time.timeAsDouble);
     public CrateFrame[] Capture(double captureTime)
@@ -49,13 +74,21 @@ internal sealed class LuggageCapture : IDisposable
         while (signals.Count > 0)
         {
             var signal = signals.Dequeue();
-            if (signal.Kind == LuggageEventKind.Destroyed) { if (entries.Remove(signal.Id)) directoryDirty = true; continue; }
+            if (signal.Kind == LuggageEventKind.Destroyed)
+            {
+                if (entries.TryGetValue(signal.Id, out var destroyed))
+                { segments?.Forget(destroyed.ObjectId); RetireSegmentCrate(destroyed.ObjectId); }
+                continue;
+            }
             if (!signal.Source || signal.Source.gameObject.scene.handle != sceneHandle) continue;
-            Register(signal.Source);
-            entries[signal.Id].NextProbe = 0; // Includes an inactive biome's first Awake.
-            if (signal.Kind != LuggageEventKind.Discovered)
+            bool action = signal.Kind != LuggageEventKind.Discovered && signal.Kind != LuggageEventKind.Appearance;
+            Register(signal.Source, urgent: action);
+            if (!entries.TryGetValue(signal.Id, out var target)) continue;
+            target.NextProbe = 0; target.AppearanceDirty = true; // Includes an inactive biome's first Awake.
+            if (signal.Kind != LuggageEventKind.Discovered && signal.Kind != LuggageEventKind.Appearance)
             {
                 var entry = entries[signal.Id]; entry.Pending = signal; entry.NextProbe = 0;
+                entry.InitialUrgent = true;
                 entry.WatchFrom = signal.Time; entry.WatchUntil = signal.Time + .5;
             }
         }
@@ -64,6 +97,7 @@ internal sealed class LuggageCapture : IDisposable
             var duplicates = new HashSet<string>(StringComparer.Ordinal);
             foreach (var group in entries.Values.GroupBy(e => e.Key))
                 if (group.Count() > 1) { duplicates.Add(group.Key); Warn("duplicate:" + group.Key, "箱子层级不唯一，已跳过：" + group.Key); }
+            foreach (var entry in entries.Values) entry.Ambiguous = duplicates.Contains(entry.Key);
             ordered = entries.Values.Where(e => !duplicates.Contains(e.Key)).OrderBy(e => e.Key, StringComparer.Ordinal).ToArray();
             directoryDirty = false;
         }
@@ -71,19 +105,49 @@ internal sealed class LuggageCapture : IDisposable
         foreach (var entry in ordered)
         {
             if (!entry.Source) continue;
+            if (CaptureBootstrapWorkBudget.InitialOnly && entry.Previous != null && !entry.InitialUrgent &&
+                !entry.AppearanceDirty && !entry.Pending.HasValue && captureTime > entry.WatchUntil)
+            { frames.Add(entry.Previous); continue; }
+            if (entry.Previous == null && !entry.InitialUrgent && !CaptureBootstrapWorkBudget.TryBeginRead()) continue;
+            entry.InitialUrgent = false;
             try { frames.Add(Sample(entry, captureTime)); }
-            catch (Exception e) { Warn(entry.Key, "箱子状态采集失败：" + entry.Key + " · " + e.Message); }
+            catch (Exception e)
+            {
+                if (entry.Previous != null) frames.Add(entry.Previous);
+                Warn(entry.Key, "箱子状态采集失败：" + entry.Key + " · " + e.Message);
+            }
         }
         bool same = frames.Count == previous.Length;
         if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previous[i])) { same = false; break; }
         if (!same) previous = frames.ToArray();
         return previous;
     }
-    private void Register(Luggage source)
+    private void Register(Luggage source, bool urgent = false)
     {
-        if (!source || source.gameObject.scene.handle != sceneHandle || entries.ContainsKey(source.GetInstanceID())) return;
-        entries.Add(source.GetInstanceID(), new Entry { Source = source, Animator = source.GetComponent<Animator>(),
-            Key = WorldTrack.Path(source.transform), Kind = source.GetType().FullName ?? source.GetType().Name });
+        if (!source || source.gameObject.scene.handle != sceneHandle) return;
+        if (segments != null && !segments.Admit(source.gameObject, urgent)) return;
+        if (entries.ContainsKey(source.GetInstanceID())) return;
+        var entry = new Entry { Source = source, Animator = source.GetComponent<Animator>(),
+            ObjectId = source.gameObject.GetInstanceID(),
+            InitialUrgent = urgent,
+            AppearanceSchedule = new CrateAppearanceCapturePolicy(source.GetInstanceID()),
+            EventOnly = NativeStaticVisualCapability.CrateEventOnly(source),
+            Key = WorldTrack.Path(source.transform), Kind = source.GetType().FullName ?? source.GetType().Name };
+        entries.Add(source.GetInstanceID(), entry);
+        entry.RootLifecycle = CaptureRootLifecycleObserver.Bind(source.gameObject, () =>
+        {
+            if (!disposed && source && signals.Count < 4096)
+                signals.Enqueue(new LuggageEvent(source, LuggageEventKind.Appearance, Time.timeAsDouble));
+        });
+        // The host's SpawnItemRoutine can wait for registration longer than an
+        // animation window. Observe its exact delayed activation independently.
+        if (source.activateOnOpen && source.activateOnOpen != source.gameObject)
+            entry.OpenEffectLifecycle = CaptureRootLifecycleObserver.Bind(source.activateOnOpen!, () =>
+            {
+                if (!disposed && source && signals.Count < 4096)
+                    signals.Enqueue(new LuggageEvent(source, LuggageEventKind.Appearance, Time.timeAsDouble));
+            });
+        segmentEntries[source.gameObject.GetInstanceID()] = source.GetInstanceID();
         directoryDirty = true;
     }
     private CrateFrame Sample(Entry entry, double time)
@@ -91,16 +155,19 @@ internal sealed class LuggageCapture : IDisposable
         var source = entry.Source; var old = entry.Previous;
         bool pendingDue = entry.Pending.HasValue && time >= entry.Pending.Value.Time;
         bool watching = time >= entry.WatchFrom && time <= entry.WatchUntil;
-        if (old != null && !pendingDue && !watching && time < entry.NextProbe) return old;
-        // Static roots/visibility are an inexpensive 2 Hz fallback, staggered per chest.
+        bool appearanceDue = entry.AppearanceSchedule.Due(time, old != null, entry.AppearanceDirty,
+            old?.Pose.Active ?? false, watching, old?.Animation, followSceneClock: true, eventOnly: entry.EventOnly);
+        if (old != null && !pendingDue && !watching && !appearanceDue && (entry.EventOnly || time < entry.NextProbe)) return old;
+        // Unproven scripts retain the staggered fallback; audited roots wake
+        // only through exact-root lifecycle/native events and finite clips.
         // Only a notified interaction watches briefly at capture rate for its delayed effect.
-        entry.NextProbe = time + .5 + (source.GetInstanceID() & 3) * .03;
+        entry.NextProbe = time + entry.AppearanceSchedule.ProbeInterval;
         bool open = source.IsOpen;
         bool active = source.gameObject.activeInHierarchy;
         bool newlyVisible = old != null && !old.Pose.Active && active;
         bool effect = source.activateOnOpen && source.activateOnOpen.activeSelf;
         bool skeleton = source is RespawnChest respawn && respawn.skeleton && respawn.skeleton.activeSelf;
-        bool appearanceChanged = !entry.Initialized || newlyVisible || effect != entry.OpenEffect || skeleton != entry.Skeleton;
+        bool appearanceChanged = !entry.Initialized || newlyVisible || entry.AppearanceDirty || effect != entry.OpenEffect || skeleton != entry.Skeleton;
         bool animationChanged = false;
         CrateAnimationFrame? animation = old?.Animation;
         if (old == null || newlyVisible && animation == null) animation = ReadAnimation(entry, time, null);
@@ -119,9 +186,20 @@ internal sealed class LuggageCapture : IDisposable
         // Initial checkpoint and discrete events only; never sample every lid/bone at 60 Hz.
         ObjectPose pose = old == null || appearanceChanged || animationChanged
             ? VisualReplica.Capture(source.transform) : RootPose(source.transform, old.Pose);
+        var visuals = old?.Visuals; var lights = old?.Lights;
+        if (appearanceChanged || entry.AppearanceSchedule.Due(time, old != null, false, active, watching, animation, followSceneClock: true, eventOnly: entry.EventOnly))
+        {
+            // The cached component/property directories never traverse the scene
+            // here. Full values are read at 30 Hz only for an interacting chest.
+            visuals = NativeVisualAppearance.Capture(source.transform, visuals);
+            lights = NativeLightAppearance.Capture(source.transform, lights);
+            entry.AppearanceSchedule.Observed(time, watching || CrateAppearanceCapturePolicy.Advancing(animation, time)); entry.AppearanceDirty = false;
+        }
         entry.Initialized = true; entry.OpenEffect = effect; entry.Skeleton = skeleton;
-        if (old != null && old.Open == open && ReferenceEquals(old.Pose, pose) && ReferenceEquals(old.Animation, animation)) return old;
-        return entry.Previous = new CrateFrame { Key = entry.Key, Kind = entry.Kind, Open = open, Pose = pose, Animation = animation };
+        if (old != null && old.Open == open && ReferenceEquals(old.Pose, pose) && ReferenceEquals(old.Animation, animation) &&
+            ReferenceEquals(old.Visuals, visuals) && ReferenceEquals(old.Lights, lights)) return old;
+        return entry.Previous = new CrateFrame { Key = entry.Key, Kind = entry.Kind, Open = open, Pose = pose, Animation = animation,
+            Visuals = visuals, Lights = lights };
     }
     private static ObjectPose RootPose(Transform root, ObjectPose old)
     {
@@ -129,8 +207,7 @@ internal sealed class LuggageCapture : IDisposable
         if (old.Active == active && old.Position[0] == p.x && old.Position[1] == p.y && old.Position[2] == p.z &&
             old.Rotation[0] == q.x && old.Rotation[1] == q.y && old.Rotation[2] == q.z && old.Rotation[3] == q.w &&
             old.Scale[0] == s.x && old.Scale[1] == s.y && old.Scale[2] == s.z) return old;
-        return new ObjectPose { Position = new[] { p.x, p.y, p.z }, Rotation = new[] { q.x, q.y, q.z, q.w },
-            Scale = new[] { s.x, s.y, s.z }, Active = active, Nodes = old.Nodes };
+        return new ObjectPose(new[] { p.x, p.y, p.z }, new[] { q.x, q.y, q.z, q.w }, new[] { s.x, s.y, s.z }, active, old.Nodes);
     }
     private static CrateAnimationFrame? ReadAnimation(Entry entry, double time, LuggageEvent? signal)
     {
@@ -167,136 +244,8 @@ internal sealed class LuggageCapture : IDisposable
     public void Dispose()
     {
         if (disposed) return; disposed = true;
-        observer.Dispose(); entries.Clear(); signals.Clear(); frames.Clear(); ordered = Array.Empty<Entry>(); previous = Array.Empty<CrateFrame>(); reported.Clear();
-    }
-}
-
-internal sealed class LuggagePlayback : IDisposable
-{
-    private sealed class Entry
-    {
-        public Luggage Source = null!;
-        public string Kind = "";
-        public VisualReplica? Replica;
-        public CrateVisualAnimation? Animation;
-        public ObjectPose? LastPose;
-        public CrateAnimationFrame? LastAnimation;
-        public bool OriginalsHidden, Failed, AnimationFailed;
-    }
-    private readonly Dictionary<string, Entry> allowed = new(StringComparer.Ordinal);
-    private readonly Dictionary<Renderer, bool> originals = new();
-    private readonly Dictionary<string, CrateFrame> next = new(StringComparer.Ordinal);
-    private readonly HashSet<string> present = new(StringComparer.Ordinal);
-    private readonly HashSet<string> reported = new(StringComparer.Ordinal);
-    private readonly Action<string>? warning;
-    private CrateFrame[]? previousRight;
-    private bool disposed;
-    private int enforcedFrame = -1;
-    public LuggagePlayback(Action<string>? warning = null)
-    {
-        this.warning = warning;
-        int sceneHandle = SceneManager.GetActiveScene().handle;
-        var ambiguous = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var source in UnityEngine.Object.FindObjectsByType<Luggage>(FindObjectsInactive.Include, FindObjectsSortMode.None))
-        {
-            if (!source || source.gameObject.scene.handle != sceneHandle) continue;
-            string key = WorldTrack.Path(source.transform);
-            if (allowed.ContainsKey(key)) { ambiguous.Add(key); continue; }
-            allowed.Add(key, new Entry { Source = source, Kind = source.GetType().FullName ?? source.GetType().Name });
-        }
-        foreach (string key in ambiguous) { allowed.Remove(key); Warn("duplicate:" + key, "箱子层级不唯一，无法安全回放：" + key); }
-    }
-    public void Apply(CrateFrame[] left, CrateFrame[] right, float mix) => Apply(left, right, mix, 0);
-    public void Apply(CrateFrame[] left, CrateFrame[] right, float mix, double replayTime)
-    {
-        if (disposed) throw new ObjectDisposedException(nameof(LuggagePlayback));
-        if (!ReferenceEquals(previousRight, right))
-        { next.Clear(); foreach (var frame in right) if (!next.ContainsKey(frame.Key)) next.Add(frame.Key, frame); previousRight = right; }
-        present.Clear();
-        foreach (var frame in left)
-        {
-            if (!allowed.TryGetValue(frame.Key, out var entry) || !entry.Source || entry.Kind != frame.Kind)
-            { Warn("missing:" + frame.Key, "录像箱子与当前关卡不匹配，已跳过：" + frame.Key); continue; }
-            if (!present.Add(frame.Key)) continue;
-            if (entry.Failed) continue;
-            try
-            {
-                if (!entry.OriginalsHidden)
-                {
-                    foreach (var renderer in entry.Source.GetComponentsInChildren<Renderer>(true))
-                    {
-                        if (!renderer || originals.ContainsKey(renderer)) continue;
-                        originals.Add(renderer, renderer.forceRenderingOff); renderer.forceRenderingOff = true;
-                    }
-                    entry.OriginalsHidden = true;
-                }
-                next.TryGetValue(frame.Key, out var following);
-                if (following?.Kind != frame.Kind) following = null;
-                bool boundary = mix >= 1 && following != null;
-                var current = boundary ? following! : frame;
-                if (!current.Pose.Active) { Hide(entry); continue; }
-                entry.Replica ??= new VisualReplica(entry.Source.gameObject);
-                bool checkpointChanged = !ReferenceEquals(entry.LastPose, current.Pose) || !ReferenceEquals(entry.LastAnimation, current.Animation);
-                bool dynamicRoot = following != null && !ReferenceEquals(frame.Pose, following.Pose);
-                if (checkpointChanged || dynamicRoot)
-                {
-                    entry.Replica.InvalidatePose();
-                    entry.Replica.Apply(frame.Pose, following?.Pose, mix);
-                    entry.LastPose = current.Pose; entry.LastAnimation = current.Animation;
-                }
-                if (current.Animation != null && !entry.AnimationFailed)
-                {
-                    try
-                    {
-                        entry.Animation ??= new CrateVisualAnimation(entry.Source, entry.Replica.Root);
-                        entry.Animation.Sample(current.Animation, boundary ? null : following?.Animation, boundary ? 0 : mix, replayTime, checkpointChanged || dynamicRoot);
-                    }
-                    catch (Exception e)
-                    {
-                        // One bad asset must neither spam native errors every tick nor
-                        // erase this chest. Retain recorded event-checkpoint geometry.
-                        entry.AnimationFailed = true;
-                        try { entry.Animation?.Dispose(); } catch { }
-                        entry.Replica.InvalidatePose(); entry.Replica.Apply(frame.Pose, following?.Pose, mix);
-                        Warn("animation:" + frame.Key, "箱子动画已隔离，保留记录的视觉状态：" + frame.Key + " · " + e.Message);
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                entry.Failed = true; Hide(entry);
-                try { entry.Animation?.Dispose(); } catch { }
-                Warn("apply:" + frame.Key, "箱子视觉回放已隔离：" + frame.Key + " · " + e.Message);
-            }
-        }
-        foreach (var pair in allowed) if (!present.Contains(pair.Key)) Hide(pair.Value);
-        // PlaybackSession.Tick alone owns original-renderer enforcement.
-    }
-    private static void Hide(Entry entry)
-    {
-        if (entry.Replica?.Root && entry.Replica.Root.activeSelf) entry.Replica.Hide();
-        entry.LastPose = null; entry.LastAnimation = null;
-    }
-    public void Enforce()
-    {
-        if (disposed || enforcedFrame == Time.frameCount) return;
-        enforcedFrame = Time.frameCount;
-        foreach (var pair in originals)
-            try { if (pair.Key && !pair.Key.forceRenderingOff) pair.Key.forceRenderingOff = true; }
-            catch (Exception e) { Warn("renderer-hide", "无法隐藏原生箱子渲染器：" + e.Message); }
-    }
-    private void Warn(string key, string message)
-    { if (reported.Count < 128 && reported.Add(key)) try { warning?.Invoke(message); } catch { } }
-    public void Dispose()
-    {
-        if (disposed) return; disposed = true;
-        foreach (var pair in allowed)
-        {
-            try { pair.Value.Animation?.Dispose(); } catch (Exception e) { Warn("animation-dispose:" + pair.Key, e.Message); }
-            try { pair.Value.Replica?.Dispose(); } catch (Exception e) { Warn("dispose:" + pair.Key, e.Message); }
-        }
-        foreach (var pair in originals)
-            try { if (pair.Key) pair.Key.forceRenderingOff = pair.Value; } catch (Exception e) { Warn("restore", e.Message); }
-        originals.Clear(); allowed.Clear(); next.Clear(); present.Clear(); reported.Clear(); previousRight = null;
+        foreach (var entry in entries.Values)
+        { entry.RootLifecycle?.Dispose(); entry.OpenEffectLifecycle?.Dispose(); if (entry.Source) VisualReplica.ReleaseCapture(entry.Source.transform); }
+        observer.Dispose(); segments?.Dispose(); entries.Clear(); segmentEntries.Clear(); signals.Clear(); frames.Clear(); ordered = Array.Empty<Entry>(); previous = Array.Empty<CrateFrame>(); reported.Clear();
     }
 }

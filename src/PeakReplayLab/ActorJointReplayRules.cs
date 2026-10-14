@@ -12,17 +12,24 @@ public static class ActorJointReplayRules
 
     public static void Validate(NodePose[] joints)
     {
-        if (joints == null || joints.Length > MaximumJoints) throw Invalid();
+        if (joints == null || joints.Length > MaximumJoints) throw Invalid(-1, "joint array");
         string? previous = null;
-        foreach (var joint in joints)
+        for (int index = 0; index < joints.Length; index++)
         {
-            if (joint == null || string.IsNullOrEmpty(joint.Path) || joint.Path.Length > MaximumPathLength ||
-                previous != null && StringComparer.Ordinal.Compare(previous, joint.Path) >= 0 ||
-                !ReplayRules.Finite(joint.SampleTime) || Math.Abs(joint.SampleTime) > 1_000_000_000 ||
-                !Vector(joint.Position, 3) || !Vector(joint.Rotation, 4) || !Vector(joint.Scale, 3)) throw Invalid();
+            var joint = joints[index];
+            if (joint == null) throw Invalid(index, "null node");
+            if (string.IsNullOrEmpty(joint.Path) || joint.Path.Length > MaximumPathLength)
+                throw Invalid(index, "path");
+            if (previous != null && StringComparer.Ordinal.Compare(previous, joint.Path) >= 0)
+                throw Invalid(index, "path order");
+            if (!ReplayRules.Finite(joint.SampleTime) || Math.Abs(joint.SampleTime) > 1_000_000_000)
+                throw Invalid(index, "sample time");
+            if (!Vector(joint.Position, 3)) throw Invalid(index, "position");
+            if (!Vector(joint.Rotation, 4)) throw Invalid(index, "rotation");
+            if (!Vector(joint.Scale, 3)) throw Invalid(index, "scale");
             double norm = 0;
             foreach (float value in joint.Rotation) norm += value * (double)value;
-            if (norm < .25 || norm > 2.25) throw Invalid();
+            if (norm < .25 || norm > 2.25) throw Invalid(index, "rotation norm");
             previous = joint.Path;
         }
     }
@@ -49,5 +56,7 @@ public static class ActorJointReplayRules
         foreach (float component in value) if (!ReplayRules.Finite(component) || Math.Abs(component) > 1e7) return false;
         return true;
     }
-    private static InvalidDataException Invalid() => new("Invalid full-body joint pose.");
+    // Construct details only on failure; validation adds no per-frame strings.
+    private static InvalidDataException Invalid(int index, string reason) =>
+        new("Invalid full-body joint pose: joint " + index + ", " + reason + ".");
 }

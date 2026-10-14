@@ -49,6 +49,7 @@ public static class CrateAnimationTimeline
         var animation = source.Animation;
         if (animation == null || !animation.Anchored || origin == 0) return source;
         return new CrateFrame { Key = source.Key, Kind = source.Kind, Open = source.Open, Pose = source.Pose,
+            Visuals = source.Visuals, Lights = source.Lights,
             Animation = new CrateAnimationFrame { Clip = animation.Clip, Time = animation.Time, Anchored = true,
                 AnchorTime = animation.AnchorTime - origin, Rate = animation.Rate, Duration = animation.Duration, Loop = animation.Loop } };
     }
