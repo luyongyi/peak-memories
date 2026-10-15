@@ -30,17 +30,17 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
     public sealed class Plan
     {
         public string RecentPath = "", LargePath = "";
-        public bool RunCancellation = true;
+        public bool RunCancellation = true, RequireCacheSkip, RunLargeDuplicate;
         public double CancelAfterSeconds = 2, BaselineSeconds = 10, ResultHoldSeconds = 6;
         public int MaximumSeconds = 1500;
     }
     private sealed class Round
     {
         public string Name = "", Recording = "", Output = "";
-        public bool Cancel, ExpectDuplicate, RequestAccepted, CancelObserved, UiFinished;
+        public bool Cancel, ExpectDuplicate, ExpectCacheHit, CacheHit, RequestAccepted, CancelObserved, UiFinished;
         public long Start, ExportStart, ExportStop, UiStop, UploadStart, UploadStop;
         public string ExportError = "";
-        public int ProgressChanges;
+        public int ProgressChanges, ExportInvocations, UploadInvocations;
         public float LastProgress = -1;
         public FrameMeter ExportFrames = new(), UploadFrames = new();
         public Task? Worker, Sender;
@@ -115,6 +115,8 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
         var probe = active;
         Require(probe?.armed == true && probe.current != null, "Unexpected trajectory export during protected test.");
         var round = probe!.current!;
+        round.ExportInvocations++;
+        Require(!round.ExpectCacheHit, "A completed cache hit must not invoke replay export.");
         Require(string.Equals(Path.GetFullPath(recordingPath), round.Recording, StringComparison.OrdinalIgnoreCase), "Unexpected recording export.");
         outputDirectory = round.Output;
         round.ExportStart = Stopwatch.GetTimestamp(); __state = round;
@@ -135,6 +137,15 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
         Require(probe?.armed == true && endpoint.AbsoluteUri == probe.endpoint && endpoint.Host == "127.0.0.1", "Only the explicit local loopback endpoint is allowed.");
         string prefix = probe!.output + Path.DirectorySeparatorChar;
         Require(packagePaths.All(path => Path.GetFullPath(path).StartsWith(prefix, StringComparison.OrdinalIgnoreCase)), "Only this session's independent trajectory packages may be uploaded.");
+        Require(probe.current != null, "An upload must belong to the active test round.");
+        probe.current!.UploadInvocations++;
+        Require(!probe.current.ExpectCacheHit, "A completed cache hit must not invoke HTTP upload.");
+    }
+    private static bool ScopedExportDirectory(ref string __result)
+    {
+        Require(active?.armed == true, "Export/cache directory access outside the explicit protected session.");
+        __result = Path.Combine(active!.output, "production-exports");
+        return false;
     }
     private void Awake()
     {
@@ -167,10 +178,12 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
             foreach (var name in new[] { "SetSteamStatInternal", "IncrementSteamStat", "ThrowAchievement" }) Block(typeof(AchievementManager), name);
             harmony.Patch(AccessTools.DeclaredMethod(typeof(ReplayTrajectoryExporter), "Export"), prefix: new HarmonyMethod(typeof(TrajectoryAuditProbe), nameof(BeforeExport)), finalizer: new HarmonyMethod(typeof(TrajectoryAuditProbe), nameof(AfterExport)));
             harmony.Patch(AccessTools.DeclaredMethod(typeof(TrajectoryUploader), "UploadManyAsync"), prefix: new HarmonyMethod(typeof(TrajectoryAuditProbe), nameof(GuardUpload)));
+            harmony.Patch(AccessTools.DeclaredPropertyGetter(typeof(Plugin), "RouteExportDirectory"), prefix: new HarmonyMethod(typeof(TrajectoryAuditProbe), nameof(ScopedExportDirectory)));
             AddRound("recent-normal", plan.RecentPath, false, false);
             AddRound("recent-duplicate", plan.RecentPath, false, true);
             if (plan.RunCancellation) AddRound("large-cancel", plan.LargePath, true, false);
             AddRound("large-retry", plan.LargePath, false, false);
+            if (plan.RunLargeDuplicate) AddRound("large-duplicate", plan.LargePath, false, true);
             begun = previousFrame = phaseStart = Stopwatch.GetTimestamp(); armed = true; WritePhase();
         }
         catch (Exception exception) { error = exception.ToString(); Logger.LogError("Trajectory probe refused: " + exception); Finish(false); }
@@ -178,7 +191,8 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
     private void AddRound(string name, string path, bool cancel, bool duplicate)
     {
         Require(Path.IsPathFullyQualified(path) && path.EndsWith(".peakrun", StringComparison.OrdinalIgnoreCase) && File.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0, "An existing ordinary sealed full recording is required.");
-        rounds.Add(new Round { Name = name, Recording = Path.GetFullPath(path), Output = Path.Combine(output, name, "exports"), Cancel = cancel, ExpectDuplicate = duplicate });
+        rounds.Add(new Round { Name = name, Recording = Path.GetFullPath(path), Output = Path.Combine(output, "production-exports"), Cancel = cancel,
+            ExpectDuplicate = duplicate, ExpectCacheHit = duplicate && plan.RequireCacheSkip });
     }
     private void Enter(string next)
     {
@@ -239,6 +253,22 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
                 string routeError = (string)Read(owner, "routeError")!;
                 Require(routeError.Length == 0, "Production export error: " + routeError);
                 if (Read(owner, "routeExport") != null) return;
+                bool cacheHit = false;
+                try { cacheHit = Read(owner, "routeCacheHit") is true; } catch (MissingMemberException) { }
+                if (cacheHit)
+                {
+                    Require(current.ExpectCacheHit && current.Worker?.Status == TaskStatus.RanToCompletion && Read(owner, "routeFinished") is true,
+                        "A cached preparation must finish through the production menu.");
+                    Require(current.ExportInvocations == 0 && current.UploadInvocations == 0 && Read(owner, "routeSending") == null,
+                        "A completed cache hit unexpectedly decoded replay pages or started HTTP upload.");
+                    var cached = Read(Read(current.Worker, "Result"), "CachedReceipt") as TrajectoryUploadReceipt;
+                    Require(cached != null && cached.UploadIds.Length > 0, "The authenticated local completion receipt is missing.");
+                    current.CacheHit = true; current.UiStop = now; current.UiFinished = true;
+                    current.PackageMetrics = new { ParsingSkipped = true, ExportSkipped = true, SendingSkipped = true };
+                    current.Receipt = new { Parts = cached!.UploadIds.Length, CompletedCacheHit = true };
+                    Enter("Hold"); return;
+                }
+                Require(!current.ExpectCacheHit, "Repeated successful upload did not use the completed cache.");
                 var package = Read(owner, "routePackage") as TrajectoryExportResult;
                 Require(package != null && current.Worker?.Status == TaskStatus.RanToCompletion, "Production menu export did not yield a successful package.");
                 Require(current.ExportStart > 0 && current.ExportStop >= current.ExportStart, "The scoped production Export timing hook was not observed.");
@@ -313,7 +343,8 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
             using var memory = new MemoryStream(); gzip.CopyTo(memory); byte[] bytes = memory.ToArray();
             using var sha = SHA256.Create(); string hash = BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-", "");
             var package = JsonConvert.DeserializeObject<TrajectoryPackage>(System.Text.Encoding.UTF8.GetString(bytes)) ?? throw new InvalidDataException("Invalid trajectory package.");
-            long partPoints = package.Players.Sum(player => (long)player.Points.Count), partEvents = package.Players.Sum(player => (long)player.Events.Count);
+            long partPoints = package.Players.Sum(player => player.Points.Sum(point => point.Length == 6 ? (long)point[5] : 1)),
+                partEvents = package.Players.Sum(player => (long)player.Events.Count);
             points += partPoints; events += partEvents;
             parts.Add(new { JsonSha256 = hash, DecodedBytes = bytes.Length, CompressedBytes = new FileInfo(path).Length, Players = package.Players.Count, PointCount = partPoints, EventCount = partEvents });
         }
@@ -322,6 +353,7 @@ public sealed class TrajectoryAuditProbe : BaseUnityPlugin
     private object RoundSummary(Round round) => new
     {
         round.Name, round.Cancel, round.RequestAccepted, round.CancelObserved, round.UiFinished,
+        round.ExpectCacheHit, round.CacheHit, round.ExportInvocations, round.UploadInvocations,
         ExportSeconds = round.ExportStop == 0 ? (double?)null : Seconds(round.ExportStart, round.ExportStop),
         UiSeconds = round.UiStop == 0 ? (double?)null : Seconds(round.Start, round.UiStop),
         UploadUiSeconds = round.UploadStop == 0 ? (double?)null : Seconds(round.UploadStart, round.UploadStop),

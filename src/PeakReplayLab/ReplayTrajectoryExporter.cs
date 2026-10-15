@@ -115,6 +115,7 @@ public sealed class TrajectoryEvent
 
 public static class ReplayTrajectoryExporter
 {
+    public const string UploadCacheVersion = "trajectory-v2/export-1";
     public const long MaximumCompressedBytes = 12L * 1024 * 1024;
     public const long MaximumDecodedBytes = 64L * 1024 * 1024;
     private const long MaximumRetainedPoints = MaximumDecodedBytes / 72;
@@ -291,6 +292,14 @@ public static class ReplayTrajectoryExporter
         bool created = false;
         try
         {
+            // The wire can be tiny while its exact expanded v1 is large. Apply
+            // the existing canonical byte budget before compression/subdivision,
+            // using a discard stream instead of allocating another JSON string.
+            using (var canonical = new LimitedWriteStream(Stream.Null, decodedLimit, cancellation))
+            using (var text = new StreamWriter(canonical, new UTF8Encoding(false), 8192, true))
+            using (var json = new JsonTextWriter(text) { CloseOutput = false })
+            { JsonSerializer.Create(UploadJson).Serialize(json, package); json.Flush(); text.Flush(); }
+            var wire = TrajectoryPointRunCodec.Encode(package, cancellation);
             long rawBytes, compressedBytes;
             using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan))
             {
@@ -301,7 +310,7 @@ public static class ReplayTrajectoryExporter
                 using (var text = new StreamWriter(decoded, new UTF8Encoding(false), 8192, true))
                 using (var json = new JsonTextWriter(text) { CloseOutput = false })
                 {
-                    JsonSerializer.Create(UploadJson).Serialize(json, package);
+                    JsonSerializer.Create(UploadJson).Serialize(json, wire);
                     json.Flush(); text.Flush(); rawBytes = decoded.BytesWritten;
                 }
                 compressed.Flush(); compressedBytes = compressed.BytesWritten; file.Flush();

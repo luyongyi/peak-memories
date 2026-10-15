@@ -42,5 +42,6 @@
   <Project Path="tests/ReplayAudioSpatialContract/ReplayAudioSpatialContract.csproj" />
   <Project Path="tests/NativeLoadingContract/NativeLoadingContract.csproj" />
   <Project Path="tests/TrajectoryUploadContract/TrajectoryUploadContract.csproj" />
+  <Project Path="tests/TrajectoryCacheContract/TrajectoryCacheContract.csproj" />
   <Project Path="tests/TrajectoryContract/TrajectoryContract.csproj" />
 </Solution>

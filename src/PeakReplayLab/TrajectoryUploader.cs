@@ -18,6 +18,7 @@ public sealed class TrajectoryUploadReceipt
     public string ModerationStatus { get; set; } = "";
     public string MapCompatibility { get; set; } = "";
     public bool Duplicate { get; set; }
+    public bool Cached { get; set; }
     public string[] UploadIds { get; set; } = Array.Empty<string>();
 }
 
@@ -51,7 +52,9 @@ public static class TrajectoryUploader
     // succeeds only after every immutable export has a valid acknowledgement.
     public static async Task<TrajectoryUploadReceipt> UploadManyAsync(IReadOnlyList<string> packagePaths, Uri endpoint,
         CancellationToken cancellation = default, Action<int, int>? progress = null,
-        HttpMessageHandler? testHandler = null, Func<TimeSpan, CancellationToken, Task>? retryDelay = null)
+        HttpMessageHandler? testHandler = null, Func<TimeSpan, CancellationToken, Task>? retryDelay = null,
+        Func<string, TrajectoryUploadReceipt?>? confirmedReceipt = null,
+        Action<string, TrajectoryUploadReceipt>? onConfirmed = null)
     {
         Endpoint(endpoint.AbsoluteUri);
         if (packagePaths == null || packagePaths.Count == 0) throw new InvalidDataException("没有可上传的轨迹包。");
@@ -73,7 +76,14 @@ public static class TrajectoryUploader
         {
             try
             {
-                receipts.Add(await UploadFileAsync(path, endpoint, client, cancellation, retryDelay ?? Task.Delay).ConfigureAwait(false));
+                cancellation.ThrowIfCancellationRequested();
+                var known = confirmedReceipt?.Invoke(path);
+                if (known != null && (!HexId(known.UploadId) || known.UploadIds == null || known.UploadIds.Length != 1 || known.UploadIds[0] != known.UploadId
+                    || !ReceiptStatus(known.ModerationStatus, known.MapCompatibility)))
+                    throw new InvalidDataException("本地轨迹回执无效，不能跳过上传。");
+                var received = known ?? await UploadFileAsync(path, endpoint, client, cancellation, retryDelay ?? Task.Delay).ConfigureAwait(false);
+                if (known == null) onConfirmed?.Invoke(path, received);
+                receipts.Add(received);
                 progress?.Invoke(receipts.Count, paths.Length);
             }
             catch (Exception error) when (error is InvalidDataException || error is IOException || error is HttpRequestException)
@@ -88,7 +98,7 @@ public static class TrajectoryUploader
         {
             UploadId = receipts[0].UploadId, UploadIds = receipts.Select(value => value.UploadId).ToArray(),
             ModerationStatus = status, MapCompatibility = receipts.All(value => value.MapCompatibility == "matched") ? "matched" : "waiting-map",
-            Duplicate = receipts.All(value => value.Duplicate)
+            Duplicate = receipts.All(value => value.Duplicate), Cached = receipts.All(value => value.Cached)
         };
     }
 
@@ -121,7 +131,7 @@ public static class TrajectoryUploader
             // A fresh content instance is required for every retry. Keep the one
             // read-only file handle alive so a changed path cannot swap payloads.
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-            request.Headers.TryAddWithoutValidation("X-Trajectory-Format", "trajectory-v1");
+            request.Headers.TryAddWithoutValidation("X-Trajectory-Format", "trajectory-v2");
             request.Headers.TryAddWithoutValidation("Prefer", "return=minimal");
             request.Content = new StreamContent(new BorrowedStream(file));
             request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
@@ -159,8 +169,7 @@ public static class TrajectoryUploader
                 string id = json.Value<string>("uploadId") ?? "";
                 string moderation = json.Value<string>("moderationStatus") ?? "";
                 string compatibility = json.Value<string>("mapCompatibility") ?? "";
-                if (!HexId(id) || (moderation != "pending" && moderation != "approved" && moderation != "hidden" && moderation != "rejected") ||
-                    (compatibility != "matched" && compatibility != "waiting-map"))
+                if (!HexId(id) || !ReceiptStatus(moderation, compatibility))
                     throw new InvalidDataException("服务器没有返回有效投稿回执，轨迹包已保留。");
                 return new TrajectoryUploadReceipt
                 {
@@ -176,6 +185,9 @@ public static class TrajectoryUploader
     }
 
     private static bool Retryable(HttpStatusCode code) => (int)code == 408 || (int)code == 429 || (int)code >= 500;
+    private static bool ReceiptStatus(string moderation, string compatibility) =>
+        (moderation == "pending" || moderation == "approved" || moderation == "hidden" || moderation == "rejected") &&
+        (compatibility == "matched" || compatibility == "waiting-map");
     private static bool HexId(string id)
     {
         if (id.Length != 64) return false;

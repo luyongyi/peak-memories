@@ -214,6 +214,9 @@ try {
     foreach ($name in $projects) {
         Invoke-Checked dotnet @('run', '--project', "tests/$name/$name.csproj", '-c', 'Release', '--no-build')
     }
+    # Keep the original manifest contract list compatible with older releases;
+    # the new upload cache has an additional mandatory independent check.
+    Invoke-Checked dotnet @('run', '--project', 'tests/TrajectoryCacheContract/TrajectoryCacheContract.csproj', '-c', 'Release')
     Invoke-Checked dotnet @('build', 'tools/ReleaseVerifier/ReleaseVerifier.csproj', '-c', 'Release', '--nologo', '-warnaserror')
     $script:verifierDll = Join-Path $repoRoot 'artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll'
     Invoke-Checked dotnet @($script:verifierDll, 'self-test')

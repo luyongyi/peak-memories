@@ -80,12 +80,13 @@ FullReplayResult Save(string root, ReplayHeader header, IEnumerable<ReplayFrame>
     Check(task.Wait(TimeSpan.FromSeconds(20))); var result = task.GetAwaiter().GetResult();
     Check(result.Status == (interrupted ? "faulted" : "completed")); return result;
 }
-JObject ReadPackage(string path)
+JObject ReadWirePackage(string path)
 {
     using var file = File.OpenRead(path); using var gzip = new GZipStream(file, CompressionMode.Decompress);
     using var text = new StreamReader(gzip); using var json = new JsonTextReader(text);
     return JObject.Load(json);
 }
+JObject ReadPackage(string path) => TrajectoryPointRunTests.Canonical(ReadWirePackage(path));
 ReplayFrame[] SyntheticFrames()
 {
     return Enumerable.Range(0, 721).Select(i =>
@@ -409,7 +410,7 @@ Test("eighty members round-trip full and rolling recordings and all export with 
         && (long)value["timeOriginMs"]! == 1079 && (int)value["durationMs"]! == 200));
     Check(packages.Select(value => value["runKey"]!.ToString()).Distinct().Count() == 1);
     Check(result.CompressedBytes == result.Paths.Sum(value => new FileInfo(value).Length));
-    Check(result.DecodedBytes == packages.Sum(value => (long)System.Text.Encoding.UTF8.GetByteCount(value.ToString(Formatting.None))));
+    Check(result.DecodedBytes == result.Paths.Select(ReadWirePackage).Sum(value => (long)System.Text.Encoding.UTF8.GetByteCount(value.ToString(Formatting.None))));
     Check(result.PlayerNames.Last() == "Synthetic member 79");
     string canceledOutput = Path.Combine(root, "canceled-parts");
     using var cancellation = new CancellationTokenSource();
@@ -678,6 +679,28 @@ Test("writer snapshots recording context before external mutation", () => InRoot
 }));
 
 TrajectoryProjectionTests.Run(Test);
+TrajectoryPointRunTests.Run(Test);
+Test("export writes v2 exact stationary samples while enforcing the expanded byte budget", () => InRoot(root =>
+{
+    var frames = Enumerable.Range(0, 601).Select(index => Frame(200 + index / 10d, Actor(200 + index / 10d, 0))).ToArray();
+    var source = Save(root, Header(), frames);
+    var result = ReplayTrajectoryExporter.Export(source.FilePath, Path.Combine(root, "compact"));
+    var wire = ReadWirePackage(result.Path);
+    Check((string?)wire["format"] == "trajectory-v2" && result.PointCount == 601);
+    var entries = (JArray)wire["players"]![0]!["points"]!;
+    Check(entries.Count == 1 && entries[0]!.Values<int>().SequenceEqual(new[] { 0, 125, 250, 0, 100, 601 }));
+    Check(((JArray)ReadPackage(result.Path)["players"]![0]!["points"]!).Count == 601);
+    string rejected = Path.Combine(root, "expanded-over-budget");
+    Reject(() => ReplayTrajectoryExporter.ExportWithSmallerLimits(source.FilePath, rejected,
+        ReplayTrajectoryExporter.MaximumCompressedBytes, 3000));
+    Check(!Directory.EnumerateFiles(rejected).Any());
+}));
+int pointRunFixtureIndex = Array.IndexOf(args, "--point-run-fixture-dir");
+if (pointRunFixtureIndex >= 0)
+{
+    if (pointRunFixtureIndex + 1 >= args.Length) throw new ArgumentException("--point-run-fixture-dir needs a directory.");
+    TrajectoryPointRunTests.WriteFixture(args[pointRunFixtureIndex + 1]);
+}
 
 int fixtureIndex = Array.IndexOf(args, "--fixture-dir");
 if (fixtureIndex >= 0)
