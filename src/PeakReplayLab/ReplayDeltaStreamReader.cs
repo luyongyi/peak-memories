@@ -383,14 +383,24 @@ internal static partial class ReplayDeltaCodec
         // created for skipped tracks. The enclosing JSON reader checks syntax.
         private static void SkipValue(ReplayTokenReader json)
         {
+            ValidateSkippedToken(json.TokenType);
             if (json.TokenType is not (JsonToken.StartObject or JsonToken.StartArray)) return;
             int depth = 1;
             while (depth != 0)
             {
                 Read(json);
+                ValidateSkippedToken(json.TokenType);
                 if (json.TokenType is JsonToken.StartObject or JsonToken.StartArray) depth++;
                 else if (json.TokenType is JsonToken.EndObject or JsonToken.EndArray) depth--;
             }
+        }
+        private static void ValidateSkippedToken(JsonToken token)
+        {
+            // JsonTextReader accepts JavaScript extensions such as [1,,2]
+            // (Undefined) and new Date(...). Skipping a visual track must not
+            // turn those malformed replay values into an accepted route.
+            if (token is JsonToken.Undefined or JsonToken.StartConstructor or JsonToken.EndConstructor)
+                throw Error("Invalid JSON value in skipped replay data.");
         }
         private ObjectPatch[] ReadPatches(ReplayTokenReader json, Type type, string identity, int? maximum)
         {

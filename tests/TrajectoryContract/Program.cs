@@ -677,6 +677,8 @@ Test("writer snapshots recording context before external mutation", () => InRoot
     Check(info.Header.RouteContext.Alignment!.Landmarks[0].PositionCm[0] == -200 && info.Header.RouteContext.Alignment.Landmarks[0].Rotation![3] == 1 && info.Header.RouteContext.Alignment.Landmarks[0].Scale![0] == 1);
 }));
 
+TrajectoryProjectionTests.Run(Test);
+
 int fixtureIndex = Array.IndexOf(args, "--fixture-dir");
 if (fixtureIndex >= 0)
 {

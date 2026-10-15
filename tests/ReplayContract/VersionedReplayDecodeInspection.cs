@@ -131,8 +131,14 @@ internal static class VersionedReplayDecodeInspection
                 shared = (IDisposable)Activator.CreateInstance(Type(assembly, "FullReplaySharedScratchPool"), nonPublic: true)!;
                 try
                 {
-                    object loader = archive.GetMethod("CreatePageLoader", BindingFlags.NonPublic | BindingFlags.Static)!
-                        .Invoke(null, new object[] { path, metadata, default(CancellationToken), lines, shared })!;
+                    var factory = archive.GetMethod("CreatePageLoader", BindingFlags.NonPublic | BindingFlags.Static)!;
+                    object[] supplied = { path, metadata, default(CancellationToken), lines, shared };
+                    var parameters = factory.GetParameters();
+                    var arguments = new object[parameters.Length];
+                    for (int i = 0; i < arguments.Length; i++)
+                        arguments[i] = i < supplied.Length ? supplied[i] : parameters[i].IsOptional ? System.Type.Missing :
+                            throw new InvalidOperationException("Reader factory gained an unsupported required parameter.");
+                    object loader = factory.Invoke(null, arguments)!;
                     // Func's return parameter is covariant even when the old
                     // ReplayClip belongs to an isolated assembly load context.
                     Load = (Func<int, CancellationToken, object>)loader;
