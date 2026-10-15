@@ -18,6 +18,8 @@ internal static partial class ReplayDeltaCodec
     internal sealed partial class StreamReader
     {
         private readonly int schema;
+        private readonly bool trajectoryOnly;
+        private readonly ReplayEffectProjection? trajectoryProjection;
         private readonly ReplayRules.VersionValidationMemo versionMemo = new();
         private readonly Func<Type, int, object>? sharedSnapshots;
         private const int MaximumRetainedPatches = 2048;
@@ -63,10 +65,12 @@ internal static partial class ReplayDeltaCodec
         private static readonly Dictionary<PropertyInfo, Action<object, object?>> fieldSetters = FieldSetters();
         private static readonly Func<object, object> cloneModel = ModelCloner();
 
-        internal StreamReader(int schema, Func<Type, int, object>? sharedSnapshots = null)
+        internal StreamReader(int schema, Func<Type, int, object>? sharedSnapshots = null, bool trajectoryOnly = false)
         {
             if (!ReplayRules.SupportedSchema(schema)) throw new ArgumentOutOfRangeException(nameof(schema));
             this.schema = schema;
+            this.trajectoryOnly = trajectoryOnly;
+            trajectoryProjection = trajectoryOnly ? new ReplayEffectProjection(trajectoryOnly: true) : null;
             this.sharedSnapshots = sharedSnapshots;
             actors.patchReader = this; items.patchReader = this; crates.patchReader = this;
             ropes.patchReader = this; effects.patchReader = this; audio.patchReader = this;
@@ -174,6 +178,10 @@ internal static partial class ReplayDeltaCodec
             line != null ? new StringReader(line) : new ReplayRecordTextReader(buffer!, length);
         private ReplayFrame? DecodeRecordCore(string? line, char[]? buffer, int length)
         {
+            // Scan the original syntax, but only materialize route fields. The
+            // fallback remains selective even for escaped names/uncommon JSON.
+            if (trajectoryProjection != null && buffer != null && trajectoryProjection.TryProject(buffer, length))
+            { buffer = trajectoryProjection.Buffer; length = trajectoryProjection.Length; }
             using var input = RecordInput(line, buffer, length);
             using var json = new ReplayJsonTokenReader(new JsonTextReader(input) { MaxDepth = 24, DateParseHandling = DateParseHandling.None, PropertyNameTable = names, ArrayPool = jsonBuffers });
             Read(json); Require(json, JsonToken.StartObject);
@@ -183,17 +191,25 @@ internal static partial class ReplayDeltaCodec
             Read(json);
             if (json.TokenType != JsonToken.PropertyName || json.TextValue != "Type")
             {
-                using var fallbackInput = RecordInput(line, buffer, length);
-                using var fallback = new JsonTextReader(fallbackInput) { MaxDepth = 24, DateParseHandling = DateParseHandling.None, ArrayPool = jsonBuffers };
-                var token = JObject.Load(fallback, new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
-                if (fallback.Read()) throw Error("Multiple JSON values in one record.");
-                if ((string?)token["Type"] == "end") return null;
+                if (trajectoryOnly)
+                {
+                    if (TrajectoryRecordType(line, buffer, length) == "end") return null;
+                }
+                else
+                {
+                    using var fallbackInput = RecordInput(line, buffer, length);
+                    using var fallback = new JsonTextReader(fallbackInput) { MaxDepth = 24, DateParseHandling = DateParseHandling.None, ArrayPool = jsonBuffers };
+                    var token = JObject.Load(fallback, new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
+                    if (fallback.Read()) throw Error("Multiple JSON values in one record.");
+                    if ((string?)token["Type"] == "end") return null;
+                }
             }
             else
             {
                 Read(json);
                 if (json.TokenType == JsonToken.String && json.TextValue == "end")
                 {
+                    if (trajectoryOnly) { TrajectoryRecordType(line, buffer, length); return null; }
                     using var footerInput = RecordInput(line, buffer, length);
                     using var footer = new JsonTextReader(footerInput) { MaxDepth = 24, DateParseHandling = DateParseHandling.None, ArrayPool = jsonBuffers };
                     JObject.Load(footer, new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
@@ -216,6 +232,8 @@ internal static partial class ReplayDeltaCodec
                 ulong bit = 1UL << index;
                 if ((seen & bit) != 0) throw Error("Duplicate frame field.");
                 seen |= bit;
+                if (trajectoryOnly && index is not (0 or 1 or 2 or 3 or 4 or 14 or 23 or 35 or 36))
+                { SkipValue(frameJson); continue; }
                 values[index] = index switch
                 {
                     0 => Text(frameJson), 1 => Number(frameJson), 2 => Boolean(frameJson),
@@ -242,6 +260,14 @@ internal static partial class ReplayDeltaCodec
             if (world == null && !full) throw Error("First frame requires a complete baseline.");
             if (values[37] != null && !full) throw Error("Static creature directories require a full page baseline.");
             world = (WorldFrame)ApplyPatch(values[3] as ObjectPatch ?? throw Error("Missing world patch."), full ? null : world);
+            if (trajectoryOnly)
+                return new ReplayFrame
+                {
+                    T = time, World = world,
+                    SceneSampleTimeKnown = schema >= 22 ? values[35] is bool routeClockKnown ? routeClockKnown : throw Error("Missing scene clock knowledge.") : false,
+                    SceneSampleTime = schema >= 22 ? values[36] is double routeSceneTime ? routeSceneTime : throw Error("Missing scene observation clock.") : 0,
+                    Actors = actors.Decode(values[4], values[14], values[23], full),
+                };
             var result = new ReplayFrame
             {
                 T = time, World = world,
@@ -261,6 +287,22 @@ internal static partial class ReplayDeltaCodec
             };
             ReplayRules.ValidateVersion(result, schema, versionMemo);
             return result;
+        }
+
+        private string? TrajectoryRecordType(string? line, char[]? buffer, int length)
+        {
+            using var input = RecordInput(line, buffer, length);
+            using var json = new ReplayJsonTokenReader(new JsonTextReader(input)
+            { MaxDepth = 24, DateParseHandling = DateParseHandling.None, ArrayPool = jsonBuffers });
+            Read(json); Require(json, JsonToken.StartObject);
+            var seen = new HashSet<string>(StringComparer.Ordinal); string? type = null;
+            while (NextProperty(json, out string name))
+            {
+                if (!seen.Add(name)) throw Error("Duplicate frame field.");
+                if (name == "Type") type = Text(json); else SkipValue(json);
+            }
+            if (json.Read()) throw Error("Multiple JSON values in one record.");
+            return type;
         }
 
         private string[] ReadOrder(ReplayTokenReader json, int? maximum)
@@ -313,19 +355,42 @@ internal static partial class ReplayDeltaCodec
                 if ((result.Seen & bit) != 0) throw Error("Duplicate delta field.");
                 result.Seen |= bit;
                 PropertyInfo field = fields[index];
+                if (trajectoryOnly && !TrajectoryField(type, name))
+                { SkipValue(json); continue; }
                 object? value = ReadField(json, type, field);
                 if (name == identity) result.Key = (string?)value;
                 result.Fields.Add(new FieldValue(field, value));
             }
             if (sharedSeen)
             {
-                if (result.Fields.Count != 0 || fullSeen) throw Error("Shared snapshot reference cannot contain entity fields.");
+                if (result.Seen != 0 || fullSeen) throw Error("Shared snapshot reference cannot contain entity fields.");
                 object snapshot = sharedSnapshots!(type, sharedId);
                 if (snapshot == null || snapshot.GetType() != type) throw Error("Shared snapshot type mismatch.");
                 result.ResolvedSnapshot = snapshot; result.Full = true;
                 result.Key = (string?)fields[indices[identity!]].GetValue(snapshot);
             }
             return result;
+        }
+
+        private static bool TrajectoryField(Type type, string name) =>
+            type == typeof(WorldFrame) ? name == nameof(WorldFrame.Segment) :
+            type == typeof(ActorFrame) ? name is nameof(ActorFrame.Id) or nameof(ActorFrame.Name) or nameof(ActorFrame.Position)
+                or nameof(ActorFrame.Appearance) or nameof(ActorFrame.RouteState) :
+            type == typeof(Appearance) ? name == nameof(Appearance.EyeState) :
+            type == typeof(ActorRouteState);
+
+        // No object trees, binary joint unpacking or shared references are
+        // created for skipped tracks. The enclosing JSON reader checks syntax.
+        private static void SkipValue(ReplayTokenReader json)
+        {
+            if (json.TokenType is not (JsonToken.StartObject or JsonToken.StartArray)) return;
+            int depth = 1;
+            while (depth != 0)
+            {
+                Read(json);
+                if (json.TokenType is JsonToken.StartObject or JsonToken.StartArray) depth++;
+                else if (json.TokenType is JsonToken.EndObject or JsonToken.EndArray) depth--;
+            }
         }
         private ObjectPatch[] ReadPatches(ReplayTokenReader json, Type type, string identity, int? maximum)
         {
@@ -582,6 +647,10 @@ internal static partial class ReplayDeltaCodec
             Type type = patch.Type;
             if (patch.ResolvedSnapshot != null) return patch.ResolvedSnapshot;
             if (old != null && patch.Fields.Count == 0) return old;
+            // A joint-only actor update still contains Id. Hold the projected
+            // actor instead of cloning it for irrelevant 60 Hz animation patches.
+            if (trajectoryOnly && old is ActorFrame prior && patch.Fields.Count == 1 &&
+                patch.Fields[0].Field.Name == nameof(ActorFrame.Id) && patch.Key == prior.Id) return prior;
             if (old == null && schema >= 20 && type == typeof(CreatureReplayFrame))
             {
                 var indices = fieldIndices[type];
@@ -611,6 +680,9 @@ internal static partial class ReplayDeltaCodec
             // Only schema-forbidden and documented optional fields keep defaults.
             // Prototype arrays are never mutated or exposed.
             object result = cloneModel(old ?? defaultModels[type]);
+            // Do not charge the projected frame for a default action string
+            // that can be longer than the source's valid empty/short action.
+            if (trajectoryOnly && old == null && result is ActorFrame routeActor) routeActor.Action = "";
             foreach (var entry in patch.Fields)
             {
                 var field = entry.Field; object? value = entry.Value;

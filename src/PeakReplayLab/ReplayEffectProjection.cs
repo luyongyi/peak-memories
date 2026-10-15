@@ -2,17 +2,21 @@ using System;
 
 namespace PeakReplayLab;
 
-// Page-local scratch for the existing effects parser. This is only a lexical
-// fast path: the ordinary parser still validates identities, duplicates, schema
-// and effect patch semantics. Any syntax outside this conservative JSON subset
+// Page-local scratch for selective replay readers. This is only a lexical
+// fast path: the consuming parser still validates identities, duplicates, schema
+// and retained patch semantics. Any syntax outside this conservative JSON subset
 // must be parsed from the untouched original record instead.
 internal sealed class ReplayEffectProjection
 {
     private const int MaximumDepth = 24;
+    private enum Scope { Frame, World, Actor, Appearance }
+    private readonly bool trajectoryOnly;
     private char[] source = Array.Empty<char>();
     private int position, sourceLength, written;
     internal char[] Buffer { get; private set; } = new char[4096];
     internal int Length { get; private set; }
+
+    internal ReplayEffectProjection(bool trajectoryOnly = false) => this.trajectoryOnly = trajectoryOnly;
 
     internal bool TryProject(char[] input, int length)
     {
@@ -23,7 +27,7 @@ internal sealed class ReplayEffectProjection
         try
         {
             WhiteSpace();
-            if (!ProjectObject(world: false, depth: 1)) return false;
+            if (!ProjectObject(Scope.Frame, depth: 1)) return false;
             WhiteSpace();
             if (position != sourceLength) return false;
             Length = written; return true;
@@ -31,7 +35,7 @@ internal sealed class ReplayEffectProjection
         finally { source = Array.Empty<char>(); }
     }
 
-    private bool ProjectObject(bool world, int depth)
+    private bool ProjectObject(Scope scope, int depth)
     {
         if (depth > MaximumDepth || !Take('{') || !Write('{')) return false;
         WhiteSpace();
@@ -44,23 +48,57 @@ internal sealed class ReplayEffectProjection
             WhiteSpace();
             if (!Take(':') || !Copy(nameStart, nameEnd - nameStart) || !Write(':')) return false;
             WhiteSpace();
-            if (!world && NameIs(nameStart, nameEnd, "World"))
+            if (scope == Scope.Frame && NameIs(nameStart, nameEnd, "World"))
             {
-                if (!ProjectObject(world: true, depth: depth + 1)) return false;
+                if (!ProjectObject(Scope.World, depth: depth + 1)) return false;
+            }
+            else if (trajectoryOnly && scope == Scope.Frame && NameIs(nameStart, nameEnd, "Actors"))
+            {
+                if (!ProjectActors(depth + 1)) return false;
+            }
+            else if (trajectoryOnly && scope == Scope.Actor && NameIs(nameStart, nameEnd, "Appearance"))
+            {
+                if (!ProjectObject(Scope.Appearance, depth: depth + 1)) return false;
             }
             else
             {
-                bool keep = world ? NameIs(nameStart, nameEnd, "ActiveMapObjects") || NameIs(nameStart, nameEnd, "Segment") :
-                    NameIs(nameStart, nameEnd, "Type") || NameIs(nameStart, nameEnd, "T") ||
-                    NameIs(nameStart, nameEnd, "SceneSampleTimeKnown") || NameIs(nameStart, nameEnd, "SceneSampleTime") ||
-                    NameIs(nameStart, nameEnd, "ObjectsFull") || NameIs(nameStart, nameEnd, "Effects") ||
-                    NameIs(nameStart, nameEnd, "RemovedEffects") || NameIs(nameStart, nameEnd, "EffectOrder");
+                bool keep = Keep(scope, nameStart, nameEnd);
                 int valueStart = position;
                 if (!Value(depth)) return false;
                 if (keep ? !Copy(valueStart, position - valueStart) : !Null()) return false;
             }
             WhiteSpace();
             if (Take('}')) return Write('}');
+            if (!Take(',') || !Write(',')) return false;
+            WhiteSpace();
+        }
+    }
+
+    private bool Keep(Scope scope, int start, int end)
+    {
+        if (scope == Scope.World)
+            return NameIs(start, end, "Segment") || !trajectoryOnly && NameIs(start, end, "ActiveMapObjects");
+        if (scope == Scope.Actor)
+            return NameIs(start, end, "Id") || NameIs(start, end, "Name") || NameIs(start, end, "Full") ||
+                NameIs(start, end, "Position") || NameIs(start, end, "RouteState");
+        if (scope == Scope.Appearance) return NameIs(start, end, "EyeState");
+        return NameIs(start, end, "Type") || NameIs(start, end, "T") || NameIs(start, end, "ObjectsFull") ||
+            NameIs(start, end, "SceneSampleTimeKnown") || NameIs(start, end, "SceneSampleTime") ||
+            (trajectoryOnly
+                ? NameIs(start, end, "RemovedActors") || NameIs(start, end, "ActorOrder")
+                : NameIs(start, end, "Effects") || NameIs(start, end, "RemovedEffects") || NameIs(start, end, "EffectOrder"));
+    }
+
+    private bool ProjectActors(int depth)
+    {
+        if (depth > MaximumDepth || !Take('[') || !Write('[')) return false;
+        WhiteSpace();
+        if (Take(']')) return Write(']');
+        while (true)
+        {
+            if (!ProjectObject(Scope.Actor, depth + 1)) return false;
+            WhiteSpace();
+            if (Take(']')) return Write(']');
             if (!Take(',') || !Write(',')) return false;
             WhiteSpace();
         }

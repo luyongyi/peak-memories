@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.33";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.34";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
@@ -333,6 +333,30 @@ public static class ReplayRules
         memo?.Visuals.Add(visuals);
     }
 
+    // Trajectory projection deliberately has no visual/inventory/environment
+    // payload. Validate every field consumed by export without pretending the
+    // discarded tracks were decoded or certified as a playable recording.
+    internal static void ValidateTrajectoryStored(ReplayFrame frame, double previous, double maximumStoredTime)
+    {
+        if (frame.Type != "frame" || !Finite(frame.T) || frame.T < 0 || frame.T <= previous || frame.T > maximumStoredTime ||
+            frame.World == null || frame.World.Segment < 0 || frame.World.Segment > 10 || frame.Actors == null)
+            throw new InvalidDataException("Invalid trajectory frame time or world stage.");
+        if (!Finite(frame.SceneSampleTime) || Math.Abs(frame.SceneSampleTime) > 1_000_000 ||
+            !frame.SceneSampleTimeKnown && frame.SceneSampleTime != 0 ||
+            frame.SceneSampleTimeKnown && frame.SceneSampleTime > frame.T + .000001)
+            throw new InvalidDataException("Invalid scene observation clock.");
+        var ids = objectKeys ??= new HashSet<string>(StringComparer.Ordinal); ids.Clear();
+        foreach (var actor in frame.Actors)
+        {
+            if (actor == null || string.IsNullOrWhiteSpace(actor.Id) || actor.Id.Length > 256 ||
+                actor.Name == null || actor.Name.Length > 256 || !Vector(actor.Position, 3) ||
+                actor.Appearance == null || actor.Appearance.EyeState < 0 || actor.Appearance.EyeState > 2 || !ids.Add(actor.Id))
+                throw new InvalidDataException("Invalid trajectory actor.");
+            ReplayRouteRules.Validate(actor.RouteState, frame.T);
+        }
+        ids.Clear();
+    }
+
     private static void ValidateFrame(ReplayFrame frame, double previous, bool capture, ValidationMemo? memo = null, double maximumStoredTime = 121)
     {
         if (!Finite(maximumStoredTime) || maximumStoredTime < 1 || maximumStoredTime > 4 * 60 * 60)
@@ -577,14 +601,15 @@ public static class ReplayFiles
 
     internal static ReplayClip ReadBuffered(TextReader reader, ReplayLineBufferPool buffers,
         System.Threading.CancellationToken cancellation, bool effectsOnly, long decodedByteLimit, double maximumStoredTime,
-        Func<Type, int, object>? sharedSnapshots = null)
-        => ReadCore(reader, cancellation, true, decodedByteLimit, maximumStoredTime, effectsOnly, buffers, sharedSnapshots);
+        Func<Type, int, object>? sharedSnapshots = null, bool trajectoryOnly = false)
+        => ReadCore(reader, cancellation, true, decodedByteLimit, maximumStoredTime, effectsOnly, buffers, sharedSnapshots, trajectoryOnly);
 
     private static ReplayClip ReadCore(TextReader reader, System.Threading.CancellationToken cancellation,
         bool allowSingleFrame, long decodedByteLimit, double maximumStoredTime, bool effectsOnly, ReplayLineBufferPool? buffers = null,
-        Func<Type, int, object>? sharedSnapshots = null)
+        Func<Type, int, object>? sharedSnapshots = null, bool trajectoryOnly = false)
     {
         if (reader == null) throw new ArgumentNullException(nameof(reader));
+        if (effectsOnly && trajectoryOnly) throw new ArgumentException("Conflicting replay projections.");
         if (decodedByteLimit < 1 || decodedByteLimit > ReplayRules.MaxBytes)
             throw new ArgumentOutOfRangeException(nameof(decodedByteLimit));
         if (!ReplayRules.Finite(maximumStoredTime) || maximumStoredTime < 1 || maximumStoredTime > 4 * 60 * 60)
@@ -609,7 +634,7 @@ public static class ReplayFiles
         var decodedCreatures = new HashSet<CreatureReplayFrame>();
         var decodedInteractions = new HashSet<InteractionReplayFrame>();
         var validation = new ReplayRules.ValidationMemo();
-        var fieldDeltas = effectsOnly ? null : new ReplayDeltaCodec.StreamReader(replay.Header.Schema, sharedSnapshots);
+        var fieldDeltas = effectsOnly ? null : new ReplayDeltaCodec.StreamReader(replay.Header.Schema, sharedSnapshots, trajectoryOnly);
         var effectDeltas = effectsOnly ? new ReplayDeltaCodec.EffectReader(replay.Header.Schema) : null;
         var effectJsonBuffers = effectsOnly ? new ReplayJsonBufferPool() : null;
         var effectProjection = effectsOnly ? new ReplayEffectProjection() : null;
@@ -636,8 +661,12 @@ public static class ReplayFiles
                 catch (OverflowException e) { throw new InvalidDataException("Delta number outside range.", e); }
             }
             if (frame == null) { replay.Complete = true; continue; }
-            ReplayRules.ValidateStored(frame, previous, validation, maximumStoredTime);
-            ReplayRules.ValidateVersion(frame, replay.Header.Schema, validation.Version);
+            if (trajectoryOnly) ReplayRules.ValidateTrajectoryStored(frame, previous, maximumStoredTime);
+            else
+            {
+                ReplayRules.ValidateStored(frame, previous, validation, maximumStoredTime);
+                ReplayRules.ValidateVersion(frame, replay.Header.Schema, validation.Version);
+            }
             decodedBytes += RollingBuffer.EstimateFrame(frame);
             foreach (var item in frame.Items) if (decodedItems.Add(item)) decodedBytes += RollingBuffer.Estimate(item);
             foreach (var crate in frame.Crates) if (decodedCrates.Add(crate)) decodedBytes += RollingBuffer.Estimate(crate);
@@ -654,7 +683,7 @@ public static class ReplayFiles
                 if (e.Sequence <= previousEventSequence || e.T < previousEventTime) throw new InvalidDataException("Item events are not ordered.");
                 previousEventSequence = e.Sequence; previousEventTime = e.T;
             }
-            if (frame.World.ActiveMapObjects.Length != replay.Header.MapObjects.Length) throw new InvalidDataException("Map state shape changed.");
+            if (!trajectoryOnly && frame.World.ActiveMapObjects.Length != replay.Header.MapObjects.Length) throw new InvalidDataException("Map state shape changed.");
             if (replay.Frames.Count >= ReplayRules.MaxFrames) throw new InvalidDataException("Too many replay frames.");
             replay.Frames.Add(frame);
             previous = frame.T;

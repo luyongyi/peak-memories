@@ -160,7 +160,7 @@ public static class ReplayTrajectoryExporter
         // revalidates caller-mutable metadata, which is quadratic for this scan.
         using var lineBuffers = new ReplayLineBufferPool();
         using var sharedBuffers = new FullReplaySharedScratchPool();
-        var loadPage = FullReplayArchive.CreatePageLoader(recordingPath, info, cancellation, lineBuffers, sharedBuffers);
+        var loadPage = FullReplayArchive.CreatePageLoader(recordingPath, info, cancellation, lineBuffers, sharedBuffers, trajectoryOnly: true);
         int workers = Math.Max(1, Math.Min(MaximumDecodeWorkers, Environment.ProcessorCount - 1));
         void Read(Action<ReplayFrame> observe, bool metadata)
         {

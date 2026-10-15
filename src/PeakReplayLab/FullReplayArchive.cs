@@ -104,7 +104,7 @@ public static partial class FullReplayArchive
     // the recording instead of walking thousands of unrelated page entries on
     // every seek. Public ReadPage still validates caller-mutable metadata.
     internal static Func<int, CancellationToken, ReplayClip> CreatePageLoader(string path, FullReplayInfo info, CancellationToken cancellation = default,
-        ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null)
+        ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null, bool trajectoryOnly = false)
     {
         if (info == null) throw new ArgumentNullException(nameof(info));
         cancellation.ThrowIfCancellationRequested();
@@ -119,7 +119,7 @@ public static partial class FullReplayArchive
         cancellation.ThrowIfCancellationRequested();
         buffers ??= new ReplayLineBufferPool();
         sharedBuffers ??= new FullReplaySharedScratchPool();
-        return (index, token) => ReadPageCore(fullPath, snapshot, header, actorIds, index, token, buffers: buffers, sharedBuffers: sharedBuffers);
+        return (index, token) => ReadPageCore(fullPath, snapshot, header, actorIds, index, token, buffers: buffers, sharedBuffers: sharedBuffers, trajectoryOnly: trajectoryOnly);
     }
 
     // The playback source already owns immutable validated metadata. Legacy
@@ -135,7 +135,8 @@ public static partial class FullReplayArchive
     }
 
     private static ReplayClip ReadPageCore(string fullPath, FullReplayInfo info, JObject expectedHeader, HashSet<string> actorIds,
-        int pageIndex, CancellationToken cancellation, bool effectsOnly = false, ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null)
+        int pageIndex, CancellationToken cancellation, bool effectsOnly = false, ReplayLineBufferPool? buffers = null, FullReplaySharedScratchPool? sharedBuffers = null,
+        bool trajectoryOnly = false)
     {
         cancellation.ThrowIfCancellationRequested();
         if (pageIndex < 0 || pageIndex >= info.Pages.Length) throw new ArgumentOutOfRangeException(nameof(pageIndex));
@@ -153,13 +154,34 @@ public static partial class FullReplayArchive
         using var gzip = new GZipStream(slice, CompressionMode.Decompress, true);
         using var raw = new CheckedRawStream(gzip, page.RawBytes, cancellation);
         using var reader = new StreamReader(raw, Utf8, false, 8192, true);
-        using var shared = info.Version >= 3 && page.SharedThrough > 0 && !effectsOnly ? new SharedSnapshotReader(fullPath, info, page.SharedThrough, cancellation, sharedBuffers) : null;
-        var clip = buffers != null || shared != null
-            ? ReplayFiles.ReadBuffered(reader, buffers ?? new ReplayLineBufferPool(), cancellation, effectsOnly, MaximumPageDecodedBytes, MaximumDuration,
-                shared == null ? null : new Func<Type, int, object>(shared.Resolve))
-            : effectsOnly
-            ? ReplayFiles.ReadEffects(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration)
-            : ReplayFiles.Read(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration);
+        bool hasShared = info.Version >= 3 && page.SharedThrough > 0 && !effectsOnly;
+        using var shared = hasShared && !trajectoryOnly ? new SharedSnapshotReader(fullPath, info, page.SharedThrough, cancellation, sharedBuffers) : null;
+        SharedSnapshotReader? routeShared = null;
+        object ResolveShared(Type type, int id)
+        {
+            // ActorOrder is the sole route dependency in shared storage. Never
+            // inflate visual, creature or joint blocks during trajectory export.
+            if (trajectoryOnly)
+            {
+                if (type != typeof(string[])) throw Invalid("Invalid trajectory shared dependency.");
+                // Most pages have inline player order. Avoid another file,
+                // decoder and scratch lease until a real order reference appears.
+                routeShared ??= new SharedSnapshotReader(fullPath, info, page.SharedThrough, cancellation, sharedBuffers);
+                return routeShared.Resolve(type, id);
+            }
+            return shared!.Resolve(type, id);
+        }
+        ReplayClip clip;
+        try
+        {
+            clip = buffers != null || hasShared || trajectoryOnly
+                ? ReplayFiles.ReadBuffered(reader, buffers ?? new ReplayLineBufferPool(), cancellation, effectsOnly, MaximumPageDecodedBytes, MaximumDuration,
+                    hasShared ? new Func<Type, int, object>(ResolveShared) : null, trajectoryOnly)
+                : effectsOnly
+                ? ReplayFiles.ReadEffects(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration)
+                : ReplayFiles.Read(reader, cancellation, allowSingleFrame: true, decodedByteLimit: MaximumPageDecodedBytes, maximumStoredTime: MaximumDuration);
+        }
+        finally { routeShared?.Dispose(); }
         if (raw.BytesRead != page.RawBytes || raw.Crc != expectedCrc || slice.Remaining != 0)
             throw Invalid("Full replay page bytes do not match its index.");
         if (!clip.Complete || clip.Frames.Count != page.FrameCount || Math.Abs(clip.Frames[0].T - page.Start) > .000001 ||
