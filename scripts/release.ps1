@@ -186,7 +186,19 @@ try {
     }
     $currentSchema = [int] [regex]::Match($dataText, 'CurrentSchema\s*=\s*(\d+)').Groups[1].Value
     $schemaExpression = [regex]::Match($dataText, 'SupportedSchema\(int schema\)\s*=>\s*([^;]+);').Groups[1].Value
-    $supportedSchemas = @(@([regex]::Matches($schemaExpression, 'schema\s*==\s*(\d+)') | ForEach-Object { [int] $_.Groups[1].Value }) + $currentSchema | Sort-Object -Unique)
+    $schemaRange = [regex]::Match($schemaExpression.Trim(), '\Aschema\s*>=\s*([0-9]+)\s*&&\s*schema\s*<=\s*CurrentSchema\z')
+    if ($schemaRange.Success) {
+        $firstSchema = [int] $schemaRange.Groups[1].Value
+        if ($firstSchema -le 0 -or $currentSchema -lt $firstSchema -or $currentSchema -gt 1024) { throw 'Invalid replay schema range.' }
+        $supportedSchemas = @($firstSchema..$currentSchema)
+    } else {
+        $schemaTerms = @($schemaExpression.Split('||', [StringSplitOptions]::None))
+        $supportedSchemas = @(foreach ($term in $schemaTerms) {
+            $schemaTerm = [regex]::Match($term.Trim(), '\Aschema\s*==\s*(CurrentSchema|[0-9]+)\z')
+            if (-not $schemaTerm.Success) { throw 'Unsupported replay schema expression.' }
+            if ($schemaTerm.Groups[1].Value -ceq 'CurrentSchema') { $currentSchema } else { [int] $schemaTerm.Groups[1].Value }
+        }) | Sort-Object -Unique
+    }
     if ($currentSchema -le 0 -or $supportedSchemas.Count -eq 0) { throw 'Replay schema declarations were not found.' }
     $GameRoot = [System.IO.Path]::GetFullPath($GameRoot).TrimEnd('/', '\')
     $managedDir = Join-Path $GameRoot 'PEAK_Data/Managed'
@@ -214,6 +226,9 @@ try {
     foreach ($name in $projects) {
         Invoke-Checked dotnet @('run', '--project', "tests/$name/$name.csproj", '-c', 'Release', '--no-build')
     }
+    # Keep the original manifest contract list compatible with older releases;
+    # the new upload cache has an additional mandatory independent check.
+    Invoke-Checked dotnet @('run', '--project', 'tests/TrajectoryCacheContract/TrajectoryCacheContract.csproj', '-c', 'Release')
     Invoke-Checked dotnet @('build', 'tools/ReleaseVerifier/ReleaseVerifier.csproj', '-c', 'Release', '--nologo', '-warnaserror')
     $script:verifierDll = Join-Path $repoRoot 'artifacts/bin/ReleaseVerifier/release/ReleaseVerifier.dll'
     Invoke-Checked dotnet @($script:verifierDll, 'self-test')

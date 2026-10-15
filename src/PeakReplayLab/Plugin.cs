@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.35")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.36")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {
@@ -82,7 +82,7 @@ public sealed partial class Plugin : BaseUnityPlugin
                 }),
                 mode => Guard(() => SetRecordingMode(mode)), () => theatre.Close(),
                 RequestReplayDeletion, ConfirmReplayDeletion, CancelReplayDeletion,
-                RequestRouteExport, ConfirmRouteUpload, CancelRouteUpload, OpenRouteWebsite);
+                RequestRouteExport, ConfirmRouteUpload, CancelRouteUpload, OpenRouteWebsite, ForceRouteReupload);
         }
         catch (Exception e) { disabledByError = true; Logger.LogError(e); Note("回放保护未能安装，已停用新回放功能；原足迹 Mod 不受影响。"); }
         SceneManager.activeSceneChanged += SceneChanged;
@@ -170,7 +170,7 @@ public sealed partial class Plugin : BaseUnityPlugin
             CanManage = CanManageRecordings, Managing = LibraryManagementBusy || RouteUploadBusy,
             CanUpload = FileManagementAllowed && !LibraryManagementBusy,
             RouteExporting = routeExport != null, RouteSending = routeSending != null,
-            RouteReady = routePackage != null, RouteFinished = routeFinished,
+            RouteReady = routePackage != null, RouteFinished = routeFinished, RouteCacheHit = routeCacheHit,
             RouteSummary = routeSummary, RouteError = routeError, RouteProgress = VolatileRouteProgress(),
             DeletePreparing = preparingDeletion != null, DeleteMoving = movingDeletion != null,
             DeleteReady = CanConfirmDeletion, DeleteError = deletionError,

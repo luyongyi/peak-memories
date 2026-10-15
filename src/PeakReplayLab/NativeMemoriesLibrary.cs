@@ -26,7 +26,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
         public string DeleteError = "";
         public MemoriesLibraryItem? DeleteItem;
         public long DeleteBytes;
-        public bool CanUpload, RouteExporting, RouteSending, RouteReady, RouteFinished;
+        public bool CanUpload, RouteExporting, RouteSending, RouteReady, RouteFinished, RouteCacheHit;
         public string RouteSummary = "", RouteError = "";
         public float RouteProgress;
     }
@@ -60,7 +60,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     private readonly Func<string, bool> requestDelete;
     private readonly Action confirmDelete, cancelDelete;
     private readonly Func<string, bool> prepareRoute;
-    private readonly Action uploadRoute, cancelRoute, openRoutes;
+    private readonly Action uploadRoute, cancelRoute, openRoutes, reuploadRoute;
     private readonly List<Button[]> navigationRows = new();
     private readonly NativeMemoriesCoverArt covers = new();
     private State state = new();
@@ -83,12 +83,12 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     public NativeMemoriesLibrary(Action close, Action refresh, Action openFolder, Action<bool> chooseCollection,
         Action<string> play, Action<ReplayRecordingMode> chooseMode, Action cancelLoading,
         Func<string, bool> requestDelete, Action confirmDelete, Action cancelDelete,
-        Func<string, bool> prepareRoute, Action uploadRoute, Action cancelRoute, Action openRoutes)
+        Func<string, bool> prepareRoute, Action uploadRoute, Action cancelRoute, Action openRoutes, Action reuploadRoute)
     {
         this.close = close; this.refresh = refresh; this.openFolder = openFolder; this.chooseCollection = chooseCollection;
         this.play = play; this.chooseMode = chooseMode; this.cancelLoading = cancelLoading;
         this.requestDelete = requestDelete; this.confirmDelete = confirmDelete; this.cancelDelete = cancelDelete;
-        this.prepareRoute = prepareRoute; this.uploadRoute = uploadRoute; this.cancelRoute = cancelRoute; this.openRoutes = openRoutes;
+        this.prepareRoute = prepareRoute; this.uploadRoute = uploadRoute; this.cancelRoute = cancelRoute; this.openRoutes = openRoutes; this.reuploadRoute = reuploadRoute;
     }
 
     public bool CanOpen => !Modal.IsOpen || OwnsModal;
@@ -128,7 +128,7 @@ internal sealed class NativeMemoriesLibrary : IDisposable
             next.DeleteMoving != state.DeleteMoving || next.DeleteReady != state.DeleteReady || next.DeleteError != state.DeleteError ||
             next.DeleteItem != state.DeleteItem || next.DeleteBytes != state.DeleteBytes ||
             next.CanUpload != state.CanUpload || next.RouteExporting != state.RouteExporting || next.RouteSending != state.RouteSending ||
-            next.RouteReady != state.RouteReady || next.RouteFinished != state.RouteFinished || next.RouteError != state.RouteError)
+            next.RouteReady != state.RouteReady || next.RouteFinished != state.RouteFinished || next.RouteCacheHit != state.RouteCacheHit || next.RouteError != state.RouteError)
             dirty = true;
         state = next;
         if (page == Page.Routes && routeText) routeText!.text = RouteDescription();
@@ -327,7 +327,10 @@ internal sealed class NativeMemoriesLibrary : IDisposable
     {
         routeText = Label(parent, RouteDescription(), 400, 26);
         if (state.RouteFinished)
+        {
             Row(parent, 62, ("打开地图网站", openRoutes, true));
+            if (state.RouteCacheHit) Row(parent, 62, ("重新上传", reuploadRoute, state.CanUpload));
+        }
         else
             Row(parent, 62, (state.RouteExporting ? "正在筛选…" : state.RouteSending ? "正在上传…" :
                 state.RouteError.Length > 0 && state.RouteReady ? "重试上传" : "确认上传到 Web", uploadRoute,

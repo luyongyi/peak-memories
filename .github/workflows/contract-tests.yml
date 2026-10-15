@@ -30,6 +30,7 @@ jobs:
           - ReplayAudioSpatialContract
           - TrajectoryContract
           - TrajectoryUploadContract
+          - TrajectoryCacheContract
           - StaticPlaybackContract
           - NativeSpiderIdleLineContract
           - ActorNetworkContract

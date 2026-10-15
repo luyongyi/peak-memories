@@ -211,7 +211,15 @@ internal static class Verifier
         Require(plugin == version && recorder == version, "Plugin or Recorder version disagrees with release.");
         int current = int.Parse(Match(data, "\\bconst\\s+int\\s+CurrentSchema\\s*=\\s*([0-9]+)\\s*;", "CurrentSchema"));
         string supported = Match(data, "\\bSupportedSchema\\s*\\(\\s*int\\s+schema\\s*\\)\\s*=>\\s*([^;]+);", "SupportedSchema");
-        var schemas = supported.Split("||").Select(expression =>
+        var range = Regex.Match(supported.Trim(), @"\Aschema\s*>=\s*([0-9]+)\s*&&\s*schema\s*<=\s*CurrentSchema\z");
+        int[] schemas;
+        if (range.Success)
+        {
+            int first = int.Parse(range.Groups[1].Value);
+            Require(first > 0 && current >= first && current <= 1024, "Invalid source replay schema range.");
+            schemas = Enumerable.Range(first, current - first + 1).ToArray();
+        }
+        else schemas = supported.Split("||").Select(expression =>
         {
             var match = Regex.Match(expression.Trim(), "\\Aschema\\s*==\\s*(CurrentSchema|[0-9]+)\\z");
             Require(match.Success, "Unsupported SupportedSchema expression; update release verifier.");

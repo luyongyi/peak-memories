@@ -15,16 +15,25 @@ public sealed partial class Plugin
 {
     private ConfigEntry<string> routeUploadEndpoint = null!;
     private CancellationTokenSource? routeCancellation;
-    private Task<TrajectoryExportResult>? routeExport;
+    private Task<RoutePreparation>? routeExport;
     private Task<TrajectoryUploadReceipt>? routeSending;
     private TrajectoryExportResult? routePackage;
+    private TrajectoryUploadCacheSession? routeCache;
+    private bool routeCacheHit;
+    private string? routeSourcePath;
+    private sealed class RoutePreparation
+    {
+        public TrajectoryExportResult? Package;
+        public TrajectoryUploadCacheSession? Cache;
+        public TrajectoryUploadReceipt? CachedReceipt;
+    }
     private Uri? routeDestination;
     private string routeSummary = "", routeError = "";
     private bool routeFinished;
     private sealed class RouteProgress { public float Value; public int UploadedParts; public int TotalParts; }
     private RouteProgress routeProgress = new();
     private int routeDisplayedParts = -1;
-    private bool RouteUploadBusy => routeExport != null || routeSending != null || routePackage != null;
+    private bool RouteUploadBusy => routeExport != null || routeSending != null || routePackage != null || routeFinished || routeCacheHit;
     private float VolatileRouteProgress() => Volatile.Read(ref routeProgress.Value);
     private string RouteExportDirectory => Path.Combine(Paths.BepInExRootPath, "PeakReplayLab", "TrajectoryExports");
 
@@ -32,6 +41,9 @@ public sealed partial class Plugin
         "https://peak.mylus.cn/api/route-uploads", "Optional manual trajectory upload from sealed continuous .peakrun recordings only. Export at most 10Hz cm coordinates and names; never uploads replay files. HTTPS required except loopback development.");
 
     private bool RequestRouteExport(string path)
+        => RequestRouteExportCore(path, false);
+
+    private bool RequestRouteExportCore(string path, bool force)
     {
         if (!FileManagementAllowed || LibraryManagementBusy || !library || RouteUploadBusy)
         { Note("请在主菜单等录像读取、保存或回放结束，再上传轨迹。"); return false; }
@@ -45,17 +57,41 @@ public sealed partial class Plugin
             routeCancellation = new CancellationTokenSource();
             var cancellation = routeCancellation.Token;
             string output = RouteExportDirectory;
-            routePackage = null; routeFinished = false; routeError = "";
+            routeSourcePath = Path.GetFullPath(path);
+            routePackage = null; routeCache = null; routeCacheHit = false; routeFinished = false; routeError = "";
             var progressState = new RouteProgress();
             routeProgress = progressState;
-            routeSummary = "正在从完整录像筛选轨迹…\n最多 10 Hz · 厘米坐标 · 不上传录像本体";
-            routeExport = Task.Run(() => ReplayTrajectoryExporter.Export(path, output, cancellation,
-                progress => Volatile.Write(ref progressState.Value, (float)progress)), cancellation);
+            routeSummary = force ? "正在重新准备这份录像的轨迹…" : "正在核对这份录像的上传记录…";
+            var destination = routeDestination!;
+            routeExport = Task.Run(() =>
+            {
+                var cache = TrajectoryUploadCache.Open(output, path, destination, ReplayTrajectoryExporter.UploadCacheVersion, cancellation);
+                if (force) cache.ForgetAcknowledgements(cancellation);
+                var cached = cache.CompletedReceipt(cancellation);
+                if (cached != null)
+                    return new RoutePreparation { Cache = cache, CachedReceipt = cached };
+                var restored = cache.RestoreExport(cancellation);
+                if (restored != null) return new RoutePreparation { Package = restored, Cache = cache };
+                var package = ReplayTrajectoryExporter.Export(path, output, cancellation,
+                    progress => Volatile.Write(ref progressState.Value, (float)progress));
+                cache.RememberExport(package, cancellation);
+                return new RoutePreparation { Package = package, Cache = cache };
+            }, cancellation);
             ObserveFault(routeExport);
             return true;
         }
         catch (Exception e)
         { CancelRouteUpload(); Note("准备轨迹失败：" + e.Message); return false; }
+    }
+
+    private void ForceRouteReupload()
+    {
+        if (!routeCacheHit || !routeFinished || routeCache == null || routeSourcePath == null || routeExport != null || routeSending != null
+            || !FileManagementAllowed || LibraryManagementBusy || !library || SceneManager.GetActiveScene().name != "Title"
+            || ReplaySafety.Active || theatre?.Busy == true) return;
+        string path = routeSourcePath;
+        CancelRouteUpload();
+        RequestRouteExportCore(path, true);
     }
 
     private void ConfirmRouteUpload()
@@ -66,6 +102,7 @@ public sealed partial class Plugin
         routeError = "";
         var package = routePackage;
         var destination = routeDestination;
+        var cache = routeCache;
         var cancellation = routeCancellation!.Token;
         var progressState = routeProgress;
         Volatile.Write(ref progressState.TotalParts, package.Paths.Length);
@@ -73,12 +110,15 @@ public sealed partial class Plugin
         routeDisplayedParts = -1;
         routeSending = Task.Run(async () =>
         {
+            cache?.EnsureSourceCurrent(cancellation);
             var receipt = await TrajectoryUploader.UploadManyAsync(package.Paths, destination, cancellation,
                 (done, total) =>
                 {
                     Volatile.Write(ref progressState.UploadedParts, done);
                     Volatile.Write(ref progressState.Value, (float)done / total);
-                }).ConfigureAwait(false);
+                }, confirmedReceipt: path => cache?.ConfirmedReceipt(path, cancellation),
+                onConfirmed: (path, confirmed) => cache?.RecordConfirmed(path, confirmed, cancellation)).ConfigureAwait(false);
+            cache?.MarkCompleted(receipt, cancellation);
             // A small local acknowledgement is separate from the immutable package.
             // Server success must remain success even if writing the local note fails.
             try
@@ -103,7 +143,20 @@ public sealed partial class Plugin
         {
             try
             {
-                routePackage = routeExport.GetAwaiter().GetResult();
+                var preparation = routeExport.GetAwaiter().GetResult();
+                routeCache = preparation.Cache;
+                routePackage = preparation.Package;
+                if (preparation.CachedReceipt != null)
+                {
+                    routeCacheHit = true; routeFinished = true;
+                    var receipt = preparation.CachedReceipt;
+                    routeSummary = "本机已有这份录像的上传成功记录，已跳过解析和发送。\n" +
+                        $"全队 {receipt.UploadIds.Length} 个轨迹分包均已确认。\n" +
+                        "投稿编号：" + receipt.UploadId.Substring(0, 16) + "\n当前审核和展示状态请在地图网站查看。";
+                    Logger.LogInfo("Trajectory completed cache hit: no replay-page decode and no HTTP upload.");
+                    return;
+                }
+                if (routePackage == null) throw new InvalidDataException("没有可上传的轨迹包。");
                 string names = string.Join(" · ", routePackage.PlayerNames.Select(name => MemoriesLibraryModel.Plain(name, 48)));
                 routeSummary = $"将上传到：{routeDestination!.Host}\n" +
                     $"{routePackage.PlayerCount} 位玩家 · {routePackage.PointCount:N0} 个坐标 · 最多 10 Hz\n" +
@@ -167,7 +220,7 @@ public sealed partial class Plugin
         var sending = routeSending;
         routeCancellation = null;
         cancellation?.Cancel();
-        routeExport = null; routeSending = null; routePackage = null; routeDestination = null;
+        routeExport = null; routeSending = null; routePackage = null; routeCache = null; routeCacheHit = false; routeSourcePath = null; routeDestination = null;
         routeSummary = routeError = ""; routeFinished = false;
         if (cancellation == null) return;
         Task work = sending ?? (Task?)exporting ?? Task.CompletedTask;

@@ -78,6 +78,7 @@
     <Compile Include="../../src/PeakReplayLab/ActorJointTimeline.cs" Link="ActorJointTimeline.cs" />
     <Compile Include="../../src/PeakReplayLab/SceneObservationTimeline.cs" Link="SceneObservationTimeline.cs" />
     <Compile Include="../../src/PeakReplayLab/ReplayTrajectoryExporter.cs" Link="ReplayTrajectoryExporter.cs" />
+    <Compile Include="../../src/PeakReplayLab/TrajectoryPointRunCodec.cs" Link="TrajectoryPointRunCodec.cs" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
   </ItemGroup>
 </Project>
