@@ -102,7 +102,7 @@ internal sealed class FullReplaySharedWriter
         Encode("Interactions", source.Interactions, 4); Encode("Spawned", source.Spawned, 5);
         foreach (string name in new[] { "ActorOrder", "ItemOrder", "CrateOrder", "RopeOrder", "EffectOrder", "AudioOrder", "SpawnedOrder", "BalloonOrder", "CreatureOrder", "InteractionOrder" })
             if (schema >= 26 && record.TryGetValue(name, out var order) && order is string[] keys &&
-                keys.Length <= ReplayRules.MaxCreatures && (keys.Length >= 256 || keys.Sum(key => (long)key.Length) >= 8192) && TryLeaf(keys, 9, out int id))
+                keys.Length <= SharedOrderMaximum(schema) && (keys.Length >= 256 || keys.Sum(key => (long)key.Length) >= 8192) && TryLeaf(keys, 9, out int id))
             { record[name] = Reference(id); CountReference(id); }
         return pageRawBytes;
 
@@ -149,11 +149,12 @@ internal sealed class FullReplaySharedWriter
                 else
                 {
                     byte[] raw = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(updates[i], ReplayFiles.Json));
-                    // Compact traps are event-driven scene state. Their small
-                    // full snapshots must still be shared or every independent
-                    // page would write the same dormant directory again.
+                    // Compact traps and fake item sources are event-driven
+                    // scene state. Share their small complete snapshots so
+                    // independent pages do not repeat dormant source paths.
                     bool compactTrap = values[i] is CreatureReplayFrame creature && CreatureReplayRules.CompactStaticTrap(creature);
-                    if (raw.Length < 512 && !compactTrap) continue;
+                    bool compactFake = schema >= 27 && values[i] is InteractionReplayFrame interaction && InteractionReplayRules.CompactFakeItem(interaction);
+                    if (raw.Length < 512 && !compactTrap && !compactFake) continue;
                     if (raw.Length > ReplayRules.MaxLineCharacters) throw new InvalidDataException("Shared snapshot exceeds its raw byte limit.");
                     string hash = FullReplayArchive.SharedHash(kind, raw);
                     if (!hashes.TryGetValue(hash, out id))
@@ -196,6 +197,11 @@ internal sealed class FullReplaySharedWriter
 
     internal static bool StaticDirectoryEntry(CreatureReplayFrame frame) => CreatureReplayRules.CompactStaticTrap(frame) ||
         frame.Kind == "spider" && frame.ClockMode == CreatureReplayRules.IdleClock && frame.IdleAnimation != null;
+
+    // A leaf is typed only as string[], so its scanner uses the largest track
+    // allowance. The consuming track still enforces its own entity limit.
+    internal static int SharedOrderMaximum(int schema) => schema >= 27
+        ? Math.Max(ReplayRules.MaxCreatures, ReplayRules.MaxInteractions) : ReplayRules.MaxCreatures;
 
     private void CountReference(int id)
     {

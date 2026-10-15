@@ -82,6 +82,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
     private readonly List<string> remove = new();
     private readonly InteractionReplayObserver observer;
     private readonly PresentationWorkBudget budget;
+    private readonly FakeItemReplayPlayback fakeItems;
     private readonly Action<string>? warning;
     private InteractionReplayFrame[] lastLeft = Array.Empty<InteractionReplayFrame>(), lastRight = Array.Empty<InteractionReplayFrame>();
     private float lastMix, originalGloom;
@@ -94,6 +95,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
     public InteractionReplayPlayback(Action<string>? warning = null, PresentationWorkBudget? workBudget = null)
     {
         this.warning = warning; budget = workBudget ?? new(); resources.LoadTemplates();
+        fakeItems = new FakeItemReplayPlayback(frame => resources.Resolve(frame)?.Root, budget, warning);
         observer = new InteractionReplayObserver(Changed, Spawned, warning);
         try { foreach (var source in resources.Initial()) Hide(source); }
         catch { Dispose(); throw; }
@@ -116,6 +118,9 @@ internal sealed class InteractionReplayPlayback : IDisposable
     private void Hide(InteractionReplayResources.Source source)
     {
         if (!source.Root) return;
+        // Fake stand-ins have no visual ownership in old recordings. Their
+        // explicit schema27 states acquire a separate passive visibility lease.
+        if (source.Kind == "fake-item") return;
         if (source.Posts != null)
         {
             if (postSources.Count < InteractionReplayRules.MaximumEntities) postSources[source.Root.GetInstanceID()] = source;
@@ -152,6 +157,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
         if (!ownsNative && (left.Length != 0 || right.Length != 0))
         { ownsNative = true; foreach (var source in deferredSources.Values) Hide(source); deferredSources.Clear(); }
         Pending = false; VisibleCount = MissingCount = 0; wanted.Clear(); next.Clear(); appliedPosts.Clear();
+        fakeItems.Begin(left, discontinuity);
         foreach (var frame in right) next[frame.Key] = frame;
         foreach (var frame in left) wanted.Add(frame.Key);
         int sleeping = 0;
@@ -166,6 +172,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
         foreach (var key in remove) retry.Remove(key);
         foreach (var frame in left)
         {
+            if (frame.Kind == "fake-item") { fakeItems.Apply(frame, discontinuity); continue; }
             if (InteractionReplayRules.World(frame.Kind) && !InteractionReplayRules.PostKind(frame.Kind) && claimed.Add((frame.Kind, frame.SourcePath)))
             { var native = resources.Resolve(frame); if (native != null) HideRoot(native.Root); }
             if (InteractionReplayRules.PostKind(frame.Kind))
@@ -238,6 +245,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
             catch (Exception e)
             { entry?.Dispose(); entries.Remove(frame.Key); retry[frame.Key] = Time.realtimeSinceStartupAsDouble + 1; MissingCount++; if (warned.Count < 64 && warned.Add(frame.Kind + frame.Resource)) warning?.Invoke("互动视觉缺失：" + e.Message); }
         }
+        fakeItems.End(); Pending |= fakeItems.Pending; MissingCount += fakeItems.MissingCount; VisibleCount += fakeItems.VisibleCount;
     }
     private static Entry Create(InteractionReplayResources.Source source, InteractionReplayFrame frame)
     {
@@ -323,7 +331,7 @@ internal sealed class InteractionReplayPlayback : IDisposable
     }
     public void Dispose()
     {
-        if (disposed) return; disposed = true; observer.Dispose();
+        if (disposed) return; disposed = true; observer.Dispose(); fakeItems.Dispose();
         foreach (var pair in hidden) if (pair.Key) pair.Key.forceRenderingOff = pair.Value;
         originalLights.Dispose(); foreach (var entry in entries.Values) entry.Dispose(); entries.Clear(); hidden.Clear();
         deferredSources.Clear();

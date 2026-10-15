@@ -132,7 +132,7 @@ internal static partial class ReplayDeltaCodec
                     { MaxDepth = 24, DateParseHandling = DateParseHandling.None, PropertyNameTable = names, ArrayPool = jsonBuffers });
                 Read(json); Require(json, JsonToken.StartObject);
                 if (!NextProperty(json, out string name) || name != "Value") throw Error("Invalid shared leaf wrapper.");
-                object value = type == typeof(string[]) ? ReadStrings(json, ReplayRules.MaxCreatures) : ReadValue(json, type)!;
+                object value = type == typeof(string[]) ? ReadStrings(json, FullReplaySharedWriter.SharedOrderMaximum(schema)) : ReadValue(json, type)!;
                 if (NextProperty(json, out _) || json.Read()) throw Error("Shared leaf requires one complete array.");
                 if (value is string[] strings)
                     foreach (string text in strings) ValidKey(text, 2048);

@@ -17,7 +17,14 @@ internal sealed class ItemEventCapture : IDisposable
     private static long sequence;
     private static Action<string>? warn;
     private static bool overflowWarned;
-    private sealed class ItemOwner { public Item? Item; public readonly ItemMotionPacketPolicy Motion = new(); }
+    private sealed class ItemOwner
+    {
+        public Item? Item;
+        public readonly ItemMotionPacketPolicy Motion = new();
+        public bool ScaleKnown;
+        public float AppliedScale;
+        public long KinematicEpoch;
+    }
     private static readonly ConditionalWeakTable<Component, ItemOwner> componentItems = new();
     private sealed class MotionHint { public bool Force; public double Last = double.NegativeInfinity; }
     private sealed class MotionHints { public readonly ConditionalWeakTable<Item, MotionHint> Items = new(); }
@@ -59,13 +66,17 @@ internal sealed class ItemEventCapture : IDisposable
             Patch(typeof(Item), "SetState", nameof(Changed), postfix: true);
             Patch(typeof(Item), nameof(Item.SetItemInstanceDataRPC), nameof(StructureChanged), postfix: true);
             Patch(typeof(Item), nameof(Item.SetCookedAmountRPC), nameof(Changed), postfix: true);
-            Patch(typeof(Item), nameof(Item.SetKinematicRPC), nameof(Motion), postfix: true);
-            Patch(typeof(Item), nameof(Item.SetKinematic), nameof(Motion), postfix: true);
-            Patch(typeof(Item), nameof(Item.SetKinematicAndResetSyncData), nameof(Motion), postfix: true);
+            PatchKinematic(nameof(Item.SetKinematicRPC), observePose: true);
+            PatchKinematic(nameof(Item.SetKinematic), observePose: false);
+            PatchKinematic(nameof(Item.SetKinematicAndResetSyncData), observePose: true);
             Patch(typeof(Item), "Move", nameof(Motion), postfix: true);
             Patch(typeof(Item), nameof(Item.ApplyForceRPC), nameof(Motion), postfix: true);
             Patch(typeof(ItemPhysicsSyncer), nameof(ItemPhysicsSyncer.OnDataReceived), nameof(PhysicsReceived), postfix: true);
             Patch(typeof(ItemPhysicsSyncer), nameof(ItemPhysicsSyncer.GetDataToWrite), nameof(PhysicsWritten), postfix: true);
+            // ApplyScale runs after the real native mesh/collider writes. The
+            // RPC arrives before those writes and item.data.Scale may still
+            // contain the prior value; observe the applied argument instead.
+            Patch(typeof(ItemScaleSyncer), "ApplyScale", nameof(ScaleApplied), postfix: true);
             // Querying ShouldSendData, resetting interpolation, or requesting
             // future packets is not an observed movement. The actual immutable
             // incoming/outgoing packet below supplies the wake-up boundary.
@@ -101,6 +112,21 @@ internal sealed class ItemEventCapture : IDisposable
             HookFailures++;
             try { warning?.Invoke("物品事件入口未安装，其他录制保持可用：" + type.Name + "." + method + " · " + e.Message); }
             catch { }
+        }
+    }
+
+    private void PatchKinematic(string method, bool observePose)
+    {
+        try
+        {
+            var target = AccessTools.DeclaredMethod(typeof(Item), method) ?? throw new MissingMethodException(nameof(Item), method);
+            harmony.Patch(target, prefix: new HarmonyMethod(typeof(ItemEventCapture), observePose ? nameof(KinematicPoseBefore) : nameof(KinematicBefore)),
+                postfix: new HarmonyMethod(typeof(ItemEventCapture), nameof(KinematicAfter)));
+        }
+        catch (Exception e)
+        {
+            HookFailures++;
+            try { warning?.Invoke("物品事件入口未安装，其他录制保持可用：Item." + method + " · " + e.Message); } catch { }
         }
     }
 
@@ -154,6 +180,76 @@ internal sealed class ItemEventCapture : IDisposable
     { try { if (!ReplaySafety.Active) ItemCapture.MarkDirty(__instance, true); } catch { } }
     private static void Motion(Item __instance)
     { try { if (!ReplaySafety.Active) ItemCapture.MarkMotion(__instance); } catch { } }
+    private readonly struct KinematicObservation
+    {
+        internal readonly Rigidbody? Body;
+        internal readonly ItemOwner? Owner;
+        internal readonly bool Known, Kinematic, PoseKnown;
+        internal readonly long Epoch;
+        internal readonly Vector3 Position;
+        internal readonly Quaternion Rotation;
+        internal KinematicObservation(Rigidbody body, ItemOwner owner)
+        { Body = body; Owner = owner; Known = true; Kinematic = body.isKinematic; Epoch = owner.KinematicEpoch;
+          PoseKnown = false; Position = default; Rotation = default; }
+        internal KinematicObservation(KinematicObservation before, Vector3 position, Quaternion rotation)
+        { Body = before.Body; Owner = before.Owner; Known = before.Known; Kinematic = before.Kinematic; Epoch = before.Epoch;
+          PoseKnown = true; Position = position; Rotation = rotation; }
+    }
+    private static void KinematicBefore(Item __instance, out KinematicObservation __state)
+    {
+        __state = default;
+        try
+        {
+            if (ReplaySafety.Active || !__instance || !__instance.rig) return;
+            var owner = componentItems.GetValue(__instance, static value => new ItemOwner { Item = (Item)value });
+            __state = new KinematicObservation(__instance.rig, owner);
+        }
+        catch { }
+    }
+    private static void KinematicPoseBefore(Item __instance, out KinematicObservation __state)
+    {
+        KinematicBefore(__instance, out __state);
+        try
+        {
+            if (__state.Known && __state.Body)
+                __state = new KinematicObservation(__state, __state.Body!.position, __state.Body!.rotation);
+        }
+        catch { }
+    }
+    private static void KinematicAfter(Item __instance, KinematicObservation __state)
+    {
+        try
+        {
+            if (ReplaySafety.Active || !__instance || !__state.Known || !__state.Body || __state.Owner == null ||
+                __state.Owner.KinematicEpoch != __state.Epoch) return;
+            var body = __state.Body!;
+            bool changed = __state.Kinematic != body.isKinematic;
+            // RPCs additionally reposition even an already kinematic body,
+            // which native ShouldSendData will not publish as a physics packet.
+            // Read its direct pose only on these explicit RPC boundaries. The
+            // hot ordinary SetKinematic path needs just the two bool reads.
+            if (!changed && __state.PoseKnown)
+            {
+                var position = body.position; var rotation = body.rotation;
+                changed = position.x != __state.Position.x || position.y != __state.Position.y ||
+                    position.z != __state.Position.z || RotationChanged(__state.Rotation, rotation);
+            }
+            if (!changed) return;
+            // Native RPCs nest SetKinematic. One completed inner boundary is
+            // sufficient; the eventual scene read runs after all native writes.
+            __state.Owner.KinematicEpoch++;
+            ItemCapture.MarkMotion(__instance);
+        }
+        catch { }
+    }
+    private static bool RotationChanged(Quaternion a, Quaternion b)
+    {
+        // No per-call epsilon: successive tiny kinematic RPC moves can
+        // accumulate while ShouldSendData remains false. q and -q alone are
+        // the same orientation and need no new observation.
+        return !(a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w) &&
+            !(a.x == -b.x && a.y == -b.y && a.z == -b.z && a.w == -b.w);
+    }
     private static void PhysicsReceived(ItemPhysicsSyncer __instance, ItemPhysicsSyncData data) => PhysicsPacket(__instance, data);
     private static void PhysicsWritten(ItemPhysicsSyncer __instance, ItemPhysicsSyncData __result) => PhysicsPacket(__instance, __result);
     private static void PhysicsPacket(ItemPhysicsSyncer source, ItemPhysicsSyncData data)
@@ -171,6 +267,20 @@ internal sealed class ItemEventCapture : IDisposable
     }
     private static Item? Owner(Component component) => componentItems.GetValue(component,
         static value => new ItemOwner { Item = value.GetComponent<Item>() }).Item;
+    private static void ScaleApplied(ItemScaleSyncer __instance, float scale)
+    {
+        try
+        {
+            if (ReplaySafety.Active || !__instance || scale < 0 || float.IsNaN(scale) || float.IsInfinity(scale)) return;
+            var owner = componentItems.GetValue(__instance, static value => new ItemOwner { Item = value.GetComponent<Item>() });
+            if (!owner.Item || owner.ScaleKnown && owner.AppliedScale == scale) return;
+            owner.ScaleKnown = true; owner.AppliedScale = scale;
+            // A scalar visual observation, not an inventory/material event and
+            // not another high-rate motion lease. The scene consumer coalesces it.
+            ItemCapture.MarkChildScaleObservation(owner.Item!);
+        }
+        catch { }
+    }
     private static void WindMotion(WindChillZone __instance, Item item)
     {
         try

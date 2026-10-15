@@ -19,13 +19,22 @@ namespace UnityEngine
         public Character? CharacterOwner;
         public readonly Transform transform = new();
         public int NativeCalls;
+        public int ComponentLookups;
         public Exception? NativeFailure;
-        public T? GetComponent<T>() where T : Component => this is T self ? self : ItemOwner is T item ? item : CharacterOwner as T;
+        public T? GetComponent<T>() where T : Component { ComponentLookups++; return this is T self ? self : ItemOwner is T item ? item : CharacterOwner as T; }
         protected void Native() { if (NativeFailure != null) throw NativeFailure; NativeCalls++; }
     }
     public sealed class GameObject : Object { }
-    public sealed class Transform { public Vector3 position; }
-    public class Rigidbody : Component { }
+    public sealed class Transform { public Vector3 position; public Vector3 localScale = new(1,1,1); }
+    public class Rigidbody : Component
+    {
+        private bool kinematic; private Vector3 p; private Quaternion q = new() { w = 1 };
+        public int KinematicReads, PositionReads, RotationReads;
+        public bool isKinematic { get { KinematicReads++; return kinematic; } set => kinematic = value; }
+        public Vector3 position { get { PositionReads++; return p; } set => p = value; }
+        public Quaternion rotation { get { RotationReads++; return q; } set => q = value; }
+        public Vector3 linearVelocity, angularVelocity;
+    }
     public class Collider : Component { public Rigidbody? attachedRigidbody; public bool DirectItem = true; }
     public class Collision { }
     public struct Vector3 { public float x, y, z; public Vector3(float x, float y, float z) { this.x = x; this.y = y; this.z = z; } }
@@ -68,7 +77,11 @@ public class Item : UnityEngine.Component
     public Character? trueHolderCharacter;
     public Photon.Pun.PhotonView? photonView;
     public ushort itemID = 1;
-    public bool isUsingPrimary, isUsingSecondary, finishedCast, Kinematic;
+    public bool isUsingPrimary, isUsingSecondary, finishedCast;
+    public UnityEngine.Rigidbody rig = new();
+    public ItemPhysicsSyncer? physicsSyncer;
+    public bool Kinematic => rig.isKinematic;
+    public int WasActiveCalls;
     public ItemState State;
     public float Cooked;
     [MethodImpl(MethodImplOptions.NoInlining)] public void StartUsePrimary() { Native(); isUsingPrimary = true; }
@@ -91,9 +104,12 @@ public class Item : UnityEngine.Component
     public void ChangeState(ItemState state, Character holder) => SetState(state, holder);
     [MethodImpl(MethodImplOptions.NoInlining)] public void SetItemInstanceDataRPC(ItemInstanceData data) => Native();
     [MethodImpl(MethodImplOptions.NoInlining)] public void SetCookedAmountRPC(int cookedAmount) { Native(); Cooked = cookedAmount; }
-    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematicRPC(bool value, UnityEngine.Vector3 position, UnityEngine.Quaternion rotation) { Native(); Kinematic = value; transform.position = position; }
-    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematic(bool value) { Native(); Kinematic = value; }
-    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematicAndResetSyncData(bool value, UnityEngine.Vector3 position, UnityEngine.Quaternion rotation) { Native(); Kinematic = value; transform.position = position; }
+    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematicRPC(bool value, UnityEngine.Vector3 position, UnityEngine.Quaternion rotation)
+    { Native(); SetKinematic(value); rig.position = position; rig.rotation = rotation; transform.position = position; }
+    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematic(bool value) { Native(); rig.isKinematic = value; if (!value) WasActiveCalls++; }
+    [MethodImpl(MethodImplOptions.NoInlining)] public void SetKinematicAndResetSyncData(bool value, UnityEngine.Vector3 position, UnityEngine.Quaternion rotation)
+    { Native(); SetKinematic(value); rig.position = position; rig.rotation = rotation; transform.position = position;
+      if (value) { rig.linearVelocity = default; rig.angularVelocity = default; physicsSyncer?.ResetRecievedData(); } }
     [MethodImpl(MethodImplOptions.NoInlining)] internal void Move(UnityEngine.Vector3 position, UnityEngine.Quaternion rotation) { Native(); transform.position = position; }
     [MethodImpl(MethodImplOptions.NoInlining)] public void ApplyForceRPC(UnityEngine.Vector3 force, UnityEngine.Vector3 pos) => Native();
     [MethodImpl(MethodImplOptions.NoInlining)] public void PutInBackpackRPC(byte slotID, BackpackReference backpackReference) => Native();
@@ -126,6 +142,14 @@ public class ItemPhysicsSyncer : UnityEngine.Component
     [MethodImpl(MethodImplOptions.NoInlining)] public void ResetRecievedData() { Native(); Data = default; }
     [MethodImpl(MethodImplOptions.NoInlining)] public void ForceSyncForFrames(int frames = 10) => Native();
     [MethodImpl(MethodImplOptions.NoInlining)] public bool ShouldSendData() { Native(); return Send; }
+}
+public class ItemScaleSyncer : UnityEngine.Component
+{
+    public float currentScale = 1;
+    public readonly UnityEngine.Transform Mesh = new();
+    [MethodImpl(MethodImplOptions.NoInlining)] private void ApplyScale(float scale)
+    { Native(); Mesh.localScale = new UnityEngine.Vector3(scale,scale,scale); }
+    public void Update(bool inBackpack = false) => ApplyScale(currentScale * (inBackpack ? .5f : 1));
 }
 public class WindChillZone : UnityEngine.Component
 {
@@ -205,6 +229,7 @@ namespace PeakReplayLab
         public static void MarkMotionObservation(Item item,bool continuousObservation)
         {Notices.Add(new Notice("motion",item,continuous:continuousObservation));OnNotify?.Invoke("motion",item);}
         public static void MarkMetadataObservation(Item item)=>Emit("metadata",item);
+        public static void MarkChildScaleObservation(Item item)=>Emit("child-scale",item);
         public static void RegistryChanged(Item item) => Emit("registry", item);
         public static void Destroying(Item item) => Emit("destroy", item);
         public static void MarkInventoryDirty() => Emit("inventory", null);

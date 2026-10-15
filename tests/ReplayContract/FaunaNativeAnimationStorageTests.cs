@@ -40,7 +40,7 @@ internal static class FaunaNativeAnimationStorageTests
         });
         test("older schema item baselines keep exact omitted field and native limits", () =>
         {
-            Check(ReplayRules.CurrentSchema == 26 && ReplayRules.SupportedSchema(25) && !ReplayRules.SupportedSchema(9));
+            Check(ReplayRules.CurrentSchema == 27 && ReplayRules.SupportedSchema(25) && ReplayRules.SupportedSchema(26) && !ReplayRules.SupportedSchema(9));
             foreach (int schema in Enumerable.Range(10, 14))
             {
                 var plain = Frog(0).WithIdleAnimation(null); var token = JObject.FromObject(new ReplayDeltaCodec.Writer(schema).Encode(Frame(0, plain)));

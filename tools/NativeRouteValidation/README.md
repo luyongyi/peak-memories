@@ -42,15 +42,19 @@ dotnet build tools/NativeRouteValidation/driver/RouteAuditProbe.csproj -c Releas
 
 0.8.31 的乌鸦对照同时执行生产 `Due` 事件／错峰安全检查调度，不能用每次强制读取 Animator 隐藏检查之间的误差。JSON 分别记录生产时钟误差、明确的 10 ms 子帧预算及旧 2 ms 预算是否满足；精确相位的姿态 oracle 容差不变。2 ms 是生产检查时的纠偏阈值，不能当作整个安全检查区间的连续误差上界。整体通过还要求真实惊飞、手持和熟制状态验证成功。
 
+`-SnowVisual` 显式开启雪堆与雪球对照，建议 `-Scene Level_9 -ObserveFromIndex 2 -Biomes 3`。测试按真实原生 `Biome == Alpine` 触发，不把关卡槽索引当成生物群系；当前已实测 Level_9 的 Alpine 位于槽 2，观察起点不得晚于 2。它在原生 Alpine 段寻找经理已登记的真实雪堆与有限平坦雪／冰面，通过正常取雪、丢弃、受限刚体速度刺激、静置、再次刺激和拾取验证显隐及尺寸。速度刺激只在真实雪面、动态地面球及 8 米范围内执行，水平初速为实际 `minimumSpeedToGrow + 0.2`，最高 1.3 m/s，保留垂直速度，每段最多四次；不改变原生摩擦、制动或尺寸逻辑。第一段地面自然增长可以发生在落地或首次刺激阶段，只统计当时已观察到的新增长，不回填证据。静置时通过原生玩家传送离球至少四米，到已确认的同类雪面地板，消除人物持续接触；不写球的姿态或运动学状态来制造静止。它不写入目标尺寸、模型、采集帧或伪物状态；没有合适原生条件或未完成增长必须失败。输出 `snow-visual.json` 的原生／实际采集数据与受限频率的只读采集器诊断，并检查倒序跳转后生产回放视觉的雪堆可见性与雪球子节点尺寸；离线 `RouteVerify` 还会逆序解码最终文件，逐条核对。此模式 `PerformanceMeasurementValid=false`，不能用于性能或体积对比。
+
+雪测试的等待阶段区分真正静止与原生冰面仍在滑动：前者须观察 `SleepingClock` 与固定观察时间至少三秒；后者须有至少六个真实位置／朝向变化见证，尺寸保持、动作边界稳定且窗口过期。后者继续验证再次增长与回放，但明确输出 `TrueStaticSleepCovered=false`、`QuietScenario=NativeStillMoving_NoStaticSleepClaim`，不计作静置停采通过。若两种原生条件都未证实，测试失败。
+
 启动器支持以下路径参数：
 
 | 参数 | 含义 |
 |---|---|
 | `GameRoot` | 游戏安装目录，须包含 `PEAK.exe` 和 BepInEx |
-| `SavePath` | 当前游戏实际使用的 `quicksave.peak`，默认当前用户的 `AppData/LocalLow/LandCrab/PEAK/quicksave.peak`；用于备份和哈希前置校验，不会改变游戏的存档位置 |
+| `SavePath` | 当前游戏实际使用的 `quicksave.peak`，默认当前用户的 `AppData/LocalLow/LandCrab/PEAK/quicksave.peak`；已有文件备份及核对哈希，无文件记录 `ABSENT` 并核对测试后仍不存在，不会改变游戏的存档位置 |
 | `RepositoryRoot` | 源码仓库根目录；默认从工具目录向上寻找 `src/PeakReplayLab/PeakReplayLab.csproj` |
 
-当前原生存档必须已存在，探针会将游戏自己的存档路径哈希与启动器提供值比对；传入其他文件不会绕过保护。路径参数示例：
+启动器与探针都核对原生存档路径；现有文件须匹配原 SHA256，无存档须匹配明确的 `ABSENT` 证明。测试不创建占位存档；退出后如果文件新出现、被删除或被改写，保护检查失败，不自动删除任何新文件。传入其他文件不会绕过保护。路径参数示例：
 
 ```powershell
 & tools/NativeRouteValidation/launch-route.ps1 -Label route-custom-example01 -Scene Level_9 -Biomes 4 -RepositoryRoot "C:/Work/PeakMemories" -GameRoot "D:/SteamLibrary/steamapps/common/PEAK" -SavePath "C:/Users/Example/AppData/LocalLow/LandCrab/PEAK/quicksave.peak"

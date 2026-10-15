@@ -3,6 +3,7 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="FaunaRecordingVerification.cs" />
+    <Compile Include="SnowRecordingVerification.cs" />
     <Reference Include="ReplayContract"><HintPath>../../../artifacts/bin/ReplayContract/release/ReplayContract.dll</HintPath></Reference>
     <Reference Include="Newtonsoft.Json"><HintPath>../../../artifacts/bin/ReplayContract/release/Newtonsoft.Json.dll</HintPath></Reference>
   </ItemGroup>

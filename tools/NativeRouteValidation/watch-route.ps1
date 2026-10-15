@@ -26,7 +26,12 @@ while(-not $process.HasExited){
 }
 $metadata=Get-Content -LiteralPath (Join-Path $Launch 'launch.json') -Raw|ConvertFrom-Json
 if($metadata.ProtectedSavePath -and $metadata.ConfigDirectory){
-    $saveHash=if(Test-Path -LiteralPath $metadata.ProtectedSavePath){(Get-FileHash -LiteralPath $metadata.ProtectedSavePath -Algorithm SHA256).Hash}else{'ABSENT'}
+    if($metadata.SaveHashBefore -cne 'ABSENT' -and $metadata.SaveHashBefore -cnotmatch '^[A-F0-9]{64}$'){throw 'Invalid original protected-save proof.'}
+    $saveWasPresent=if($metadata.PSObject.Properties.Name -contains 'SaveExistedBefore'){[bool]$metadata.SaveExistedBefore}else{$metadata.SaveHashBefore -cne 'ABSENT'}
+    if($saveWasPresent -ne ($metadata.SaveHashBefore -cne 'ABSENT')){throw 'Protected-save existence and hash proofs disagree.'}
+    $saveIsDirectory=Test-Path -LiteralPath $metadata.ProtectedSavePath -PathType Container
+    $saveIsPresent=Test-Path -LiteralPath $metadata.ProtectedSavePath -PathType Leaf
+    $saveHash=if($saveIsPresent){(Get-FileHash -LiteralPath $metadata.ProtectedSavePath -Algorithm SHA256).Hash}elseif($saveIsDirectory){'INVALID_DIRECTORY'}else{'ABSENT'}
     $configProof=Get-Content -LiteralPath (Join-Path $Launch 'protected-before/config-hashes.json') -Raw|ConvertFrom-Json
     # BepInEx can rewrite only its version/comment header before the opt-in
     # protection plugin starts. Restore that exact original file after exit
@@ -49,5 +54,5 @@ if($metadata.ProtectedSavePath -and $metadata.ConfigDirectory){
         $path=Join-Path $metadata.ConfigDirectory $_.File
         -not (Test-Path -LiteralPath $path) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $_.Hash
     }|ForEach-Object {$_.File})
-    [pscustomobject]@{ProcessExited=$true;QuicksaveUnchanged=($saveHash -eq $metadata.SaveHashBefore);ConfigurationsUnchanged=($changed.Count -eq 0);RestoredCommentOnlyHeaders=$headerRestored;ChangedConfigurationFiles=$changed}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $Session 'disk-protection-proof.json') -Encoding utf8
+    [pscustomobject]@{ProcessExited=$true;SaveExistedBefore=$saveWasPresent;SaveExistsAfter=[bool]$saveIsPresent;SaveHashBefore=$metadata.SaveHashBefore;SaveHashAfter=$saveHash;QuicksaveUnchanged=(-not $saveIsDirectory -and $saveIsPresent -eq $saveWasPresent -and $saveHash -ceq $metadata.SaveHashBefore);ConfigurationsUnchanged=($changed.Count -eq 0);RestoredCommentOnlyHeaders=$headerRestored;ChangedConfigurationFiles=$changed}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $Session 'disk-protection-proof.json') -Encoding utf8
 }

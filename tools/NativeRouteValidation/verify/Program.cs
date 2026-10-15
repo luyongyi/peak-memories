@@ -12,6 +12,7 @@ var endpointTargets=censusGroups.Where(group=>(string?)group["Phase"]=="FarIdle"
 var endpointSamples=new Dictionary<JObject,EndpointSample>();
 var path=(string)summary["RecordingFile"]!;var info=FullReplayArchive.ReadInfo(path);
 double origin=(double)summary["FirstCapture"]!;
+var snowVerifier=SnowRecordingVerification.OpenIfAvailable(args[0],origin);
 var actions=(summary["Actions"] as JArray??new()).Cast<JObject>().ToArray();
 var bindings=(summary["Bindings"] as JArray??new()).Cast<JObject>().GroupBy(x=>(string)x["Track"]!+":"+(string)x["Key"]!).ToDictionary(g=>g.Key,g=>g.OrderBy(x=>(double)x["NativeTime"]!).ToArray());
 var roots=new Dictionary<string,int>(StringComparer.Ordinal);
@@ -70,6 +71,7 @@ for(int pageIndex=info.Pages.Length-1;pageIndex>=0;pageIndex--)
     for(int i=0;i<page.Frames.Count;i++)
     {
         var frame=page.Frames[i];seen.Add(info.Pages[pageIndex].FirstFrameIndex+i);
+        snowVerifier?.Observe(frame);
         foreach(var target in endpointTargets)
         {
             double age=target.NativeTime-origin-frame.T;
@@ -180,6 +182,9 @@ foreach(var target in endpointTargets)
         NativeFrogCount=frogChecks.Length,FrogChecks=frogChecks,Passed=endpointPassed});
 }
 var fauna=FaunaRecordingVerification.RunIfAvailable(args[0],summary,path,info,output);
+var snow=snowVerifier?.Complete(output);
+bool? snowPassed=snow==null?null:(bool?)JObject.FromObject(snow)["Passed"];
+if ((bool?)summary["SnowVisual"]?["Requested"] == true && snow == null) snowPassed = false;
 var sharedNames=new[]{"Items","Crates","Ropes","Creatures","Interactions","Spawned","Visuals","Lights","PoseNodes","Order","StaticCreatureDirectory"};
 var sharedKinds=(info.SharedBlocks??Array.Empty<FullReplaySharedBlock>()).GroupBy(block=>block.Kind).OrderBy(group=>group.Key)
     .Select(group=>new{Kind=group.Key,Type=sharedNames[group.Key],Blocks=group.Count(),RawBytes=group.Sum(block=>(long)block.RawBytes),CompressedBytes=group.Sum(block=>block.Length)}).ToArray();
@@ -195,8 +200,8 @@ var report=new{Version=(string?)summary["InstalledVersion"],Mvid=(string?)summar
     EndpointChecks=endpointChecks,EndpointChecksAvailable=endpointTargets.Length!=0,EndpointChecksFailed=endpointFailures,
     InactiveBodyEntryObservationsOutsideTransitionGrace=leakObservations,FirstScopeViolations=violations,ItemOwnerCheckedObservations=checkedItems,ItemOwnerUnknownOrGlobalObservations=unknownItems,
     ParticleCheckpoints=checkpoints,ParticleCheckpointBytes=checkpointBytes,Seeks=(JArray?)summary["Seeks"],
-    FaunaRecording=fauna,NativeVisualPassed=nativeVisualPassed,
-    Passed=info.Complete&&summarySucceeded&&countOk&&failures==0&&leakObservations==0&&missingNative==0&&knownNativeFrogCounterMatches!=false&&endpointFailures==0&&fauna?.Passed!=false&&nativeVisualPassed!=false,
+    FaunaRecording=fauna,NativeVisualPassed=nativeVisualPassed,SnowRecording=snow,
+    Passed=info.Complete&&summarySucceeded&&countOk&&failures==0&&leakObservations==0&&missingNative==0&&knownNativeFrogCounterMatches!=false&&endpointFailures==0&&fauna?.Passed!=false&&nativeVisualPassed!=false&&snowPassed!=false,
     Limits="Scoped census covers active native named creature components inside current native parent roots; it can omit detached Photon scene-root births. EndpointChecks exist only when a FarIdle census supplies independent active-scene arrays; missing endpoint arrays yield no endpoint checks, not a completed endpoint comparison. Those checks use the nearest recorded frame at or before the census within 0.25s, matching VoiceThief GameObject IDs against active creature keys. Frog item keys use Item component IDs, not GameObject IDs; when an older census lacks Instance, NativePathBinding requires one unique exact native path association from each key's most recent recorder binding at or before the census. That fallback is explicitly recorder-ledger-assisted identity association, not an independent spawn oracle. Native Uses must equal the endpoint frame's original counter; historical presence alone cannot pass. Census and endpoint checks do not exercise all AI attacks. The Frog counter check verifies only the known native 100,000,000-use fixture when Swamp FrogTongue was independently observed; a match does not establish all Frog actions. HighUseItems includes only observations with Uses > 1,000,000; first/last times refer to those observations. Item owner bindings are sampled recorder diagnostics and may remain unresolved/global; they are not an independent item-spawn oracle. Inactive-root checks allow 2s transition grace. Transient native events must have separate native-birth evidence. No claim of all-map/all-multiplayer completeness."};
 File.WriteAllText(Path.Combine(output,"route-verification.json"),JsonConvert.SerializeObject(report,Formatting.Indented));
 Console.WriteLine(JsonConvert.SerializeObject(new{report.Passed,report.TotalPages,report.UniqueFrames,report.ActionChecksPassed,report.ActionChecksFailed,ScopeViolations=leakObservations,report.ParticleCheckpoints,NativeCensusEntities=nativeCoverage.Count}));

@@ -20,12 +20,12 @@ ItemEventCapture Observe()
 }
 bool Seen(string kind, Item? item) => ItemCapture.Notices.Any(n => n.Kind == kind && ReferenceEquals(n.Item, item));
 
-Test("all 45 production patches install through real Harmony with matching native signatures", () =>
+Test("all 49 production callbacks install through real Harmony with matching native signatures", () =>
 {
     using var observer = Observe();
     var methods = Harmony.GetAllPatchedMethods().Select(Harmony.GetPatchInfo).Where(p => p != null).ToArray();
     int count = methods.Sum(p => p.Prefixes.Concat(p.Postfixes).Count(patch => patch.owner.StartsWith("cn.mylus.peakreplaylab.items.", StringComparison.Ordinal)));
-    Check(count == 45, "Expected 45 Harmony callbacks, observed " + count);
+    Check(count == 49, "Expected 49 Harmony callbacks, observed " + count);
 });
 Test("native item lifecycles and optimizer callbacks update registry while destruction is distinct", () =>
 {
@@ -47,7 +47,7 @@ Test("kinematic transitions movement and forces notify after the native state ha
     item.SetKinematicRPC(true, new Vector3(1, 2, 3), default);
     item.SetKinematicAndResetSyncData(false, new Vector3(4, 5, 6), default);
     item.Move(new Vector3(7, 8, 9), default); item.ApplyForceRPC(default, default);
-    Check(observedCalls.SequenceEqual(Enumerable.Range(1, 6)) && item.transform.position.x == 7 && !item.Kinematic);
+    Check(observedCalls.SequenceEqual(new[]{1,2,4,6,7,8}) && item.transform.position.x == 7 && !item.Kinematic);
 });
 Test("physics packets and getters preserve native result while ShouldSendData false stays silent", () =>
 {
@@ -204,4 +204,6 @@ Test("native zero wind and zone forces stay silent while real force startup is o
     var zero=new WindChillZone{windForce=0};zero.Wind(item);wind.Wind(item);
     Check(ItemCapture.Notices.Count==5&&ItemCapture.Notices.Last().Continuous);
 });
+ScaleAppliedObserverTests.Run(Test,Observe);
+KinematicObserverTests.Run(Test,Observe);
 Console.WriteLine($"TOTAL: {passed} native item observer checks passed using real HarmonyX injection. Unity physics, rendering and in-game FPS are not simulated.");

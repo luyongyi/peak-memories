@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 
 namespace PeakReplayLab;
@@ -42,17 +43,50 @@ public sealed class InteractionTextFrame
 public static class InteractionReplayRules
 {
     [ThreadStatic] private static HashSet<string>? validationPaths;
-    public const int MaximumEntities = 768;
+    public const int MaximumDynamicEntities = 768;
+    public const int MaximumStaticFakeItems = 8192;
+    public const int MaximumEntities = MaximumDynamicEntities + MaximumStaticFakeItems;
     public const int MaximumNodes = 1024;
     public const int MaximumLinePoints = 16;
     public static readonly Type[] KnownTypes = { typeof(InteractionReplayFrame), typeof(InteractionLineFrame), typeof(InteractionTextFrame) };
-    public static bool World(string kind) => kind == "scout-statue" || kind == "ghost-fire" || kind == "soul-pillar" || kind == "campfire" || kind == "peak-portal";
+    public static bool World(string kind) => kind == "scout-statue" || kind == "ghost-fire" || kind == "soul-pillar" || kind == "campfire" || kind == "peak-portal" || kind == "fake-item";
+    public static bool FakeResource(string resource, out ushort itemId)
+    {
+        itemId = 0;
+        return resource != null && resource.StartsWith("fake-item/", StringComparison.Ordinal) &&
+            ushort.TryParse(resource.Substring(10), NumberStyles.None, CultureInfo.InvariantCulture, out itemId) &&
+            resource == "fake-item/" + itemId.ToString(CultureInfo.InvariantCulture);
+    }
+    public static bool CompactFakeItem(InteractionReplayFrame value) => value.Kind == "fake-item" &&
+        FakeResource(value.Resource, out _) && !string.IsNullOrWhiteSpace(value.SourcePath) &&
+        value.Pose != null && value.Pose.Nodes != null && value.Pose.Nodes.Length == 0 && value.Visuals == null && value.Lights == null &&
+        value.Line == null && value.Text == null && value.GloomAmount == null && value.PostWeights == null && value.PostEnabled == null;
+    public static void ValidateCounts(InteractionReplayFrame[] values)
+    {
+        int ordinary = 0, fake = 0;
+        HashSet<string>? fakePaths = null;
+        try
+        {
+            foreach (var value in values)
+            {
+                if (value == null) throw new InvalidDataException("Missing interaction.");
+                if (value.Kind == "fake-item")
+                {
+                    if (++fake > MaximumStaticFakeItems) throw new InvalidDataException("Static fake item directory exceeds its limit.");
+                    fakePaths ??= validationPaths ??= new HashSet<string>(StringComparer.Ordinal);
+                    if (!fakePaths.Add(value.SourcePath)) throw new InvalidDataException("Duplicate static fake item scene identity.");
+                }
+                else if (++ordinary > MaximumDynamicEntities) throw new InvalidDataException("Dynamic interaction directory exceeds its limit.");
+            }
+        }
+        finally { fakePaths?.Clear(); }
+    }
     public static bool PostKind(string kind) => kind == "peak-portal" || kind == "warp-compass";
     public static bool LineKind(string kind) => kind == "clone-line" || kind == "arrow-line";
     public static bool Kind(string kind) => World(kind) || PostKind(kind) || kind == "break-debris" || kind == "inert-rocket" || LineKind(kind) || kind == "bing-subtitle" || kind == "turtle-shell" || kind == "stamina-sphere" || kind == "warning-arrow";
     public static InteractionReplayFrame Rebase(InteractionReplayFrame value, double start) => value;
     public static bool CanInterpolate(InteractionReplayFrame left, InteractionReplayFrame right) =>
-        left.Key == right.Key && left.Kind == right.Kind && left.Resource == right.Resource && left.SourcePath == right.SourcePath && left.Pose.Active && right.Pose.Active;
+        left.Kind != "fake-item" && left.Key == right.Key && left.Kind == right.Kind && left.Resource == right.Resource && left.SourcePath == right.SourcePath && left.Pose.Active && right.Pose.Active;
     public static bool ShouldProbe(double now, double next, bool dirty) => dirty || now >= next;
     public static double NextProbe(double now, int identity, bool moving) => now + (moving ? 1.0 / 30 : 1 + (identity & 31) * .017);
     public static void Validate(InteractionReplayFrame value)
@@ -60,6 +94,7 @@ public static class InteractionReplayRules
         if (value == null) throw new InvalidDataException("Missing interaction.");
         Text(value.Key, 256, true); Text(value.Resource, 2048, true); Text(value.SourcePath, 2048, false);
         if (!Kind(value.Kind) || World(value.Kind) && string.IsNullOrWhiteSpace(value.SourcePath)) throw new InvalidDataException("Invalid interaction family.");
+        if (value.Kind == "fake-item" && !CompactFakeItem(value)) throw new InvalidDataException("Invalid static fake item payload.");
         if (value.Pose == null || value.Pose.Nodes == null || value.Pose.Nodes.Length > MaximumNodes) throw new InvalidDataException("Invalid interaction pose.");
         Vector(value.Pose.Position, 3, 1e7f); Rotation(value.Pose.Rotation); Vector(value.Pose.Scale, 3, 1e5f);
         var paths = validationPaths ??= new HashSet<string>(StringComparer.Ordinal);

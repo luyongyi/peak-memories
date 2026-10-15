@@ -27,7 +27,7 @@ internal sealed class ItemCapture : IDisposable
         public PhotonView? BackpackView;
         public Character? BackpackOwner;
         public Item? Source;
-        public bool Pending, Urgent, VisualDirty, HierarchyDirty, ContinuousMotionHint, MetadataPending;
+        public bool Pending, Urgent, VisualDirty, HierarchyDirty, ContinuousMotionHint, MetadataPending, ChildScaleDirty;
         public bool Destroyed;
         public int SourceInstanceId;
     }
@@ -367,6 +367,7 @@ internal sealed class ItemCapture : IDisposable
         entry.FallbackPending = false;
         bool wasSettled = entry.Rest.Settled;
         bool notified = identity.Revision != entry.SeenRevision;
+        bool childScaleChanged = identity.ChildScaleDirty;
         CreatureIdleAnimation? wormAnimation = null;
         bool wormChanged = false;
         bool wormReady = false;
@@ -418,7 +419,7 @@ internal sealed class ItemCapture : IDisposable
             entry.Frame.Visuals, now, entry.Frame.Pose.Active, animationMoving || entry.Mob, followSceneClock: true);
         if (animationMoving && entry.Rest.Settled && !entry.Attached && !entry.Mob && !entry.ExemptDistance &&
             !refresh && !fallbackRead && !notified && !entry.AnimationDirty && !entry.Activity.AnimatedRootDue(now, followSceneClock: true)) return;
-        if (!refresh && !fallbackRead && !appearanceDue && !entry.AnimationDirty && !wormChanged &&
+        if (!refresh && !fallbackRead && !appearanceDue && !entry.AnimationDirty && !wormChanged && !childScaleChanged &&
             !entry.Schedule.ShouldRead(now, identity.Revision, hot, fixedPlacement, attachmentChanged)) return;
         bool dirty = refresh || notified || attachmentChanged || identity.VisualDirty || entry.AnimationDirty || wormChanged;
         entry.AnimationDirty = false;
@@ -437,7 +438,7 @@ internal sealed class ItemCapture : IDisposable
         bool unknownFallback = fallbackRead && !entry.KnownStatic && !wormReady;
         if (unknownFallback) VisualReplica.InvalidateCapture(entry.Transform, hierarchyChanged: true);
         bool fastChildren = (entry.Mob || entry.ExemptDistance || entry.Frog != null || animationMoving || backpack == null && entry.Attached && entry.DynamicChildren) && entry.Activity.FastChildrenDue(now, followSceneClock: true);
-        bool children = ItemActivityPolicy.ChildrenDue(dirty, old == null, fastChildren && !wormReady, unknownFallback);
+        bool children = childScaleChanged || ItemActivityPolicy.ChildrenDue(dirty, old == null, fastChildren && !wormReady, unknownFallback);
         if (children) { ChildReads++; entry.Activity.ChildrenObserved(now); }
         NativeReads++;
         RootReads++;
@@ -445,19 +446,20 @@ internal sealed class ItemCapture : IDisposable
         var sample = Read(item, key, old, children, fixedPlacement && backpack != null ? old?.Pose : null,
             now, dirty, !wormReady && (animationMoving || entry.Mob), old == null || dirty || entry.Activity.LightDue(now, followSceneClock: true),
             wormReady ? wormAnimation : null, suppressStableAppearance: wormReady);
+        identity.ChildScaleDirty = false; // Only consume after a successful full child observation.
         if (old == null || dirty || entry.Activity.LightDue(now, followSceneClock: true)) { LightReads++; entry.Activity.LightObserved(now); }
         bool attached = item.itemState != ItemState.Ground || StickyAttached(entry);
         bool kinematic = item.rig && item.rig.isKinematic;
         entry.Distance.Observed(now, identity.Revision, sample.Pose.Position[0], sample.Pose.Position[1], sample.Pose.Position[2]);
         bool rootMoved = old != null && backpack == null && RootMoved(old.Pose, sample.Pose);
-        entry.HasMoved |= attached || !kinematic || rootMoved;
+        entry.HasMoved |= attached || !kinematic || rootMoved || childScaleChanged;
         float linearVelocitySquared = 0, angularVelocitySquared = 0;
         if (backpack == null && item.rig && !item.rig.isKinematic)
         {
             linearVelocitySquared = item.rig.linearVelocity.sqrMagnitude;
             angularVelocitySquared = item.rig.angularVelocity.sqrMagnitude;
         }
-        bool moving = ItemActivityPolicy.ObservedMotion(old != null, rootMoved, linearVelocitySquared, angularVelocitySquared);
+        bool moving = childScaleChanged || ItemActivityPolicy.ObservedMotion(old != null, rootMoved, linearVelocitySquared, angularVelocitySquared);
         // A delayed bounded safety poll need not replay a one-second hot phase
         // for an already settled unchanged checkpoint. New events clear Settled
         // above; a real pose/body movement still wakes immediately here.
@@ -540,7 +542,7 @@ internal sealed class ItemCapture : IDisposable
     { if (work.IsActive(entry)) SleepTransitions++; work.Sleep(entry); }
 
     private static bool BootstrapExplicitRead(Tracked entry) => entry.InitialUrgent || entry.Identity.Urgent ||
-        entry.Identity.VisualDirty || entry.Identity.HierarchyDirty || entry.Identity.Revision != entry.SeenRevision;
+        entry.Identity.VisualDirty || entry.Identity.HierarchyDirty || entry.Identity.ChildScaleDirty || entry.Identity.Revision != entry.SeenRevision;
 
     private void CaptureAnimationSignals(double now)
     {
@@ -778,7 +780,7 @@ internal sealed class ItemCapture : IDisposable
             identity.ContinuousMotionHint = false;
             bool semantic = urgent || identity.VisualDirty || identity.HierarchyDirty || identity.Revision != entryValue.SeenRevision ||
                 identity.MotionBoundary != entryValue.SeenMotionBoundary;
-            if (!semantic && entryValue.Frame != null && (entryValue.Rest.Settled || entryValue.EventOnly) && !entryValue.Attached)
+            if (!semantic && !identity.ChildScaleDirty && entryValue.Frame != null && (entryValue.Rest.Settled || entryValue.EventOnly) && !entryValue.Attached)
             {
                 if (continuousHint)
                 {
@@ -910,6 +912,16 @@ internal sealed class ItemCapture : IDisposable
         if (!item) return;
         var identity = identities.GetValue(item, _ => new Identity());
         identity.MetadataPending = true;
+        Notify(item, identity, urgent: false);
+    }
+    internal static void MarkChildScaleObservation(Item item)
+    {
+        if (!item) return;
+        var identity = identities.GetValue(item, _ => new Identity());
+        // Actual applied child scale is geometry, not an inventory/material or
+        // action boundary. Coalesce changes until the ordinary sparse read;
+        // a quiet object wakes once, without renewing any fast motion lease.
+        identity.ChildScaleDirty = true;
         Notify(item, identity, urgent: false);
     }
     private static void Notify(Item item, Identity identity, bool urgent = true)

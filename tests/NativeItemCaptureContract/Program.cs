@@ -221,6 +221,44 @@ Test("ground fuel metadata updates at five Hertz without geometry appearance rea
     Time.timeAsDouble=11.03;item.data.data![DataEntryKey.PowerEnabled]=new BoolItemData{Value=true};ItemCapture.MarkDirty(item);
     latest=capture.Capture(Array.Empty<ActorFrame>())[0];Check(latest.Lit&&latest.SampleDiscontinuity&&latest.SampleTime==11.03&&capture.NativeReads>reads&&capture.ChildReads>children);
 });
+Test("ground snowball growth captures changing child geometry before pickup at five Hertz",()=>
+{
+    var item=Born();item.rig!.isKinematic=false;item.rig.linearVelocity=new(.2f,0,0);item.transform.ChildRevision=1;
+    using var capture=new ItemCapture();var initial=capture.Capture(Array.Empty<ActorFrame>())[0];
+    long reads=capture.NativeReads,children=capture.ChildReads;int components=item.gameObject.ComponentReads;
+    ItemFrame latest=initial;
+    for(int i=1;i<=60;i++)
+    {
+        Time.timeAsDouble=10+i/30d;item.transform.position=new(i*.01f,0,0);item.transform.ChildRevision=i+1;
+        ItemCapture.MarkChildScaleObservation(item);ItemCapture.MarkChildScaleObservation(item);
+        latest=capture.Capture(Array.Empty<ActorFrame>())[0];
+    }
+    Check(capture.NativeReads-reads==10&&capture.ChildReads-children==10);
+    Check(latest.State==(int)ItemState.Ground&&(int)latest.Pose.Nodes[0]==61&&(int)initial.Pose.Nodes[0]==1);
+    Check(item.gameObject.ComponentReads==components&&latest.ClockMode==CreatureReplayRules.ActiveClock);
+});
+Test("a sleeping same-root snowball wakes for applied child scale and stops after real growth ends",()=>
+{
+    var item=Born();item.transform.ChildRevision=1;using var capture=new ItemCapture();
+    var initial=capture.Capture(Array.Empty<ActorFrame>())[0];Check(initial.ClockMode==CreatureReplayRules.SleepingClock);
+    Time.timeAsDouble=11;item.transform.ChildRevision=2;ItemCapture.MarkChildScaleObservation(item);
+    var grown=capture.Capture(Array.Empty<ActorFrame>())[0];
+    Check((int)grown.Pose.Nodes[0]==2&&grown.ClockMode==CreatureReplayRules.ActiveClock&&grown.SampleDiscontinuity);
+    for(int i=1;i<=90;i++){Time.timeAsDouble=11+i/30d;capture.Capture(Array.Empty<ActorFrame>());}
+    var quiet=capture.Capture(Array.Empty<ActorFrame>())[0];Check(quiet.ClockMode==CreatureReplayRules.SleepingClock);
+    long children=capture.ChildReads;int components=item.gameObject.ComponentReads;
+    for(int i=91;i<=210;i++){Time.timeAsDouble=11+i/30d;Check(ReferenceEquals(quiet,capture.Capture(Array.Empty<ActorFrame>())[0]));}
+    Check(capture.ChildReads==children&&item.gameObject.ComponentReads==components);
+    item.transform.ChildRevision=3;ItemCapture.MarkChildScaleObservation(item);Time.timeAsDouble+=.2;
+    Check((int)capture.Capture(Array.Empty<ActorFrame>())[0].Pose.Nodes[0]==3);
+});
+Test("failed snowball geometry observation retains its pending applied scale",()=>
+{
+    var item=Born();item.transform.ChildRevision=1;using var capture=new ItemCapture();capture.Capture(Array.Empty<ActorFrame>());
+    Time.timeAsDouble=11;item.transform.ChildRevision=2;item.transform.Failures=1;ItemCapture.MarkChildScaleObservation(item);
+    Check((int)capture.Capture(Array.Empty<ActorFrame>())[0].Pose.Nodes[0]==1);
+    Time.timeAsDouble+=.2;Check((int)capture.Capture(Array.Empty<ActorFrame>())[0].Pose.Nodes[0]==2);
+});
 Test("continuous fuel metadata cannot postpone an unknown native behavior safety fallback",()=>
 {
     var item=Born();item.gameObject.Attach(new UnclassifiedUpdater());var fuel=new FloatItemData{Value=100};item.data=new(){data=new(){[DataEntryKey.Fuel]=fuel}};

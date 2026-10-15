@@ -28,8 +28,15 @@ internal sealed class InteractionReplayResources
     private readonly Dictionary<string, Source> templates = new(StringComparer.Ordinal);
     private readonly Dictionary<int, Source> spawned = new();
     private static readonly string[] breakItems = { "Snowball", "Antidote", "Cure-All", "NestEgg", "NestEgg_Raven", "Item_Coconut", "Beehive", "ScoutmasterSoul" };
-    public static bool IsWorld(Component owner) => owner is Peak.ScoutStatue || owner is GhostFire || owner is Peak.ScoutmasterSoulPillar || owner is Campfire || owner is Peak.PeakGatePortal;
-    public static string Kind(Component owner) => owner is Peak.ScoutStatue ? "scout-statue" : owner is GhostFire ? "ghost-fire" : owner is Peak.ScoutmasterSoulPillar ? "soul-pillar" : owner is Campfire ? "campfire" : owner is Peak.PeakGatePortal ? "peak-portal" : owner is WarpCompassVFX ? "warp-compass" : owner is Peak.Action_CloneSelectedItem ? "clone-line" : owner is Action_AskBingBong ? "bing-subtitle" : owner is ArrowShooter ? "arrow-line" : "";
+    public static bool IsWorld(Component owner) => owner is Peak.ScoutStatue || owner is GhostFire || owner is Peak.ScoutmasterSoulPillar || owner is Campfire || owner is Peak.PeakGatePortal || owner is FakeItem;
+    public static string Kind(Component owner) => owner is Peak.ScoutStatue ? "scout-statue" : owner is GhostFire ? "ghost-fire" : owner is Peak.ScoutmasterSoulPillar ? "soul-pillar" : owner is Campfire ? "campfire" : owner is Peak.PeakGatePortal ? "peak-portal" : owner is FakeItem ? "fake-item" : owner is WarpCompassVFX ? "warp-compass" : owner is Peak.Action_CloneSelectedItem ? "clone-line" : owner is Action_AskBingBong ? "bing-subtitle" : owner is ArrowShooter ? "arrow-line" : "";
+    private static bool NativeFake(FakeItem fake, out string resource)
+    {
+        resource = "";
+        if (!fake || fake.GetType() != typeof(FakeItem) || !fake.realItemPrefab || fake.GetComponentInParent<Item>() ||
+            !ItemDatabase.TryGetItem(fake.realItemPrefab.itemID, out var canonical) || !canonical || canonical != fake.realItemPrefab) return false;
+        resource = "fake-item/" + canonical.itemID.ToString(CultureInfo.InvariantCulture); return true;
+    }
     public void LoadTemplates()
     {
         foreach (string name in breakItems)
@@ -64,7 +71,7 @@ internal sealed class InteractionReplayResources
     }
     public IEnumerable<Source> Initial()
     {
-        foreach (Type type in new[] { typeof(Peak.ScoutStatue), typeof(GhostFire), typeof(Peak.ScoutmasterSoulPillar), typeof(Campfire), typeof(Peak.PeakGatePortal), typeof(WarpCompassVFX), typeof(Peak.Action_CloneSelectedItem), typeof(Action_AskBingBong), typeof(ArrowShooter) })
+        foreach (Type type in new[] { typeof(Peak.ScoutStatue), typeof(GhostFire), typeof(Peak.ScoutmasterSoulPillar), typeof(Campfire), typeof(Peak.PeakGatePortal), typeof(FakeItem), typeof(WarpCompassVFX), typeof(Peak.Action_CloneSelectedItem), typeof(Action_AskBingBong), typeof(ArrowShooter) })
             foreach (var found in Object.FindObjectsByType(type, FindObjectsInactive.Include, FindObjectsSortMode.None))
                 if (found is Component owner)
                 {
@@ -88,6 +95,13 @@ internal sealed class InteractionReplayResources
     {
         if (!owner || !owner.gameObject.scene.IsValid()) return null;
         string kind = Kind(owner); if (kind.Length == 0) return null;
+        if (owner is FakeItem fake)
+        {
+            if (!NativeFake(fake, out string fakeResource)) return null;
+            string path = WorldTrack.Path(fake.transform);
+            var value = new Source { Kind = kind, Resource = fakeResource, Path = path, Root = fake.gameObject, Owner = fake };
+            scenes[kind + "\n" + path] = value; return value;
+        }
         if (owner is ArrowShooter arrow)
         {
             string path = WorldTrack.Path(owner.transform);
@@ -118,6 +132,9 @@ internal sealed class InteractionReplayResources
     }
     public Source? Resolve(InteractionReplayFrame frame)
     {
+        if (frame.Kind == "fake-item")
+            return InteractionReplayRules.CompactFakeItem(frame) && scenes.TryGetValue(frame.Kind + "\n" + frame.SourcePath, out var fakeSource) &&
+                fakeSource.Root && fakeSource.Owner is FakeItem fake && NativeFake(fake, out var resource) && resource == frame.Resource ? fakeSource : null;
         if (InteractionReplayRules.World(frame.Kind) || frame.Kind == "arrow-line")
             return scenes.TryGetValue(frame.Kind + "\n" + frame.SourcePath, out var scene) && scene.Root ? scene : null;
         if (frame.Kind == "break-debris" || frame.Kind == "inert-rocket" || frame.Kind == "turtle-shell" || frame.Kind == "stamina-sphere" || frame.Kind == "warning-arrow")
@@ -183,6 +200,11 @@ internal sealed class InteractionReplayObserver : IDisposable
             catch (Exception e) { unavailable.Add(type); warning?.Invoke("Interaction observer unavailable: " + type.Name + "." + name + " · " + e.GetType().Name); }
         }
         Patch(typeof(Peak.ScoutStatue), "Awake", action: false); Patch(typeof(Peak.ScoutStatue), "OnAmuletsChanged", action: false); Patch(typeof(Peak.ScoutStatue), "RPC_InsertAmulet");
+        // Scene pickup stand-ins (snow piles, fruit, etc.) are separate from
+        // real inventory Items. Completed visibility changes are state-only;
+        // rejection restores visibility without an animation/motion lease.
+        foreach (string method in new[] { "Awake", "Interact", "PickUpVisibly", "UnPickUpVisibly" })
+            Patch(typeof(FakeItem), method, action: false);
         Patch(typeof(GhostFire), "Start", action: false); Patch(typeof(GhostFire), "SetLit", action: false); Patch(typeof(GhostFire), "RPC_SetLit");
         // These are native visual setters, not ongoing behavior. Observe their
         // resulting state without renewing a whole-object action window.
@@ -274,7 +296,7 @@ internal sealed class InteractionReplayObserver : IDisposable
             "campfire" => typeof(Campfire), "peak-portal" => typeof(Peak.PeakGatePortal), "warp-compass" => typeof(WarpCompassVFX),
             "clone-line" => typeof(Peak.Action_CloneSelectedItem), "bing-subtitle" => typeof(Action_AskBingBong),
             "arrow-line" or "warning-arrow" => typeof(ArrowShooter), "turtle-shell" => typeof(Peak.TurtleShell),
-            "stamina-sphere" => typeof(Peak.InfiniteStamSphere), "break-debris" => typeof(Breakable), _ => null,
+            "stamina-sphere" => typeof(Peak.InfiniteStamSphere), "break-debris" => typeof(Breakable), "fake-item" => typeof(FakeItem), _ => null,
         };
         return type != null && !unavailable.Contains(type);
     }
@@ -470,6 +492,8 @@ internal sealed class InteractionReplayCapture : IDisposable
     private readonly List<int> dead = new();
     private readonly List<InteractionReplayFrame> frames = new();
     private readonly InteractionReplayResources resources = new();
+    private readonly FakeItemReplayCapture fakeItems;
+    private InteractionReplayFrame[] previousDynamic = Array.Empty<InteractionReplayFrame>(), previousFake = Array.Empty<InteractionReplayFrame>();
     private readonly InteractionReplayObserver observer;
     private readonly SegmentCaptureClient? segments;
     private readonly Action<string>? warning;
@@ -497,11 +521,15 @@ internal sealed class InteractionReplayCapture : IDisposable
     public long UnknownFallbackReadCount { get; private set; }
     public long EventBurstReadCount { get; private set; }
     public long ContinuousReadCount { get; private set; }
+    internal long FakeItemVisibilityReads => fakeItems.VisibilityReads;
+    internal long FakeItemRootReads => fakeItems.RootReads;
+    internal long FakeItemEventWakes => fakeItems.EventWakes;
+    internal int FakeItemCount => fakeItems.Count;
     internal bool InitialBaselineReady
-    { get { foreach (var entry in entries.Values) if (entry.Source.Root && entry.Last == null) return false; return true; } }
+    { get { if (!fakeItems.InitialBaselineReady) return false; foreach (var entry in entries.Values) if (entry.Source.Root && entry.Last == null) return false; return true; } }
     public InteractionReplayCapture(Action<string>? warning = null)
     {
-        this.warning = warning; resources.LoadTemplates(); current = this;
+        this.warning = warning; fakeItems = new FakeItemReplayCapture(warning); resources.LoadTemplates(); current = this;
         segments = CaptureSegmentScope.Active?.CreateClient(Admitted, Retire);
         try { observer = new InteractionReplayObserver(Changed, Spawned, warning, ArrowLineUnchanged); }
         catch { segments?.Dispose(); if (ReferenceEquals(current, this)) current = null; throw; }
@@ -514,6 +542,8 @@ internal sealed class InteractionReplayCapture : IDisposable
         int id = source.Root.GetInstanceID();
         candidates[id] = source;
         if (!(segments?.Admit(source.Root, action) ?? true)) return;
+        if (source.Kind == "fake-item" && source.Owner is FakeItem fake)
+        { fakeItems.Register(fake, source.Resource, source.Path, action); return; }
         if (entries.TryGetValue(id, out var old) && old.Source.Root == source.Root)
         {
             old.Dirty = true;
@@ -523,7 +553,7 @@ internal sealed class InteractionReplayCapture : IDisposable
             if (source.Line) old.LineWidth = source.Line!.widthCurve;
             return;
         }
-        if (entries.Count >= InteractionReplayRules.MaximumEntities) { Warn("limit", "互动实体目录达到768个上限，超出部分未录制。"); return; }
+        if (entries.Count >= InteractionReplayRules.MaximumDynamicEntities) { Warn("limit", "互动实体目录达到768个上限，超出部分未录制。"); return; }
         bool gloom = !gloomAssigned && source.Kind == "ghost-fire"; gloomAssigned |= gloom;
         var components = source.Root.GetComponentsInChildren<MonoBehaviour>(true);
         bool missingObserver = !observer.Healthy(source.Kind) || source.Kind == "peak-portal" && portalInteracting == null;
@@ -578,6 +608,7 @@ internal sealed class InteractionReplayCapture : IDisposable
     private void Retire(int id)
     {
         if (candidates.TryGetValue(id, out var candidate) && !candidate.Root) candidates.Remove(id);
+        if (fakeItems.Remove(id)) return;
         if (!entries.TryGetValue(id, out var entry)) return;
         entry.Lifecycle.Retire();
         entry.RootLifecycle?.Dispose();
@@ -649,6 +680,7 @@ internal sealed class InteractionReplayCapture : IDisposable
     public InteractionReplayFrame[] Capture(double now)
     {
         if (disposed) throw new ObjectDisposedException(nameof(InteractionReplayCapture));
+        var fakeFrames = fakeItems.Capture(now);
         frames.Clear(); dead.Clear();
         foreach (var pair in entries)
         {
@@ -722,9 +754,15 @@ internal sealed class InteractionReplayCapture : IDisposable
         foreach (int id in dead) { segments?.Forget(id); candidates.Remove(id); Retire(id); }
         if (!gloomAssigned)
             foreach (var entry in entries.Values) if (entry.Source.Kind == "ghost-fire") { entry.Gloom = gloomAssigned = true; break; }
-        bool same = frames.Count == previous.Length;
-        if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previous[i])) { same = false; break; }
-        return same ? previous : previous = frames.ToArray();
+        bool same = frames.Count == previousDynamic.Length;
+        if (same) for (int i = 0; i < frames.Count; i++) if (!ReferenceEquals(frames[i], previousDynamic[i])) { same = false; break; }
+        if (same && ReferenceEquals(fakeFrames, previousFake)) return previous;
+        if (!same) previousDynamic = frames.ToArray();
+        previousFake = fakeFrames;
+        previous = new InteractionReplayFrame[previousDynamic.Length + fakeFrames.Length];
+        Array.Copy(previousDynamic, previous, previousDynamic.Length);
+        Array.Copy(fakeFrames, 0, previous, previousDynamic.Length, fakeFrames.Length);
+        return previous;
     }
     private InteractionContinuousState ReadContinuous(Entry entry, double now, bool active)
     {
@@ -878,7 +916,7 @@ internal sealed class InteractionReplayCapture : IDisposable
     private void Warn(string key, string message) { if (warned.Count < 64 && warned.Add(key)) warning?.Invoke(message); }
     public void Dispose()
     {
-        if (disposed) return; disposed = true; if (ReferenceEquals(current, this)) current = null; observer.Dispose(); segments?.Dispose();
+        if (disposed) return; disposed = true; if (ReferenceEquals(current, this)) current = null; observer.Dispose(); segments?.Dispose(); fakeItems.Dispose();
         foreach (var entry in entries.Values) { entry.RootLifecycle?.Dispose(); entry.Lifecycle.Retire(); VisualReplica.ReleaseCapture(entry.Root); }
         entries.Clear(); candidates.Clear(); frames.Clear(); dead.Clear(); previous = Array.Empty<InteractionReplayFrame>();
     }

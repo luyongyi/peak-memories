@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 
@@ -118,6 +120,9 @@ public static class ReplayTrajectoryExporter
     private const long MaximumRetainedPoints = MaximumDecodedBytes / 72;
     private const int MaximumEvents = 100_000;
     private const int MaximumRetainedEvents = 200_000;
+    private const int MaximumDecodeWorkers = 4;
+    // Indexed model estimate only; decoder scratch and runtime overhead are extra.
+    private const long MaximumDecodeBatchBytes = 128L * 1024 * 1024;
     private static readonly JsonSerializerSettings UploadJson = new()
     {
         TypeNameHandling = TypeNameHandling.None, MaxDepth = 12,
@@ -126,9 +131,9 @@ public static class ReplayTrajectoryExporter
     };
 
     // Invoke on a disk worker (Task.Run), never in the live capture loop.
-    // Pages are released after each read. A metadata pass establishes one shared
-    // clock; bounded whole-member batches are reread as needed. No member is
-    // removed to satisfy a package size or an arbitrary team-size limit.
+    // Independent pages decode concurrently in bounded batches, then feed the
+    // stateful route builder in time order. Normally metadata and points share
+    // one read; over-budget recordings fall back to whole-member rereads.
     public static TrajectoryExportResult Export(string recordingPath, string outputDirectory,
         CancellationToken cancellation = default, Action<double>? progress = null)
         => ExportCore(recordingPath, outputDirectory, MaximumCompressedBytes, MaximumDecodedBytes, cancellation, progress);
@@ -151,25 +156,66 @@ public static class ReplayTrajectoryExporter
         var info = FullReplayArchive.ReadInfo(recordingPath, cancellation);
         if (!info.Complete || !string.IsNullOrEmpty(info.FaultCode) || !string.IsNullOrEmpty(info.Fault))
             throw new InvalidDataException("这份录像未正常封存，暂时不能上传轨迹。是否通关不影响正常封存录像上传。");
-        void Read(Builder builder, bool metadata)
+        // Own an immutable, once-validated index. Public ReadPage deliberately
+        // revalidates caller-mutable metadata, which is quadratic for this scan.
+        using var lineBuffers = new ReplayLineBufferPool();
+        using var sharedBuffers = new FullReplaySharedScratchPool();
+        var loadPage = FullReplayArchive.CreatePageLoader(recordingPath, info, cancellation, lineBuffers, sharedBuffers);
+        int workers = Math.Max(1, Math.Min(MaximumDecodeWorkers, Environment.ProcessorCount - 1));
+        void Read(Action<ReplayFrame> observe, bool metadata)
         {
             double previous = -1;
-            for (int i = 0; i < info.Pages.Length; i++)
+            for (int first = 0; first < info.Pages.Length;)
             {
                 cancellation.ThrowIfCancellationRequested();
-                var page = FullReplayArchive.ReadPage(recordingPath, info, i, cancellation);
-                foreach (var frame in page.Frames)
+                int count = 1;
+                long bytes = info.Pages[first].DecodedBytes;
+                while (count < workers && first + count < info.Pages.Length &&
+                    info.Pages[first + count].DecodedBytes <= MaximumDecodeBatchBytes - bytes)
+                    bytes += info.Pages[first + count++].DecodedBytes;
+                var pages = new ReplayClip?[count];
+                try
+                {
+                    if (count == 1) pages[0] = loadPage(first, cancellation);
+                    else Parallel.For(0, count, new ParallelOptions
+                    { MaxDegreeOfParallelism = workers, CancellationToken = cancellation },
+                        offset => pages[offset] = loadPage(first + offset, cancellation));
+                }
+                catch (AggregateException error)
                 {
                     cancellation.ThrowIfCancellationRequested();
-                    if (frame.T <= previous) continue;
-                    builder.Observe(frame); previous = frame.T;
+                    var failures = error.Flatten().InnerExceptions;
+                    if (failures.Count == 1) ExceptionDispatchInfo.Capture(failures[0]).Throw();
+                    throw;
                 }
-                if (metadata) progress?.Invoke((i + 1d) / info.Pages.Length * .45);
+                // No builder/progress/UI state is touched by decode workers.
+                // Parallel.For joins every worker before exceptions or pool disposal.
+                for (int offset = 0; offset < count; offset++)
+                {
+                    foreach (var frame in pages[offset]!.Frames)
+                    {
+                        cancellation.ThrowIfCancellationRequested();
+                        if (frame.T <= previous) continue;
+                        observe(frame); previous = frame.T;
+                    }
+                    pages[offset] = null;
+                    if (metadata) progress?.Invoke((first + offset + 1d) / info.Pages.Length * .45);
+                }
+                first += count;
             }
         }
         var overview = new Builder(info.Header, info.Duration, retainData: false);
-        Read(overview, true);
+        Builder? retained = new Builder(info.Header, info.Duration);
+        Read(frame =>
+        {
+            overview.Observe(frame);
+            if (retained == null) return;
+            try { retained.Observe(frame); }
+            catch (PackageBudgetException) { retained = null; }
+        }, true);
         var package = overview.Finish();
+        TrajectoryPackage? retainedPackage = retained?.Finish(package);
+        retained = null;
         string directory = System.IO.Path.GetFullPath(outputDirectory);
         Directory.CreateDirectory(directory);
         var paths = new List<string>();
@@ -178,11 +224,18 @@ public static class ReplayTrajectoryExporter
         void Batch(string[] ids)
         {
             cancellation.ThrowIfCancellationRequested();
+            // Only the initial whole-team batch can reuse the first pass.
+            // Drop it before recursive subdivision if its encoded size is too big.
+            TrajectoryPackage? batch = retainedPackage;
+            retainedPackage = null;
             try
             {
-                var builder = new Builder(info.Header, info.Duration, selectedIds: new HashSet<string>(ids, StringComparer.Ordinal));
-                Read(builder, false);
-                var batch = builder.Finish(package);
+                if (batch == null)
+                {
+                    var builder = new Builder(info.Header, info.Duration, selectedIds: new HashSet<string>(ids, StringComparer.Ordinal));
+                    Read(builder.Observe, false);
+                    batch = builder.Finish(package);
+                }
                 var written = WritePackage(batch, directory, compressedLimit, decodedLimit, cancellation);
                 paths.Add(written.Path); rawBytes += written.Decoded; compressedBytes += written.Compressed;
                 exportedMembers += ids.Length;
@@ -190,6 +243,7 @@ public static class ReplayTrajectoryExporter
             }
             catch (PackageBudgetException) when (ids.Length > 1)
             {
+                batch = null;
                 // Whole-member subdivision preserves every individual's actual
                 // route; time slicing would require inventing cross-upload joins.
                 int middle = ids.Length / 2;

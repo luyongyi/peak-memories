@@ -72,7 +72,7 @@ internal static class NativeSharedPackingTests
         {
             var frames = ForestFrames(); var path = Save(root, frames); var info = FullReplayArchive.ReadInfo(path);
             var blocks = info.SharedBlocks ?? throw new Exception("Missing native forest shared blocks.");
-            Check(info.Header.Schema == Schema && info.Pages.Length >= 10);
+            Check(info.Header.Schema == ReplayRules.CurrentSchema && info.Pages.Length >= 10);
             Check(blocks.Count(block => block.Kind == 9) == 1,
                 "An unchanged 457-creature order was duplicated across pages.");
             Check(blocks.Count(block => block.Kind == 10) == 2,
@@ -356,7 +356,7 @@ internal static class NativeSharedPackingTests
     { Check(value is JObject reference && reference.Count == 1 && reference["$Shared"]?.Type == JTokenType.Integer, "Expected one direct shared reference."); return (int)value!["$Shared"]!; }
     private static string Save(string root, ReplayFrame[] frames)
     {
-        var writer = new FullReplayWriter(root, new ReplayHeader { Schema = Schema, Scene = "Level_NativeSharedForest" });
+        var writer = new FullReplayWriter(root, new ReplayHeader { Scene = "Level_NativeSharedForest" });
         foreach (var frame in frames) Check(writer.TryEnqueue(frame));
         var result = writer.CompleteAsync().GetAwaiter().GetResult();
         Check(result.Status == "completed", result.Fault ?? "Native forest recording failed."); return result.FilePath;

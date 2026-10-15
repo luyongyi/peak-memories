@@ -10,6 +10,7 @@
     <Project Path="tests/NativeAppearanceContract/NativeAppearanceContract.csproj" />
     <Project Path="tests/NativeCreatureObserverContract/NativeCreatureObserverContract.csproj" />
     <Project Path="tests/NativeItemObserverContract/NativeItemObserverContract.csproj" />
+    <Project Path="tests/FakeItemReplayContract/FakeItemReplayContract.csproj" />
     <Project Path="tests/StaticPlaybackContract/StaticPlaybackContract.csproj" />
     <Project Path="tests/CreatureIdleAnimationContract/CreatureIdleAnimationContract.csproj" />
     <Project Path="tests/RavenAnimationContract/RavenAnimationContract.csproj" />

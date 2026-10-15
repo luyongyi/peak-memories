@@ -9,6 +9,7 @@ internal static partial class FullReplaySharedBlockTests
     public static void Run(Action<string, Action> test)
     {
         RunStaticTraps(test);
+        RunFakeItems(test);
         RunSharedLimits(test);
         test("shared gzip footer collection preserves every short read split and member boundary", () =>
         {

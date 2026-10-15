@@ -311,6 +311,8 @@ internal sealed class RollingCapture : IDisposable
         interactions.LightReadCount, interactions.PostReadCount, interactions.GloomReadCount,
         interactions.EventWakeCount, interactions.SleepingSkipCount, interactions.UnknownFallbackReadCount,
         interactions.EventBurstReadCount, interactions.ContinuousReadCount,
+        interactions.FakeItemCount, interactions.FakeItemVisibilityReads,
+        interactions.FakeItemRootReads, interactions.FakeItemEventWakes,
     };
     internal object SpawnedDiagnostics => spawned == null ? new { Initializing = true } : new
     { spawned.GeometryReads, spawned.LightReads, spawned.AppearanceReads, spawned.SleepingGeometrySkips };

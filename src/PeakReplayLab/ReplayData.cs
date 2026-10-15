@@ -14,7 +14,7 @@ public sealed class ReplayHeader
     internal ReplayRegionOutcome? CoverOutcome;
     public string Type { get; set; } = "header";
     public int Schema { get; set; } = ReplayRules.CurrentSchema;
-    public string Recorder { get; set; } = "PeakReplayLab/0.8.32";
+    public string Recorder { get; set; } = "PeakReplayLab/0.8.33";
     public string Scene { get; set; } = "";
     public string GameVersion { get; set; } = "";
     public int BuildId { get; set; }
@@ -145,7 +145,7 @@ public sealed class ReplayClip
 
 public static class ReplayRules
 {
-    public const int CurrentSchema = 26;
+    public const int CurrentSchema = 27;
     public static bool SupportedSchema(int schema) => schema >= 10 && schema <= CurrentSchema;
     // Scoped to one immutable save/read operation, never trusts a previous operation.
     internal sealed class ValidationMemo
@@ -189,7 +189,7 @@ public static class ReplayRules
     private static readonly ReplayTrackValidation<BalloonReplayFrame> capturedBalloons = BalloonValidation();
     private static readonly ReplayTrackValidation<CreatureReplayFrame> capturedCreatures = CreatureValidation();
     private static readonly ReplayTrackValidation<InteractionReplayFrame> capturedInteractions = InteractionValidation();
-    private static ReplayTrackValidation<InteractionReplayFrame> InteractionValidation() => new(x => x.Key, MaxInteractions, InteractionReplayRules.Validate);
+    private static ReplayTrackValidation<InteractionReplayFrame> InteractionValidation() => new(x => x.Key, MaxInteractions, InteractionReplayRules.Validate, InteractionReplayRules.ValidateCounts);
     private static ReplayTrackValidation<RopeReplayFrame> RopeValidation() => new(x => x.Key, MaxRopes, RopeReplayRules.Validate, RopeReplayRules.ValidateCounts);
     private static ReplayTrackValidation<EffectReplayFrame> EffectValidation() => new(x => x.Key, MaxEffects, EffectReplayRules.Validate);
     private static ReplayTrackValidation<AudioReplayFrame> AudioValidation() => new(x => x.Key, MaxAudio, AudioReplayRules.Validate);
@@ -256,6 +256,8 @@ public static class ReplayRules
     internal static void ValidateVersion(ReplayFrame frame, int schema, VersionValidationMemo? memo = null)
     {
         if (!SupportedSchema(schema)) throw new InvalidDataException("Unsupported replay format; record a new replay.");
+        if (schema < 27 && (frame.Interactions.Length > 768 || Array.Exists(frame.Interactions, interaction => interaction.Kind == "fake-item")))
+            throw new InvalidDataException("Static native pickup visibility requires schema 27.");
         if (schema < 25 && (Array.Exists(frame.Items, item => item.SampleTimeKnown || item.SampleTime != 0 || item.ClockMode != CreatureReplayRules.ActiveClock || item.SampleDiscontinuity ||
                 item.IdleAnimation is { } animation && (CreatureIdleAnimationRules.IsEarlyWormClip(animation.Clip) || animation.SpinRotation != null || animation.SpinSpeed != 0)) ||
             Array.Exists(frame.Creatures, creature => creature.SampleDiscontinuity || creature.IdleAnimation is { } animation && (animation.SpinRotation != null || animation.SpinSpeed != 0))))
