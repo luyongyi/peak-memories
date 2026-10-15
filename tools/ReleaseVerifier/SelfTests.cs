@@ -20,11 +20,12 @@ internal static class SelfTests
         {
             string repo = Path.Combine(temp, "repo"), zip = Path.Combine(temp, "test.zip");
             string source = Path.Combine(repo, "src", "PeakReplayLab"); Directory.CreateDirectory(source);
-            void Sources(string projectVersion = "0.7.4", string pluginVersion = "0.7.4", string recorderVersion = "0.7.4")
+            void Sources(string projectVersion = "0.7.4", string pluginVersion = "0.7.4", string recorderVersion = "0.7.4",
+                string schemas = "schema == 10 || schema == 11 || schema == 12 || schema == CurrentSchema")
             {
                 File.WriteAllText(Path.Combine(source, "PeakReplayLab.csproj"), "<Project><PropertyGroup><Version>" + projectVersion + "</Version><AssemblyName>PeakReplayLab</AssemblyName></PropertyGroup></Project>");
                 File.WriteAllText(Path.Combine(source, "Plugin.cs"), "[BepInPlugin(\"cn.mylus.peakreplaylab\", \"Synthetic fixture\", \"" + pluginVersion + "\")] class Plugin {}");
-                File.WriteAllText(Path.Combine(source, "ReplayData.cs"), "class ReplayHeader { public string Recorder { get; set; } = \"PeakReplayLab/" + recorderVersion + "\"; } class ReplayRules { public const int CurrentSchema = 13; public static bool SupportedSchema(int schema) => schema == 10 || schema == 11 || schema == 12 || schema == CurrentSchema; }");
+                File.WriteAllText(Path.Combine(source, "ReplayData.cs"), "class ReplayHeader { public string Recorder { get; set; } = \"PeakReplayLab/" + recorderVersion + "\"; } class ReplayRules { public const int CurrentSchema = 13; public static bool SupportedSchema(int schema) => " + schemas + "; }");
             }
             Manifest Fresh() => new()
             {
@@ -65,6 +66,11 @@ internal static class SelfTests
             }
 
             Sources(); var valid = Entries(Fresh()); Checksum(valid); Archive(valid); Verifier.Verify(zip, repo, "v0.7.4", Commit); passed++;
+            Sources(schemas: "schema >= 10 && schema <= CurrentSchema"); Verifier.Verify(zip, repo, "v0.7.4", Commit); passed++;
+            Reject("range schema drift", "Supported replay schemas", changeSource: () => Sources(schemas: "schema >= 11 && schema <= CurrentSchema"));
+            Reject("inverted schema range", "schema range", changeSource: () => Sources(schemas: "schema >= 14 && schema <= CurrentSchema"));
+            Reject("open schema range", "Unsupported SupportedSchema", changeSource: () => Sources(schemas: "schema >= 10"));
+            Reject("arbitrary schema expression", "Unsupported SupportedSchema", changeSource: () => Sources(schemas: "schema >= 10 && schema <= CurrentSchema || AllowFuture(schema)"));
             Reject("tag format", "Tag must", tag: "v0.7.4-rc.1");
             Reject("full commit required", "Commit must", commit: "1111111");
             Reject("project version", "csproj version", changeSource: () => Sources(projectVersion: "0.7.3"));
