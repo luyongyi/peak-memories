@@ -48,6 +48,7 @@ internal sealed class ReplayTheatre : IDisposable
     public bool NativeLoadingVisible => nativeLoading?.Visible == true;
     public string Label { get; private set; } = "";
     public string SourceFileName { get; private set; } = "";
+    public string SourcePath { get; private set; } = "";
 
     public ReplayTheatre(Action<string> note, Action<Exception> error, Action<string>? trace = null) { this.note = note; this.error = error; this.trace = trace; }
 
@@ -58,6 +59,7 @@ internal sealed class ReplayTheatre : IDisposable
             throw new InvalidOperationException("请先退出本局，回到游戏主菜单再打开回忆录。");
         if (LoadingScreenHandler.loading) throw new InvalidOperationException("游戏仍在加载，请稍后打开回忆录。");
         SourceFileName = Path.GetFileName(path);
+        SourcePath = Path.GetFullPath(path);
         failure = "";
         readCancellation = new CancellationTokenSource();
         var token = readCancellation.Token;

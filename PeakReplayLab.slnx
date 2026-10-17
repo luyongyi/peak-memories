@@ -38,6 +38,10 @@
   <Project Path="src/PeakReplayLab/PeakReplayLab.csproj" />
   <Project Path="tests/ReplayContract/ReplayContract.csproj" />
   <Project Path="tests/ReplayViewContract/ReplayViewContract.csproj" />
+  <Project Path="tests/ReplayCameraContract/ReplayCameraContract.csproj" />
+  <Project Path="tests/CinemaContract/CinemaContract.csproj" />
+  <Project Path="tests/CinemaEffectsContract/CinemaEffectsContract.csproj" />
+  <Project Path="tests/CinemaControllerContract/CinemaControllerContract.csproj" />
   <Project Path="tests/ReplayNameplateContract/ReplayNameplateContract.csproj" />
   <Project Path="tests/ReplayAudioSpatialContract/ReplayAudioSpatialContract.csproj" />
   <Project Path="tests/NativeLoadingContract/NativeLoadingContract.csproj" />

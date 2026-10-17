@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework Condition="'$(UnityApiCheck)' != 'true'">net8.0</TargetFramework>
+    <TargetFramework Condition="'$(UnityApiCheck)' == 'true'">netstandard2.1</TargetFramework>
+    <OutputType Condition="'$(UnityApiCheck)' != 'true'">Exe</OutputType>
+    <OutputType Condition="'$(UnityApiCheck)' == 'true'">Library</OutputType>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NuGetAudit>false</NuGetAudit>
+    <PEAKGameRootDir Condition="'$(PEAKGameRootDir)' == ''">C:/Program Files (x86)/Steam/steamapps/common/PEAK/</PEAKGameRootDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../modules/PeakReplayCinema/Unity/CinemaEffects.cs" Link="CinemaEffects.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UnityApiCheck)' == 'true'">
+    <Compile Remove="Program.cs;UnityDoubles.cs" />
+    <GameAssembly Include="$(PEAKGameRootDir)PEAK_Data/Managed/*.dll" Exclude="$(PEAKGameRootDir)PEAK_Data/Managed/Mono*.dll;$(PEAKGameRootDir)PEAK_Data/Managed/netstandard.dll;$(PEAKGameRootDir)PEAK_Data/Managed/System*.dll;$(PEAKGameRootDir)PEAK_Data/Managed/mscorlib.dll" />
+    <Reference Include="@(GameAssembly)" Private="false" />
+  </ItemGroup>
+</Project>

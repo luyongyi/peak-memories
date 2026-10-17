@@ -48,6 +48,9 @@ internal sealed class NativeReplayConsole : IDisposable
     private RectTransform bufferingRoot = null!;
     private TMP_Text title = null!, clock = null!, status = null!, detailTitle = null!, held = null!, itemEvents = null!, diagnostics = null!;
     private Button play = null!, camera = null!, backpack = null!, diagnosticButton = null!, collapse = null!;
+    private Button? presentationButton;
+    private bool presentationVisible = true;
+    private readonly Action? openPresentation;
     private Slider timeline = null!;
     private Image panelImage = null!;
     private GameObject buttonPrefab = null!;
@@ -70,9 +73,10 @@ internal sealed class NativeReplayConsole : IDisposable
     public bool IsBufferingNoticeVisible => bufferingRoot && bufferingRoot.gameObject.activeInHierarchy;
     private float DrawerTravel => Mathf.Max(1, height + 12);
 
-    public NativeReplayConsole(PlaybackSession session, Action close, Action toggleDiagnostics, Action<Exception> error)
+    public NativeReplayConsole(PlaybackSession session, Action close, Action toggleDiagnostics, Action<Exception> error, Action? openPresentation = null)
     {
         this.session = session; this.close = close; this.toggleDiagnostics = toggleDiagnostics; this.error = error;
+        this.openPresentation = openPresentation;
         try { Build(); }
         catch { Dispose(); throw; }
     }
@@ -135,7 +139,7 @@ internal sealed class NativeReplayConsole : IDisposable
             speeds.Add((button, speed));
         }
         Button("切换玩家 [Tab]", controls, session.CycleFocus);
-        camera = Button("跟随镜头", controls, session.ToggleCamera);
+        camera = Button("第三人称 [C]", controls, session.ToggleCamera);
         cameraText = camera.GetComponentInChildren<TMP_Text>(true);
         backpack = Button("背包详情", controls, () => { detailsExpanded = !detailsExpanded; nextDetailUpdate = 0; detailRevision = -1; width = -1; });
         Button("返回 [Esc]", controls, close);
@@ -157,6 +161,7 @@ internal sealed class NativeReplayConsole : IDisposable
         diagnostics = Text("Playback diagnostics", panel, 19, TextAlignmentOptions.Left);
         diagnostics.textWrappingMode = TextWrappingModes.Normal;
         collapse = Button("收起 [H]", panel, Hide);
+        if (openPresentation != null) presentationButton = Button("电影模式 [F8]", panel, openPresentation);
         details.gameObject.SetActive(false); diagnostics.gameObject.SetActive(false);
         BuildDrawerHandle();
         BuildBufferingNotice();
@@ -205,6 +210,7 @@ internal sealed class NativeReplayConsole : IDisposable
     public void Tick(bool showDiagnostics, string performance, string hudWarning)
     {
         if (disposed || !root) return;
+        if (!presentationVisible) return;
         bool changed = diagnosticExpanded != showDiagnostics;
         diagnosticExpanded = showDiagnostics;
         group.interactable = Application.isFocused && !session.CameraLooking;
@@ -230,11 +236,13 @@ internal sealed class NativeReplayConsole : IDisposable
             }
             timeline.SetValueWithoutNotify((float)displayed);
             SetText(playText, session.Paused ? "播放 [空格]" : "暂停 [空格]");
-            SetText(cameraText, session.FreeCamera ? "自由镜头" : "跟随镜头");
+            SetText(cameraText, session.FreeCamera ? "游离镜头 [C]" : "第三人称 [C]");
             SetSelected(camera, session.FreeCamera); SetSelected(backpack, detailsExpanded);
             foreach (var speed in speeds) SetSelected(speed.Button, speed.Speed == session.Speed);
             SetSelected(diagnosticButton, diagnosticExpanded);
-            string hint = session.FreeCamera ? "右键 + WASD / Q E 移动 · Shift 加速" : "按住右键转向 · 指向画面滚轮缩放（1–35 米）";
+            string hint = session.FreeCamera ? "右键 + WASD / QE 飞行 · 滚轮调速 " +
+                session.FreeCameraSpeed.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " m/s · Shift 加速 / Ctrl 慢速" :
+                "右键转向 · 滚轮缩放 2.5 米/格（1–35 米）· C 游离镜头";
             if (session.Buffering) hint = bufferingNotice.Text;
             else if (!string.IsNullOrEmpty(hudWarning)) hint = hudWarning;
             else if (!string.IsNullOrEmpty(session.ObjectWarning)) hint = session.ObjectWarning;
@@ -271,10 +279,11 @@ internal sealed class NativeReplayConsole : IDisposable
         Place(bufferingText.rectTransform, 20, 9, noticeWidth - 40, 30);
         Place(bufferingDetail.rectTransform, 20, 43, noticeWidth - 40, 23);
         float inner = width - 40, y = 16;
-        float heading = inner - 176;
+        float heading = inner - 176 - (presentationButton ? 180 : 0);
         Place(title.rectTransform, 20, y, heading * .60f, 32);
         Place(clock.rectTransform, 20 + heading * .60f, y, heading * .40f, 32);
         Place((RectTransform)collapse.transform, width - 178, y - 2, 156, 35); y += 42;
+        if (presentationButton) Place((RectTransform)presentationButton.transform, width - 358, 14, 168, 35);
         Place((RectTransform)timeline.transform, 24, y, inner - 8, 26); y += 36;
         Place(controls, 20, y, inner, 48);
         float[] sizes = { 180, 92, 82, 70, 70, 210, 168, 160, 145 };
@@ -368,6 +377,14 @@ internal sealed class NativeReplayConsole : IDisposable
 
     public void ToggleDrawer()
     { if (disposed) return; drawer.Toggle(); DrawerChanged(); }
+    public void SetPresentationVisible(bool visible)
+    {
+        presentationVisible = visible;
+        if (!root) return;
+        group.alpha = visible ? 1 : 0;
+        group.interactable = group.blocksRaycasts = visible;
+        if (!visible) EventSystem.current?.SetSelectedGameObject(null);
+    }
     public void Show()
     { if (disposed) return; drawer.SetOpen(true); DrawerChanged(); }
     public void Hide()

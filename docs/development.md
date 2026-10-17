@@ -14,6 +14,16 @@ dotnet build PeakReplayLab.slnx -c Release "-p:PEAKGameRootDir=C:/Program Files 
 
 ## 独立测试
 
+电影模式是可选的共享源码模块，维护边界与排除模块的单 DLL 对照构建见 [电影模块说明](../modules/PeakReplayCinema/README.md)。`Core` 不引用游戏，录制／归档／上传不引用电影代码。新增三个独立测试项目也在 Windows／Ubuntu CI 与发布校验中运行：
+
+```powershell
+dotnet run --project tests/CinemaContract/CinemaContract.csproj -c Release
+dotnet run --project tests/CinemaEffectsContract/CinemaEffectsContract.csproj -c Release
+dotnet run --project tests/CinemaControllerContract/CinemaControllerContract.csproj -c Release
+```
+
+三者分别检查机位数学与独立文件、URP 恢复／资源隔离、回放时间同步／编辑器生命周期。替身不代表渲染验收；本机 `tools/CinemaSmoke` 配合已有兼容短录像检查真实游戏效果和截图，不向产品打包测试伴随插件。
+
 `AutomaticFullRunStartContract` 检查自动完整录制的启动资格和首帧失败恢复：首个有效帧前不创建文件，成功首帧随即入队；文件创建失败、手动停止及已开始录像的故障仍保留一次性停止规则。纯策略及状态机测试不替代存档恢复实机验收。
 
 ```powershell
@@ -44,6 +54,8 @@ Schema 21 原生待机与幽灵主体的数据契约随完整 `ReplayContract` �
 
 `ItemPlaybackContract` 和 `StaticPlaybackContract` 直接测试物品、放置物、互动实体及生物的生产播放调度，覆盖换页预算暂缓、暂停续作、跳转与池复用重置，以及不断变化的外观仍能推进。
 
+`ReplayCameraContract` 直接编译无 Unity 依赖的镜头输入与位移策略，检查两种滚轮单位的一格效果一致、细滚动无死区、第三人称缩放范围、自由飞行速度、对角线归一化、加速与精细移动、真实帧时钟及无效输入。它不替代游戏内的鼠标焦点、快捷键、暂停飞行和镜头恢复验收。
+
 以下可执行测试项目不需要游戏安装或游戏资产，可以逐个运行：
 
 ```powershell
@@ -62,6 +74,7 @@ dotnet run --project tests/NativeParameterCadenceContract/NativeParameterCadence
 dotnet run --project tests/ReplaySceneBudgetContract/ReplaySceneBudgetContract.csproj -c Release
 dotnet run --project tests/NativeLoadingContract/NativeLoadingContract.csproj -c Release
 dotnet run --project tests/ReplayViewContract/ReplayViewContract.csproj -c Release
+dotnet run --project tests/ReplayCameraContract/ReplayCameraContract.csproj -c Release
 dotnet run --project tests/ReplayNameplateContract/ReplayNameplateContract.csproj -c Release
 dotnet run --project tests/ReplayAudioSpatialContract/ReplayAudioSpatialContract.csproj -c Release
 dotnet run --project tests/TrajectoryContract/TrajectoryContract.csproj -c Release

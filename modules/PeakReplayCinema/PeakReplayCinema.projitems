@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <DefineConstants>$(DefineConstants);PEAK_CINEMA</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Source composition: one distributable DLL, no runtime cinema assembly. -->
+    <Compile Include="$(MSBuildThisFileDirectory)Core/**/*.cs" LinkBase="Cinema/Core" />
+    <Compile Include="$(MSBuildThisFileDirectory)Unity/**/*.cs" LinkBase="Cinema/Unity" />
+    <Compile Include="$(MSBuildThisFileDirectory)Integration/**/*.cs" LinkBase="Cinema/Integration" />
+  </ItemGroup>
+</Project>

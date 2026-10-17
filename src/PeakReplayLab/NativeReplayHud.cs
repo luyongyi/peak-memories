@@ -31,6 +31,12 @@ internal sealed class NativeReplayHud : IDisposable
     private bool? warningHasActor, warningStateKnown, warningInventoryKnown;
     private string warningResources = "";
     public bool BackpackExpanded { get; set; }
+    private bool presentationVisible = true;
+    public void SetPresentationVisible(bool visible)
+    {
+        presentationVisible = visible;
+        if (root) root.SetActive(visible);
+    }
     public string Warning { get; private set; } = "";
     public string Diagnostic => "native-hud=" + root.activeInHierarchy + "; " + (bar?.Diagnostic ?? "bar-not-created") + "; " + Warning;
 
@@ -130,7 +136,7 @@ internal sealed class NativeReplayHud : IDisposable
 
     public void Tick(PlaybackSession session)
     {
-        if (disposed) return;
+        if (disposed || !presentationVisible) return;
         var scheme = InputHandler.GetCurrentUsedInputScheme();
         if (inputScheme != scheme)
         {

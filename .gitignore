@@ -10,6 +10,8 @@
 *.peakrun.seekcache/
 *.seekpage
 *.peakreplay
+*.camera.json
+.cinema-*.tmp
 *.ndjson
 *.partial
 *.trajectory.json.gz

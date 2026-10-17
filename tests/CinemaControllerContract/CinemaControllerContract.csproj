@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <CinemaProductionRoot Condition="'$(CinemaProductionRoot)' == ''">$(MSBuildThisFileDirectory)../../</CinemaProductionRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(CinemaProductionRoot)/modules/PeakReplayCinema/Core/*.cs" Link="Production/Core/%(Filename)%(Extension)" />
+    <Compile Include="$(CinemaProductionRoot)/modules/PeakReplayCinema/Unity/CinemaController*.cs" Link="Production/CinemaController.cs" />
+    <Compile Include="$(CinemaProductionRoot)/modules/PeakReplayCinema/Unity/CinemaEditorContracts.cs" Link="Production/CinemaEditorContracts.cs" />
+    <Compile Include="$(CinemaProductionRoot)/modules/PeakReplayCinema/Integration/CinemaProjectFiles.cs" Link="Production/CinemaProjectFiles.cs" />
+    <Compile Include="$(CinemaProductionRoot)/modules/PeakReplayCinema/Integration/CinemaRecordingIdentity.cs" Link="Production/CinemaRecordingIdentity.cs" />
+    <Compile Include="$(CinemaProductionRoot)/src/PeakReplayLab/IReplayPresentationExtension.cs" Link="Production/IReplayPresentationExtension.cs" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>

@@ -90,8 +90,9 @@ internal static class SelfTests
             Reject("unsupported old schema", "Supported replay schemas", manifest => manifest.Replay.SupportedSchemas = new[] { 9, 10, 11, 12, 13 });
             Reject("failed contracts", "did not pass", manifest => manifest.Contracts.Passed = false);
             Reject("missing contract", "Contract projects", manifest => manifest.Contracts.Projects = manifest.Contracts.Projects[1..]);
-            foreach (string project in new[] { "TrajectoryContract", "TrajectoryUploadContract" })
+            foreach (string project in new[] { "ReplayCameraContract", "CinemaContract", "CinemaEffectsContract", "CinemaControllerContract", "TrajectoryContract", "TrajectoryUploadContract" })
                 Reject("missing " + project, "Contract projects", manifest => manifest.Contracts.Projects = manifest.Contracts.Projects.Where(name => name != project).ToArray());
+            Reject("unexpected contract", "Contract projects", manifest => manifest.Contracts.Projects = manifest.Contracts.Projects.Append("UnexpectedContract").ToArray());
             Reject("reference path", "basenames", manifest => manifest.Game.References[0].File = "private/Assembly-CSharp.dll");
             Reject("missing key reference", "Required compile reference", manifest => manifest.Game.References[0].File = "Other.dll");
             Reject("duplicate reference", "basenames", manifest => manifest.Game.References[1].File = "Assembly-CSharp.dll");

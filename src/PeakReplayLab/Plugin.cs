@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace PeakReplayLab;
 
-[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.36")]
+[BepInPlugin("cn.mylus.peakreplaylab", "PEAK Replay Lab", "0.8.40")]
 [DefaultExecutionOrder(10000)]
 public sealed partial class Plugin : BaseUnityPlugin
 {
@@ -86,7 +86,7 @@ public sealed partial class Plugin : BaseUnityPlugin
         }
         catch (Exception e) { disabledByError = true; Logger.LogError(e); Note("回放保护未能安装，已停用新回放功能；原足迹 Mod 不受影响。"); }
         SceneManager.activeSceneChanged += SceneChanged;
-        Logger.LogInfo($"PEAK Memories 0.8.27: native replay HUD / player {sampleHz.Value} Hz / scene <=30 Hz / source-bound segments / shared native event resources / mode={activeRecordingMode}. " + DirectoryPath);
+        Logger.LogInfo($"PEAK Memories 0.8.40: native replay HUD / player {sampleHz.Value} Hz / scene <=30 Hz / source-bound segments / shared native event resources / mode={activeRecordingMode}. " + DirectoryPath);
     }
 
     private void Update()
@@ -99,7 +99,9 @@ public sealed partial class Plugin : BaseUnityPlugin
         var keys = Keyboard.current;
         if (keys != null)
         {
-            if (keys.endKey.wasPressedThisFrame || keys.escapeKey.wasPressedThisFrame && (library || theatre!.Busy))
+            bool cancelledPresentationPrompt = false;
+            if (keys.escapeKey.wasPressedThisFrame) CancelPresentationPrompt(ref cancelledPresentationPrompt);
+            if (!cancelledPresentationPrompt && (keys.endKey.wasPressedThisFrame || keys.escapeKey.wasPressedThisFrame && (library || theatre!.Busy)))
             { if (theatre!.Busy) CloseTheatre(); else if (keys.endKey.wasPressedThisFrame) CloseLibrary(); else nativeLibrary?.Back(); }
             if (saveKey.Value != Key.None && keys[saveKey.Value].wasPressedThisFrame) Guard(SaveHighlight);
             if (fullRunKey.Value != Key.None && keys[fullRunKey.Value].wasPressedThisFrame) Guard(ToggleFullRun);
@@ -107,11 +109,17 @@ public sealed partial class Plugin : BaseUnityPlugin
             { if (theatre!.Busy) CloseTheatre(); else if (SceneManager.GetActiveScene().name == "Title") OpenLibrary(); else Note("回到主菜单，点击「回忆录」查看已保存的片段。"); }
             if (keys.f9Key.wasPressedThisFrame)
                 ToggleDiagnostics();
-            if (theatre!.Playback != null)
+            if (theatre!.Playback != null && Application.isFocused)
             {
-                if (keys.spaceKey.wasPressedThisFrame) theatre.Playback.Paused = !theatre.Playback.Paused;
-                if (keys.tabKey.wasPressedThisFrame) theatre.Playback.CycleFocus();
-                if (keys.hKey.wasPressedThisFrame) replayConsole?.ToggleDrawer();
+                bool ownsShortcuts = false;
+                PresentationInput(ref ownsShortcuts);
+                if (!ownsShortcuts)
+                {
+                    if (keys.spaceKey.wasPressedThisFrame) theatre.Playback.Paused = !theatre.Playback.Paused;
+                    if (keys.tabKey.wasPressedThisFrame) theatre.Playback.CycleFocus();
+                    if (keys.cKey.wasPressedThisFrame) theatre.Playback.ToggleCamera();
+                    if (keys.hKey.wasPressedThisFrame) replayConsole?.ToggleDrawer();
+                }
             }
         }
         if (theatre?.Playback != null && Gamepad.current?.selectButton.wasPressedThisFrame == true)
@@ -195,6 +203,13 @@ public sealed partial class Plugin : BaseUnityPlugin
 
     private void CloseTheatre()
     {
+        bool handled = false;
+        RequestPresentationExit(CloseTheatreCore, ref handled);
+        if (!handled) CloseTheatreCore();
+    }
+
+    private void CloseTheatreCore()
+    {
         try { if (theatre?.Playback != null) SavePerformanceReport("replay-close"); }
         catch (Exception e) { Logger.LogWarning("Replay close diagnostic failed: " + e); }
         DisposePlaybackUi(); theatre?.Close();
@@ -202,6 +217,7 @@ public sealed partial class Plugin : BaseUnityPlugin
 
     private void DisposePlaybackUi()
     {
+        DisposePresentation();
         // Restore UI input independently from replay camera/world cleanup.
         Guard(() => replayConsole?.Dispose()); replayConsole = null;
         Guard(() => replayHud?.Dispose()); replayHud = null; uiPlayback = null;
@@ -218,7 +234,9 @@ public sealed partial class Plugin : BaseUnityPlugin
             try
             {
                 replayHud = new NativeReplayHud(message => Logger.LogWarning(message));
-                replayConsole = new NativeReplayConsole(session, CloseTheatre, ToggleDiagnostics, e => Logger.LogError(e));
+                Action? openPresentation = null;
+                ConfigurePresentationEntry(ref openPresentation);
+                replayConsole = new NativeReplayConsole(session, CloseTheatre, ToggleDiagnostics, e => Logger.LogError(e), openPresentation);
                 uiPlayback = session;
                 opened = true;
             }

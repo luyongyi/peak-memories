@@ -20,6 +20,13 @@ internal sealed class ReplayNameplates : IDisposable
     private readonly Material? material;
     private readonly Color color = Color.white;
     private bool disposed;
+    private bool visible = true;
+    public void SetVisible(bool value)
+    {
+        if (visible == value) return;
+        visible = value;
+        if (canvas) canvas.SetActive(value);
+    }
     public ReplayNameplates(Action<Exception> reportRestoreError)
     {
         this.reportRestoreError = reportRestoreError;
@@ -54,6 +61,7 @@ internal sealed class ReplayNameplates : IDisposable
     public void Apply(Camera camera, IReadOnlyDictionary<string, VisualActor> actors)
     {
         HideNativeNames();
+        if (!visible) return;
         foreach (var pair in actors)
         {
             var actor = pair.Value;

@@ -26,6 +26,10 @@ jobs:
           - ItemPlaybackContract
           - NativeLoadingContract
           - ReplayViewContract
+          - ReplayCameraContract
+          - CinemaContract
+          - CinemaEffectsContract
+          - CinemaControllerContract
           - ReplayNameplateContract
           - ReplayAudioSpatialContract
           - TrajectoryContract

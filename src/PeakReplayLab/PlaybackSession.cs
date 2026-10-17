@@ -82,7 +82,25 @@ internal sealed class PlaybackSession : IDisposable
         $"; actorJoints={RecordedJointCount}; missingActorJoints={MissingJointCount}; seekPoseMs={lastSeekMilliseconds:F1}; paused={Paused}; buffering={Buffering}; preparingAudio={PreparingAudio}; preparingWorld={PreparingWorld}; cursor={Time:F3}; requested={RequestedTime:F3}; seekSequence={SeekSequence}; {timeline.LoadingDiagnostic}" +
         $"; ropes={currentFrame?.Ropes.Length ?? 0}; effects={currentFrame?.Effects.Length ?? 0}; renderedEffects={effects?.VisibleCount ?? 0}; incompleteEffects={effects?.MissingCount ?? 0}; laggingEffects={effects?.LaggingCount ?? 0}; gameSounds={currentFrame?.Audio.Length ?? 0}; spawnedTerrain={currentFrame?.Spawned.Length ?? 0}; balloons={currentFrame?.Balloons.Length ?? 0}; renderedBalloons={balloons?.VisibleCount ?? 0}; missingBalloons={balloons?.MissingCount ?? 0}; creatures={currentFrame?.Creatures.Length ?? 0}; renderedCreatures={creatures?.VisibleCount ?? 0}; missingCreatures={creatures?.MissingCount ?? 0}; interactions={currentFrame?.Interactions.Length ?? 0}; renderedInteractions={interactions?.VisibleCount ?? 0}; missingInteractions={interactions?.MissingCount ?? 0}; environmentKnown={currentFrame?.World.Environment != null}; windSources={currentFrame?.World.Environment?.Winds.Length ?? 0}; lavaSources={currentFrame?.World.Environment?.Lava.Length ?? 0}; {audio?.Diagnostic ?? "no-recorded-audio-track"}";
     private bool disposed;
-    private float yaw, pitch = 15, distance = 5;
+    private IReplayPresentationExtension? presentationExtension;
+    public Camera PresentationCamera => camera;
+    public bool CameraReadsLookDelta => cursor.ReadLookDelta;
+    public bool ShowNames { get; set; } = true;
+    public string PresentationSegment => (currentFrame?.World.Segment ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    // Read cached history only. Editing a camera key must not start IO or move
+    // the replay cursor just to infer the segment at its proposed new time.
+    public bool TryGetPresentationSegmentAt(double time, out string segment)
+    {
+        segment = "";
+        if (double.IsNaN(time) || double.IsInfinity(time) || time < 0 || time > Duration) return false;
+        if (!Buffering && currentFrame != null && Math.Abs(time - Time) < .0001)
+        { segment = PresentationSegment; return true; }
+        if (!timeline.TryHistory(time, out var sample)) return false;
+        segment = sample.Left.World.Segment.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return true;
+    }
+    private float yaw, pitch = 15, roll, distance = 5;
+    public float FreeCameraSpeed { get; private set; } = 6;
     private static readonly FieldInfo[] InputFlags = typeof(CharacterInput).GetFields(BindingFlags.Public | BindingFlags.Instance)
         .Where(f => f.FieldType == typeof(bool) && (f.Name.EndsWith("Pressed", StringComparison.Ordinal) || f.Name.EndsWith("Released", StringComparison.Ordinal))).ToArray();
     private static readonly object ClearedFlag = false;
@@ -228,6 +246,9 @@ internal sealed class PlaybackSession : IDisposable
                 case 7: using (ReplayPerformance.Measure(ReplayStage.PlaybackEnvironment)) environment?.EnforcePresentation(!Buffering); break;
                 case 8: using (ReplayPerformance.Measure(ReplayStage.PlaybackInteractions)) interactions?.Enforce(!Buffering); break;
             }
+        try { presentationExtension?.CameraApplied(); }
+        catch (Exception error) { ReleaseFailedPresentation(error); }
+        nameplates?.SetVisible(ShowNames);
         nameplates?.Apply(camera, actors);
         seekDiagnostics.Observe(UnityEngine.Time.realtimeSinceStartupAsDouble, Time, Buffering, Paused,
             (System.Diagnostics.Stopwatch.GetTimestamp() - tickStarted) * 1000d / System.Diagnostics.Stopwatch.Frequency,
@@ -435,9 +456,50 @@ internal sealed class PlaybackSession : IDisposable
 
     public void ToggleCamera()
     {
-        FreeCamera = !FreeCamera;
+        SetFreeCamera(!FreeCamera);
+    }
+
+    public void SetFreeCamera(bool free)
+    {
+        FreeCamera = free;
+        SyncCameraOrientation();
+        UiRevision++;
+    }
+
+    public void SyncCameraOrientation()
+    {
         yaw = camera.transform.eulerAngles.y;
+        // Preserve an explicitly edited cinematic pose. Mouse look still bounds
+        // pitch when the user takes over, without clipping a paused numeric edit.
         pitch = Mathf.DeltaAngle(0, camera.transform.eulerAngles.x);
+        roll = camera.transform.eulerAngles.z;
+    }
+
+    public bool TryGetActorFocusPoint(string id, out Vector3 point)
+    {
+        if (actors.TryGetValue(id, out var actor) && actor.Visible)
+        { point = actor.Position + Vector3.up * .65f; return true; }
+        point = default; return false;
+    }
+
+    public void AttachPresentation(IReplayPresentationExtension extension)
+    {
+        if (disposed) throw new ObjectDisposedException(nameof(PlaybackSession));
+        if (presentationExtension != null) throw new InvalidOperationException("A presentation extension already owns this replay.");
+        presentationExtension = extension ?? throw new ArgumentNullException(nameof(extension));
+    }
+
+    public void DetachPresentation(IReplayPresentationExtension extension)
+    {
+        if (ReferenceEquals(presentationExtension, extension)) presentationExtension = null;
+    }
+
+    private void ReleaseFailedPresentation(Exception error)
+    {
+        var failed = presentationExtension; presentationExtension = null;
+        try { failed?.Dispose(); }
+        catch (Exception restore) { try { reportRestoreError(restore); } catch { } }
+        try { reportRestoreError(error); } catch { }
     }
 
     private void ApplyCamera(float dt)
@@ -446,38 +508,52 @@ internal sealed class PlaybackSession : IDisposable
         var keys = Keyboard.current;
         ApplyCursor(Application.isFocused, mouse?.rightButton.isPressed == true);
         bool looking = cursor.Looking;
+        if (presentationExtension != null)
+        {
+            try { if (presentationExtension.ApplyCamera(dt)) return; }
+            catch (Exception error) { ReleaseFailedPresentation(error); }
+        }
         if (cursor.ReadLookDelta && mouse != null)
         {
             Vector2 motion = mouse.delta.ReadValue();
             yaw += motion.x * .12f;
             pitch = Mathf.Clamp(pitch - motion.y * .12f, -85, 85);
         }
-        Quaternion rotation = Quaternion.Euler(pitch, yaw, 0);
+        Quaternion rotation = Quaternion.Euler(pitch, yaw, FreeCamera ? roll : 0);
+        float notches = 0;
+        if (mouse != null && Application.isFocused && (looking ||
+            new Rect(0, 0, Screen.width, Screen.height).Contains(mouse.position.ReadValue()) &&
+            (!EventSystem.current || !EventSystem.current.IsPointerOverGameObject())))
+        {
+            // Unity's default is one unit per notch. The optional Windows native
+            // range is 120. Read the setting without changing global game input.
+            bool nativeWindowsRange = InputSystem.settings.scrollDeltaBehavior == InputSettings.ScrollDeltaBehavior.KeepPlatformSpecificInputRange &&
+                Application.platform == RuntimePlatform.WindowsPlayer;
+            notches = ReplayCameraMotion.WheelNotches(mouse.scroll.ReadValue().y, nativeWindowsRange ? 120 : 1);
+        }
         if (FreeCamera)
         {
             camera.transform.rotation = rotation;
+            FreeCameraSpeed = ReplayCameraMotion.FlySpeed(FreeCameraSpeed, notches);
             // Require RMB so typing/operating the timeline cannot accidentally move the camera.
             if (looking && keys != null)
             {
                 float x = (keys.dKey.isPressed ? 1 : 0) - (keys.aKey.isPressed ? 1 : 0);
                 float z = (keys.wKey.isPressed ? 1 : 0) - (keys.sKey.isPressed ? 1 : 0);
                 float y = (keys.eKey.isPressed ? 1 : 0) - (keys.qKey.isPressed ? 1 : 0);
-                float speed = keys.leftShiftKey.isPressed ? 20 : 6;
-                camera.transform.position += (rotation * new Vector3(x, 0, z) + Vector3.up * y) * (speed * dt);
+                // Normalize after combining view movement and world height:
+                // the axes overlap when looking up/down, especially W + E.
+                Vector3 direction = rotation * new Vector3(x, 0, z) + Vector3.up * y;
+                var move = ReplayCameraMotion.Movement(direction.x, direction.y, direction.z, FreeCameraSpeed, dt,
+                    keys.leftShiftKey.isPressed || keys.rightShiftKey.isPressed,
+                    keys.leftCtrlKey.isPressed || keys.rightCtrlKey.isPressed);
+                // WASD follows the view; Q/E always moves along world height.
+                camera.transform.position += new Vector3(move.X, move.Y, move.Z);
             }
         }
         else if (actors.TryGetValue(FocusId, out var focused) && focused.Visible)
         {
-            if (mouse != null && Application.isFocused)
-            {
-                float scroll = mouse.scroll.ReadValue().y;
-                // Wheel zoom works without capturing the cursor. Let scrollable
-                // replay controls consume their own wheel input instead.
-                if (scroll != 0 && (looking ||
-                    new Rect(0, 0, Screen.width, Screen.height).Contains(mouse.position.ReadValue()) &&
-                    (!EventSystem.current || !EventSystem.current.IsPointerOverGameObject())))
-                    distance = Mathf.Clamp(distance - scroll * .015f, 1, 35);
-            }
+            distance = ReplayCameraMotion.ZoomDistance(distance, notches);
             Vector3 target = focused.Position + Vector3.up * .65f;
             Vector3 offset = rotation * Vector3.back;
             float actualDistance = distance;
@@ -511,6 +587,7 @@ internal sealed class PlaybackSession : IDisposable
             catch (Exception e) { try { reportRestoreError(e); } catch { /* Continue restoring even if the logger has gone away. */ } }
         }
         if (cursorFocusSubscribed) Restore(() => { Application.focusChanged -= ApplicationFocusChanged; cursorFocusSubscribed = false; });
+        Restore(() => { var extension = presentationExtension; presentationExtension = null; extension?.Dispose(); });
         Restore(() => { UnityEngine.Time.timeScale = oldTimeScale; });
         foreach (var a in actors.Values) Restore(a.Hide);
         Restore(() => items?.Dispose());
